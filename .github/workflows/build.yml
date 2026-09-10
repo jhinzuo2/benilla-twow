@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux first (per the README's roadmap) — Windows/macOS are here too since the workspace
+        # targets all three, but keep them easy to drop from the matrix if CI minutes get tight.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # bevy_audio pulls alsa on Linux and gilrs (gamepad support) pulls udev — both link against
+      # system libs rather than vendoring them, so the dev headers have to exist before `cargo
+      # build` touches those crates. x11/xkbcommon/wayland are all dlopen'd at runtime by winit
+      # (x11-dl / xkbcommon-dl / smithay-client-toolkit), so no dev headers are needed for those.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      # Reads channel/components straight from the repo's rust-toolchain.toml (stable +
+      # clippy/rustfmt), so this only needs the target for the current OS.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      # Style/lint checks are informational for now — they shouldn't fail CI on warnings the two
+      # build/test steps above didn't already care about. Flip continue-on-error off once the tree
+      # is clean under both and you want them enforced.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        continue-on-error: true
