@@ -61,6 +61,26 @@ impl Drop for Fixtures {
     }
 }
 
+/// Recursively copy a directory tree. Used as the non-Unix fallback for linking addon folders
+/// from the third-party corpus into a fixture root — Windows has no unprivileged equivalent of
+/// `std::os::unix::fs::symlink` for directories, so the oracle test copies instead of linking
+/// there. (The corpus entries are addon folders, not single files, so `std::fs::copy` alone is
+/// not enough.)
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// **The proof, in both directions.** An addon that paints must register; one that does not must
 /// not — and "creates a frame" is not "paints".
 #[test]
@@ -199,15 +219,15 @@ fn the_directors_two_verified_addons_come_out_on_opposite_sides() {
         #[cfg(unix)]
         std::os::unix::fs::symlink(corpus.join(name), fx.root().join(name)).unwrap();
         #[cfg(not(unix))]
-        std::fs::copy(corpus.join(name), fx.root().join(name)).unwrap();
-}
-let reports = survey(fx.root());
-let row = |name: &str| {
-    reports
-        .iter()
-        .find(|r| r.name == name)
-        .unwrap_or_else(|| panic!("{name} is not in the corpus"))
-};
+        copy_dir_recursive(&corpus.join(name), &fx.root().join(name)).unwrap();
+    }
+    let reports = survey(fx.root());
+    let row = |name: &str| {
+        reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the corpus"))
+    };
 
     // The POSITIVE control. A render check that scores this one blank is broken, whatever else it
     // gets right — the director sees its numbers.
