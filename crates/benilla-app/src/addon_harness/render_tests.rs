@@ -196,15 +196,18 @@ fn the_directors_two_verified_addons_come_out_on_opposite_sides() {
     // `addon_harness` example's job, not a unit test's.
     let fx = Fixtures::new("oracle");
     for name in ["!OmniCC", "Bagnon", "Bagnon_Core", "Bagnon_Forever"] {
+        #[cfg(unix)]
         std::os::unix::fs::symlink(corpus.join(name), fx.root().join(name)).unwrap();
-    }
-    let reports = survey(fx.root());
-    let row = |name: &str| {
-        reports
-            .iter()
-            .find(|r| r.name == name)
-            .unwrap_or_else(|| panic!("{name} is not in the corpus"))
-    };
+        #[cfg(not(unix))]
+        std::fs::copy(corpus.join(name), fx.root().join(name)).unwrap();
+}
+let reports = survey(fx.root());
+let row = |name: &str| {
+    reports
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap_or_else(|| panic!("{name} is not in the corpus"))
+};
 
     // The POSITIVE control. A render check that scores this one blank is broken, whatever else it
     // gets right — the director sees its numbers.
