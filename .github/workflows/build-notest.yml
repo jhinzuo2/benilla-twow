@@ -14,91 +14,58 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: build + test (${{ matrix.os }})
+  build:
+    name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Linux first (per the README's roadmap) — Windows/macOS are here too since the workspace
-        # targets all three, but keep them easy to drop from the matrix if CI minutes get tight.
         os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: benilla
+            asset_name: benilla-linux-x86_64
+          - os: windows-latest
+            artifact_name: benilla.exe
+            asset_name: benilla-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: benilla
+            asset_name: benilla-macos-x86_64
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      # bevy_audio pulls alsa on Linux and gilrs (gamepad support) pulls udev — both link against
+      # bevy_audio pulls alsa on Linux and gilrs (gamepad support) pulls udev -- both link against
       # system libs rather than vendoring them, so the dev headers have to exist before `cargo
       # build` touches those crates. x11/xkbcommon/wayland are all dlopen'd at runtime by winit
       # (x11-dl / xkbcommon-dl / smithay-client-toolkit), so no dev headers are needed for those.
+      # Windows and macOS need nothing extra: cpal/gilrs link against SDK and framework libs the
+      # runner images already ship with.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
 
-      # Reads channel/components straight from the repo's rust-toolchain.toml (stable +
-      # clippy/rustfmt), so this only needs the target for the current OS.
+      # Reads channel/components straight from the repo's rust-toolchain.toml.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
-      # Build must succeed — this is the one step allowed to fail the job.
-      - name: cargo build --workspace --release
-        run: cargo build --workspace --all-targets --release --locked
-
-      # Tests need a real WOW_DATA (a legally-owned 1.12.1 install) that CI doesn't have, so
-      # failures here are expected and shouldn't block the build artifact upload or the job as a
-      # whole. `continue-on-error` lets the step fail without failing the job; we still capture
-      # the outcome below so it's visible at a glance in the Actions UI instead of silently green.
-      - name: cargo test --workspace
-        id: test
-        continue-on-error: true
-        run: cargo test --workspace --release --locked
-
-      - name: Report test outcome
-        run: |
-          echo "cargo test outcome: ${{ steps.test.outcome }}"
-          if [ "${{ steps.test.outcome }}" != "success" ]; then
-            echo "::warning::cargo test failed or was skipped (expected without a real WOW_DATA client install in CI) — continuing anyway."
-          fi
-
-      # Style/lint checks are informational for now — they shouldn't fail CI on warnings the
-      # build/test steps above didn't already care about. Flip continue-on-error off once the tree
-      # is clean under both and you want them enforced.
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-        continue-on-error: true
-
-      - name: cargo clippy --workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        continue-on-error: true
-
-      # Everything benilla needs to run: the compiled binary (platform-specific name/extension)
-      # plus anything cargo dropped alongside it that the exe expects at its side (e.g. dynamic
-      # libs on some platforms). Blizzard game data is never included — that stays local, pointed
-      # to via WOW_DATA at runtime, same as the README describes.
-      - name: Stage runtime artifact
-        shell: bash
-        run: |
-          mkdir -p dist
-          BIN_NAME="benilla"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            BIN_NAME="benilla.exe"
-          fi
-          cp "target/release/${BIN_NAME}" dist/
-          # Pull in any sibling dynamic libraries cargo produced next to the binary, if present.
-          find target/release -maxdepth 1 -type f \( -name "*.dll" -o -name "*.so" -o -name "*.dylib" \) -exec cp {} dist/ \; 2>/dev/null || true
+      # Only the player-facing binary (`-p benilla`), not `--workspace --all-targets`. Building
+      # every crate's test binaries too would relink a full Bevy executable per test target --
+      # multi-GB of debug output that has actually blown through the windows-latest runner's free
+      # disk before now. This also happens to be the only artifact worth downloading and running.
+      - name: cargo build --release -p benilla
+        run: cargo build --release --locked -p benilla
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: benilla-${{ matrix.os }}
-          path: dist/
+          name: ${{ matrix.asset_name }}
+          path: target/release/${{ matrix.artifact_name }}
           if-no-files-found: error
