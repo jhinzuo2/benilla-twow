@@ -18,6 +18,25 @@
 //! does at the glue screen. An addon keys its saved variables on it (`db[GetRealmName()]`), so
 //! answering `nil` would make that a `table index is nil` error one call deeper — the failure mode
 //! we have been paying for all arc.
+//!
+//! ## `getfenv`/`setfenv` (TWoW gap fix)
+//!
+//! Neither was registered at all before this fix — not stubbed, not wrong, simply absent, so any
+//! chunk that opened with `getfenv(...)` died on `attempt to call global 'getfenv' (a nil value)`
+//! before its own first real statement ran. Turtle WoW's `FrameXML/Globals.lua` is exactly that
+//! chunk: its very first executable line is `_G = getfenv(0)`, so the absence did not degrade
+//! `Globals.lua` — it killed the whole file at line 1, silently taking every later definition in
+//! it down too (`wipe`, `trim`, `explode`, `sizeof`, `print`), which is why `UIParent.lua`'s calls
+//! to `wipe(...)` faulted on a nil global hundreds of lines downstream with no error anywhere near
+//! the real cause.
+//!
+//! Both are collapsed to the one shape this host actually has: a single shared global
+//! environment, no per-chunk or per-function sandboxing (`RunScript`'s own comment below says the
+//! same thing for the chunk loader — "no `setfenv` here and none in the reference either"). So
+//! every `getfenv` argument (`0`, `1`, a function value, absent) answers the same table — the real
+//! `Lua::globals()` — and `setfenv` is a deliberate no-op rather than a raise: it does not attempt
+//! to isolate a chunk into a fresh environment, but it does not break a caller that only ever
+//! wanted `_G` back either.
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -240,6 +259,26 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // `getfenv`/`setfenv` — 5.0/5.1 environment introspection. See the module-level doc comment
+    // above ("TWoW gap fix") for the full story: neither was registered at all before this, and
+    // Turtle WoW's `FrameXML/Globals.lua` opens with `_G = getfenv(0)`, so the absence silently
+    // killed that whole file at line 1 — taking `wipe`, `trim`, `explode`, `sizeof`, and `print`
+    // down with it, hundreds of lines before `UIParent.lua`'s `wipe(...)` calls ever faulted.
+    //
+    // This host runs one shared global environment with no per-chunk sandboxing (`RunScript`
+    // above already says as much), so every `getfenv` argument answers the same table — the real
+    // `Lua::globals()`, by identity, not a snapshot/copy — and `setfenv` is a deliberate no-op: it
+    // does not raise, and it does not attempt an isolation this host does not otherwise have.
+    let genv = g.clone();
+    g.set(
+        "getfenv",
+        lua.create_function(move |_, _level: Option<Value>| Ok(genv.clone()))?,
+    )?;
+    g.set(
+        "setfenv",
+        lua.create_function(|_, (_level, _env): (Value, mlua::Table)| Ok(()))?,
+    )?;
+
     Ok(())
 }
 
@@ -416,5 +455,61 @@ mod tests {
             s.eval::<bool>("return IsMacClient() == nil").unwrap(),
             "nil is the PC arm, which is the arm this client wants"
         );
+    }
+
+    /// `getfenv(0)` answers the real global table, **by identity** — not a snapshot, not a copy.
+    /// Turtle WoW's `FrameXML/Globals.lua` opens with `_G = getfenv(0)`; if this ever answered a
+    /// different table than the one global writes actually land in, that line would silently
+    /// detach `_G` from the real environment on every future read through it.
+    #[test]
+    fn getfenv_zero_answers_the_real_global_table_by_identity() {
+        let s = UiScript::new().unwrap();
+        assert!(
+            s.eval::<bool>("GlobalsProbe = getfenv(0) return GlobalsProbe == _G")
+                .unwrap(),
+            "getfenv(0) must be _G itself, not a copy"
+        );
+        // And a global written before the call is visible through the table getfenv(0) returns —
+        // proof it is the live environment, not a fresh table pre-seeded with a snapshot.
+        assert!(
+            s.eval::<bool>(
+                "PreExisting = 'here' local e = getfenv(0) return e.PreExisting == 'here'"
+            )
+            .unwrap(),
+            "getfenv(0) must see globals that already existed, not just ones set after the call"
+        );
+    }
+
+    /// The exact TWoW failure this fix closes: `Globals.lua`'s own first line, followed by its
+    /// `wipe` definition — both used to die together, silently, because `getfenv` did not exist as
+    /// a callable global at all.
+    #[test]
+    fn a_chunk_opening_with_getfenv_zero_no_longer_aborts_at_line_one() {
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            r#"
+            _G = getfenv(0)
+            function wipe(t)
+                for k in pairs(t) do t[k] = nil end
+                return t
+            end
+            "#,
+        )
+        .expect("a chunk opening with `_G = getfenv(0)` must run past its own first line");
+        assert!(
+            s.eval::<bool>("local t = {1,2,3} wipe(t) return next(t) == nil")
+                .unwrap(),
+            "wipe must have actually been defined — the whole point of the fix"
+        );
+    }
+
+    /// `setfenv` is a no-op, not a raise — this host has no per-chunk sandboxing to give it, and a
+    /// caller that only ever wanted `_G` back (the common `setfenv(1, getfenv(0))` idiom some
+    /// libraries use defensively) must not fault on the call.
+    #[test]
+    fn setfenv_is_a_harmless_no_op() {
+        let s = UiScript::new().unwrap();
+        s.eval::<()>("setfenv(1, getfenv(0))")
+            .expect("setfenv must not raise");
     }
 }
