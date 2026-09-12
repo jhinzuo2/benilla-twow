@@ -63,6 +63,19 @@ Interface\FrameXML\Fonts.xml
 # The app's Startup load stays where it is — the cast-fail display (0427) resolves messages before
 # the in-game UI materializes at all (1051) — so this is a second, idempotent assignment pass.
 Interface\FrameXML\GlobalStrings.lua
+# ══ TWOW GLOBALS — Turtle WoW's own, off the player's chain (fork addition, not upstream) ══
+# `wipe`, `trim`, `explode`, `sizeof`, `print`, and TWoW's class-token/challenge tables. Not a
+# stock 1.12 FrameXML file — Turtle's own `FrameXML.toc` lists it second, immediately after
+# `GlobalStrings.lua` and before `Fonts.xml`/`Localization.xml`, so it is seated here to match.
+# Its own first line is `_G = getfenv(0)`, which this client's Lua host did not support until the
+# `getfenv`/`setfenv` fix (`benilla-ui/src/script/client.rs`) — without both halves of that fix,
+# `wipe` and friends silently never existed, and `UIParent.lua`'s later calls to `wipe(...)`
+# faulted hundreds of lines downstream with no error anywhere near the real cause.
+Interface\FrameXML\Globals.lua
+# ══ TWOW OVERRIDES — Turtle WoW's own, off the player's chain (fork addition, not upstream) ══
+# Patches `GetMapContinents()` to Turtle's two-continent shape. Third in Turtle's own toc, right
+# after Globals.lua and before Fonts.xml.
+Interface\FrameXML\Overrides.lua
 # ══ THE LOCALE ADJUSTMENTS — the reference's own, off the player's chain (1751, window 5) ══
 # `Localize()` (which this file also CALLS at load, exactly as the reference's own two-part
 # `<Script>` does) and `LocalizeFrames()`. Nothing of ours ever shipped either, and the gap was
