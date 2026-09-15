@@ -259,6 +259,28 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // `GetDebugStats()` — the stock debug frame's one host verb (StatsFrame.lua l.20, under the
+    // frame's own 0.5 s OnUpdate throttle) and its whole reason to load: one line of whatever
+    // this client can honestly measure, into the `StatsFrameText` fontstring the stock
+    // `StatsFrame.xml` owns (hidden, DIALOG strata — the stock client shows it from its
+    // console). The reference's own line is an internal debug format nothing parses; ours is
+    // ours — the smoothed FPS off the same push `GetFramerate` reads, plus the diagnostic log's
+    // two counts (every distinct failure this session, and how many rows the cap has not
+    // evicted), so the frame is a working at-a-glance health readout rather than a stub.
+    g.set(
+        "GetDebugStats",
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let d = &model.diagnostics;
+            Ok(format!(
+                "FPS: {:.1} | script issues: {} ({} retained)",
+                model.framerate,
+                d.total(),
+                d.len()
+            ))
+        })?,
+    )?;
+
     // `getfenv`/`setfenv` — 5.0/5.1 environment introspection. See the module-level doc comment
     // above ("TWoW gap fix") for the full story: neither was registered at all before this, and
     // Turtle WoW's `FrameXML/Globals.lua` opens with `_G = getfenv(0)`, so the absence silently
