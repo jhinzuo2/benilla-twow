@@ -1369,11 +1369,11 @@ impl ViewNode for FfxTransparent2dNode {
                     // Its own span inside the pass, so the per-pass split (`WOW_GPU_PASSES`)
                     // still reads one `ffx_glow_combine` a frame on a device that times inside
                     // a pass; on one that does not, the transparent pass carries it.
-                    let ground_span = diagnostics.pass_span(&mut render_pass, "ffx_glow_combine");
+                 // let ground_span = diagnostics.pass_span(&mut render_pass, "ffx_glow_combine"); ***NOTE*** These 2 changes are the reason for wgpu errors on world entering.
                     render_pass.set_render_pipeline(combine);
                     render_pass.set_bind_group(0, bind, &[]);
                     render_pass.draw(0..3, 0..1);
-                    ground_span.end(&mut render_pass);
+                 // ground_span.end(&mut render_pass);                                              ***NOTE*** These 2 changes are the reason for wgpu errors on world entering.
                 }
                 if !transparent_phase.items.is_empty() {
                     if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity)
