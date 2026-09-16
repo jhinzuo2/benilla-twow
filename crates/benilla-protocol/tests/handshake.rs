@@ -11,7 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 use benilla_protocol::messages::opcode;
-use benilla_protocol::{messages, WardenRequired, WorldSession};
+use benilla_protocol::{messages, WorldSession};
 use benilla_srp::vanilla_header::HeaderCrypto;
 use benilla_srp::SESSION_KEY_LENGTH;
 
@@ -89,16 +89,20 @@ fn packets_ahead_of_the_auth_response_are_skipped() {
     assert!(WorldSession::connect(&addr, "one", SESSION_KEY).is_ok());
 }
 
-/// Warden among them is refused, with the error the login screen shows — never a session that
-/// would be kicked once the server's response clock expires.
+/// TurtleWoW sends SMSG_WARDEN_DATA but does not enforce/kick on it in practice (confirmed against
+/// real observed server behavior), so it's skipped like any other interleaved packet rather than
+/// treated as fatal. This replaces an earlier assumption — that every server arms an
+/// unconditional response-timeout kick per vmangos' `Warden::BeginTimeoutClock` — which held for a
+/// vmangos-style enforcing config but not for this one. `WardenRequired` (see its own doc comment)
+/// is still benilla's honest answer for a server that DOES enforce Warden; there's just no way to
+/// distinguish "sends the packet" from "will actually kick over it" from the packet alone, so this
+/// project has chosen to trust the specific server it targets over defending against a class of
+/// server it doesn't.
 #[test]
-fn a_warden_server_is_refused_at_the_handshake() {
+fn a_warden_data_packet_does_not_end_the_handshake() {
     let addr = fake_server(vec![(opcode::SMSG_WARDEN_DATA, vec![0u8; 16])]);
-    let Err(err) = WorldSession::connect(&addr, "one", SESSION_KEY) else {
-        panic!("a Warden server must not yield a session");
-    };
     assert!(
-        err.downcast_ref::<WardenRequired>().is_some(),
-        "expected WardenRequired, got: {err:#}"
+        WorldSession::connect(&addr, "one", SESSION_KEY).is_ok(),
+        "SMSG_WARDEN_DATA alone must not refuse the handshake — TurtleWoW sends it without enforcing it"
     );
 }

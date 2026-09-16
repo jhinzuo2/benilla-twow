@@ -199,10 +199,8 @@ impl WorldSession {
         // AUTH_RESPONSE lead. Each read is still bounded by the handshake timeout, so a server that
         // never answers still fails per decision 0065.
         //
-        // SMSG_WARDEN_DATA among them ends the connection here: it means the server runs Warden,
-        // whose response clock kicks us ~30 s later no matter what else we do ([`WardenRequired`]).
-        // Refusing at the handshake trades an unplayable 30-second kick/reconnect cycle for one
-        // honest message at the login screen.
+        // SMSG_WARDEN_DATA can land among them too — see the `continue` arm below for why it's
+        // skipped rather than treated as fatal (this server sends it without enforcing it).
         loop {
             match session.recv()? {
                 ServerPacket::AuthResponse {
@@ -238,9 +236,20 @@ impl WorldSession {
                 ServerPacket::AuthResponse { result, .. } => {
                     return Err(WorldAuthReject { code: result }.into())
                 }
+                // TurtleWoW sends SMSG_WARDEN_DATA but does not enforce/kick on it in practice —
+                // confirmed against real observed server behavior, contradicting the earlier
+                // assumption above (that every server arms an unconditional ~30s kick timer per
+                // vmangos' `Warden::BeginTimeoutClock`). That assumption held for a vmangos-style
+                // enforcement config; it does not hold here. benilla still does not implement
+                // Warden (no crypto, no module execution — see `WardenRequired`'s own doc
+                // comment), so this is not "handling" Warden in any real sense: it's choosing not
+                // to disconnect over a packet this server sends but never acts on. If a server
+                // that DOES enforce Warden is hit, this being silently skipped surfaces as an
+                // unexplained kick ~30s later instead of an immediate, honest message — a
+                // deliberate tradeoff for now, worth revisiting if it matters in practice.
                 ServerPacket::Other {
                     opcode: opcode::SMSG_WARDEN_DATA,
-                } => return Err(WardenRequired.into()),
+                } => continue,
                 _ => continue,
             }
         }
@@ -322,9 +331,11 @@ impl WorldSession {
                 }
                 // Warden can land either side of SMSG_AUTH_RESPONSE depending on when the server
                 // arms it, so the roster step refuses it too — same reason as `connect`.
+                // Same as `connect`'s handling above: TurtleWoW sends this here too but doesn't
+                // enforce it, so skip rather than bail. See that site for the full reasoning.
                 ServerPacket::Other {
                     opcode: opcode::SMSG_WARDEN_DATA,
-                } => return Err(WardenRequired.into()),
+                } => continue,
                 // The tutorial bank, if the server sends it this early (1976): kept for the world
                 // entry — skipped here it would be lost to the roster loop.
                 ServerPacket::TutorialFlags(flags) => {
