@@ -14,6 +14,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Manual, on-demand only (workflow_dispatch) -- never runs on push/PR, so it can never race the
+  # `build`/`android` jobs' own checkouts or silently rewrite history on every push. Exists purely
+  # because there's no local Rust toolchain to run `cargo build` (no --locked) and commit the
+  # result the normal way -- this is that same one-time operation, done in CI instead of a laptop.
+  #
+  # Run this ONCE after adding a dependency (like benilla-android's bevy/android_logger/log, or
+  # the android-native-activity feature on benilla-app), from the Actions tab -> this workflow ->
+  # "Run workflow". Once Cargo.lock is committed and up to date, the `build`/`android` jobs' own
+  # `--locked` builds stop needing this -- it is not meant to run on every push.
+  update-lockfile:
+    name: regenerate Cargo.lock
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # So the commit step below can push to the branch this ran on.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # A real branch ref, not the detached-HEAD commit workflow_dispatch normally checks
+          # out -- `git push` below needs a branch to push TO, not a bare commit SHA.
+          ref: ${{ github.ref_name }}
+
+      # Same apt packages the desktop Linux job installs -- see that job's own comment. Needed
+      # here too since resolving the dependency graph runs build scripts/proc macros that link
+      # against these, same as an actual build would.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `cargo generate-lockfile` alone resolves versions but does NOT verify the graph actually
+      # compiles -- `cargo check` (workspace-wide, not just `-p benilla`) both updates the lockfile
+      # AND catches a resolution that's version-compatible but doesn't actually build, in one step.
+      # Slower than `generate-lockfile` alone; worth it for a step that runs rarely and whose whole
+      # job is to produce a lockfile the OTHER jobs can then trust under `--locked`.
+      - name: cargo check --workspace (updates Cargo.lock)
+        run: cargo check --workspace
+
+      # Only commits if Cargo.lock actually changed -- makes this safe to re-run even when nothing
+      # was out of date (a no-op, not an empty commit that clutters history).
+      - name: Commit updated Cargo.lock if changed
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already up to date -- nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "ci: regenerate Cargo.lock"
+          git push
+
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
