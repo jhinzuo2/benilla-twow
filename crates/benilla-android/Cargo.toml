@@ -1,0 +1,86 @@
+[package]
+name = "benilla-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Android entry point. Mirrors crates/benilla's desktop shim, but as a cdylib the \
+    JVM loads instead of a bin: no real fn main() on Android, so the entry point is \
+    android_main(AndroidApp), which sets WOW_DATA/BENILLA_HOME and hands the AndroidApp to \
+    bevy_winit's ANDROID_APP static before calling the same benilla_app::run() the desktop shim \
+    calls."
+
+# Android needs a cdylib the JVM/NativeActivity loads (libbenilla_android.so), not a bin target.
+# Keep the desktop `benilla` crate's bin untouched — this is a parallel entry point, not a
+# replacement, so `cargo build -p benilla` on desktop is unaffected.
+[lib]
+name = "benilla_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# default-features = false for the same reason crates/benilla/Cargo.toml gives: without it, this
+# crate's own defaults would compile the full dev tree regardless of what --no-default-features
+# says at the top level. The player-build gate must be explicit at every entry point, not just
+# the desktop one.
+benilla-app = { path = "../benilla-app", default-features = false }
+benilla-buildstamp = { path = "../benilla-buildstamp" }
+
+# Needed directly (not just transitively through benilla-app) for `bevy::winit::AndroidApp` (the
+# type this crate's `android_main` takes) and `bevy::winit::ANDROID_APP` (the hand-off static —
+# see src/lib.rs). `default-features = false` here too, matching benilla-app's own pin, so this
+# doesn't pull in a second differently-featured copy of bevy for the dependency resolver to
+# reconcile. The workspace's shared `[workspace.dependencies] bevy = ...` entry supplies the
+# version and feature list; this just opts in.
+bevy.workspace = true
+
+# NOT a direct android-activity dependency. winit's own docs are explicit: "there can only be a
+# single implementation of the android_activity glue crate linked with an application because it
+# is responsible for the application's android_main() entry point" — and apps should import
+# AndroidApp from winit's re-export, not pull the crate in a second time themselves. A second
+# copy is the textbook cause of a silent black screen / no-panic startup hang on Android.
+android_logger = "0.14"
+log = "0.4"
+
+[build-dependencies]
+benilla-buildstamp = { path = "../benilla-buildstamp" }
+
+# Read by `cargo apk build` (see .github/workflows/ci.yml's `android` job) to generate
+# AndroidManifest.xml and package the APK -- there is no hand-written manifest anywhere in this
+# crate; this section IS the manifest's source of truth for a cargo-apk build.
+#
+# Shaped directly against bevy's own maintained `examples/mobile/Cargo.toml` (fetched from
+# bevyengine/bevy and confirmed field-for-field on 2026-09-16), not assembled from memory or
+# blended cargo-apk-version docs -- an earlier draft of this section did that and got several
+# field names wrong (uses_feature vs feature, application.activity.orientation that doesn't exist
+# in bevy's own example, a fullscreen theme bevy's example doesn't set either). Every field below
+# has a direct counterpart in that source; nothing here is invented. bevy's example omits
+# min_sdk_version, orientation, and any theme/fullscreen setting entirely -- so this does too,
+# rather than guessing values are needed that the project bevy itself ships doesn't carry.
+[package.metadata.android]
+package = "com.benilla.twow"
+apk_name = "benilla"
+# aarch64 only for the first pass (see the CI workflow's own comment on why armv7 is deferred).
+# bevy's example builds both; trimmed to one here on purpose, not an oversight -- add
+# "armv7-linux-androideabi" back once aarch64 alone is confirmed working end to end.
+build_targets = ["aarch64-linux-android"]
+# Strips debug symbols from the shared library, shrinking the APK -- bevy's example does this by
+# default; remove if a debug build needs symbols for on-device gdb.
+strip = "strip"
+# UNSET on purpose, unlike bevy's example (which points these at its own `assets/` folder): all of
+# benilla's assets are compiled into the binary via `include_dir` (crates/benilla-app/Cargo.toml's
+# own comment on the shipped FrameXML tree) or fetched from the player's own WOWDATA/
+# benilla-config at runtime (this crate's src/lib.rs) -- there is no separate assets folder for
+# cargo-apk to bundle. Leave `assets`/`resources` absent unless that changes.
+
+[package.metadata.android.sdk]
+# Matches bevy's own example's target_sdk_version exactly (31) as the known-working starting
+# point, rather than picking a newer number unverified. Raise deliberately once a first build is
+# confirmed working, not preemptively.
+target_sdk_version = 31
+
+[package.metadata.android.application]
+label = "Benilla"
+# No `icon` line: bevy's example points this at its own `@mipmap/ic_launcher`, which lives in a
+# `resources` folder this crate doesn't have (see the note above). Add an icon + the matching
+# `resources = "..."` path together once real app assets exist -- cargo-apk's default (no icon
+# entry) is fine for a first "does it build and open a window" pass.
+

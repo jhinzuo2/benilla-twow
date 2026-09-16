@@ -192,3 +192,18 @@ cpal = "0.17"
 # `clock_gettime` and `host_statistics64` arms. The version is one the graph already carries.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+# Android: turns on bevy_winit's NativeActivity backend, which is what makes
+# `bevy::winit::AndroidApp`/`ANDROID_APP` exist at all (crates/benilla-android reads both — see
+# its src/lib.rs). Cargo unifies feature sets across every place a workspace names the same
+# dependency at the same version, so this ADDS the feature on top of whatever
+# `[workspace.dependencies] bevy = ...` already specifies rather than replacing it — no version
+# given here on purpose, so it can never drift from the workspace pin.
+#
+# `android-native-activity`, not `android-game-activity`: NativeActivity is the older, simpler
+# activity class and the one `benilla-android`'s scaffold targets. GameActivity needs a Java/
+# Kotlin `GameActivity` subclass and AndroidX Game SDK on the Gradle side — a real option later
+# for proper controller/IME support, but more moving parts than a first "does it open a window"
+# spike needs.
+[target.'cfg(target_os = "android")'.dependencies]
+bevy = { workspace = true, features = ["android-native-activity"] }
