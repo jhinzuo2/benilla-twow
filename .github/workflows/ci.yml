@@ -117,6 +117,11 @@ jobs:
       # every crate's test binaries too would relink a full Bevy executable per test target --
       # multi-GB of debug output that has actually blown through the windows-latest runner's free
       # disk before now. This also happens to be the only artifact worth downloading and running.
+      #
+      # This is the DEV build: `benilla-app`'s `default = ["dev"]` is on, so the binary carries
+      # bevy_egui, the debug panel, the perf HUD, the inspector, the capture harness and the probe
+      # fleet. That is deliberate for the everyday artifact -- it is the one you want when a bug
+      # report needs a debug panel. The `perf` job below is the one to benchmark.
       - name: cargo build --release -p benilla
         run: cargo build --release --locked -p benilla
 
@@ -125,6 +130,79 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}
           path: target/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # THE MEASURABLE BUILD. Separate job rather than a fourth matrix dimension on `build`, because
+  # it differs in both of the two things that decide frame cost, and the reasons are worth stating
+  # where they are read:
+  #
+  #   1. `--profile ship` -- `lto = "fat"` + `codegen-units = 1`, graded in-tree (decision 0736) at
+  #      -1.0 cpu_ms (-5 %) against default `release`. Cargo.toml's own comment says `ship` is what
+  #      an actual release is built with; nothing in CI was building it before this job.
+  #   2. `--no-default-features` -- the dev/player seam (decisions 0026 + 1173). This compiles the
+  #      instruments physically OUT rather than leaving them dormant behind a runtime flag. It is
+  #      also the exact invocation `scripts/gates.sh` uses to enforce "dev may see anything;
+  #      nothing may depend on dev", so this job doubles as that gate: if someone lands a coupling
+  #      from a non-dev module into a dev-only one, this goes red and the `build` job does not.
+  #
+  # NOT set here: `RUSTFLAGS=-Ctarget-cpu=native`. A runner's CPU is not the player's, and a
+  # native-tuned binary can fault outright on an older machine. Build with it locally for your own
+  # numbers; an uploaded artifact has to be portable.
+  #
+  # Cost note: fat LTO + one codegen unit means the link step is long and single-threaded, so this
+  # job runs well behind `build` on the same push. That is the trade the profile exists to make.
+  perf:
+    name: perf build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: benilla
+            asset_name: benilla-perf-linux-x86_64
+          - os: windows-latest
+            artifact_name: benilla.exe
+            asset_name: benilla-perf-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: benilla
+            asset_name: benilla-perf-macos-x86_64
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Same headers as the `build` job's Linux leg, same reasons -- a player build still links
+      # alsa and udev; the `dev` feature governs the instruments, not the audio/input backends.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own cache key: `ship` artifacts are LTO'd, single-codegen-unit objects built from a
+          # different feature set -- they share nothing with the `build` job's `release` ones, and
+          # a shared key would make one cache entry ping-pong between two incompatible artifact
+          # sets. Same rationale as the android job's key below.
+          key: ship
+          cache-on-failure: true
+
+      - name: cargo build --profile ship --no-default-features -p benilla
+        run: cargo build --profile ship --locked --no-default-features -p benilla
+
+      # `--profile ship` lands in `target/ship/`, not `target/release/` -- cargo names the output
+      # directory after the profile for any profile that is not the two built-in ones.
+      - name: Upload perf build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: target/ship/${{ matrix.artifact_name }}
           if-no-files-found: error
 
   # Separate job, not a fourth matrix row: the desktop three share one toolchain shape (rustup +
@@ -180,12 +258,43 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # The Android SDK (cmdline-tools, platform-tools, build-tools, one platform) and NDK, side by
-      # side. android-actions/setup-android installs the SDK; the NDK is pulled separately because
-      # cargo-apk needs a specific NDK version on ANDROID_NDK_HOME/ANDROID_NDK_ROOT, not whatever
-      # the SDK step's default component set happens to include.
+      # `packages: ''` IS THE FIX, and it is not optional. The action's own `packages` input
+      # defaults to `tools platform-tools`; Google removed the legacy standalone `tools` package
+      # from the SDK repository index in mid-September 2026, so that default now dies at
+      #
+      #     Warning: Failed to find package 'tools'
+      #     Error: The process '.../cmdline-tools/<v>/bin/sdkmanager' failed with exit code 1
+      #
+      # before a single compile step runs. Upstream: android-actions/setup-android#537, still
+      # open; v4 has the same default, so there is no version to bump to. An empty string makes
+      # the action skip its package install entirely (it filters empty entries out of the parsed
+      # list) while still standing up ANDROID_HOME/ANDROID_SDK_ROOT, putting cmdline-tools on
+      # PATH, and pre-accepting the SDK licenses -- which is all this job ever wanted from it.
+      #
+      # `platform-tools` is NOT a rename of `tools`. The old package's contents split three ways:
+      # adb/fastboot to platform-tools, sdkmanager/avdmanager to cmdline-tools/latest/bin, and
+      # aapt/zipalign/apksigner to build-tools/<version>. Only the third group matters to
+      # cargo-apk, and none of them were ever in `tools`, so nothing below asks for it.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      # What cargo-apk actually resolves, installed explicitly rather than inherited from an
+      # action default that can change under us again:
+      #   * build-tools -- aapt, zipalign and apksigner. cargo-apk 0.10 still shells out to aapt
+      #     (v1, not aapt2), which Google dropped from the build-tools line after 34.x, so this is
+      #     pinned at 34.0.0 rather than tracking latest. If you ever move to a cargo-apk that
+      #     speaks aapt2, this pin is what to revisit.
+      #   * platforms;android-31 -- must MATCH `target_sdk_version = 31` in benilla-android's
+      #     [package.metadata.android.sdk]; cargo-apk resolves android.jar out of this exact
+      #     directory. Raise the two together or not at all.
+      #   * platform-tools -- adb. Not needed to build an APK; kept so the job can grow an
+      #     install/instrumentation step later without another SDK round trip.
+      - name: Install pinned SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-31" "build-tools;34.0.0"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
@@ -210,6 +319,12 @@ jobs:
       # `--release` mirrors the desktop jobs. `-p benilla-android` targets the cdylib crate the
       # scaffold added, not the desktop `benilla` bin -- the two are separate crates on purpose
       # (see benilla-android/Cargo.toml) so this line can never accidentally build the wrong one.
+      #
+      # Deliberately NOT `--profile ship --no-default-features` like the `perf` job: cargo-apk
+      # keys its own output path off release-vs-debug and has never been run against this crate at
+      # all, so a first pass changes one variable, not three. Once this job is green end to end,
+      # `--no-default-features` is the next thing to add (a phone has no use for the egui debug
+      # panel, and it is the larger of the two wins).
       - name: cargo apk build --release -p benilla-android
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
