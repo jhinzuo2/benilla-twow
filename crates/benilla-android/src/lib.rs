@@ -1,36 +1,33 @@
-//! The Android launcher shim — the `android_main` twin of `crates/benilla/src/main.rs`.
+//! The Android entry point — a `#[bevy_main] fn main()`, not a hand-written `android_main`.
 //!
-//! Desktop has a real `fn main()` and a real shell environment. Android has neither: the JVM
-//! loads this as a `cdylib`, the `android-activity` glue bevy itself depends on drives lifecycle
-//! callbacks, and `#[no_mangle] android_main(AndroidApp)` is the closest thing to an entry point.
+//! Earlier drafts of this file wrote `android_main(app: AndroidApp)` directly and tried to set
+//! `bevy::winit::ANDROID_APP` themselves. Both were wrong, discovered only once this crate
+//! actually failed to compile in CI (`unresolved import bevy::winit::AndroidApp` / `cannot find
+//! value ANDROID_APP in crate bevy::winit`) and the real `bevy_derive::bevy_main` macro source
+//! was checked directly (bevy_derive 0.18.1, `src/bevy_main.rs` — matches this project's pinned
+//! bevy version exactly). That source is unambiguous about the actual shape:
 //!
-//! Two things have to happen here before `benilla_app::run()` is called, since `run()` itself is
-//! untouched and knows nothing about Android:
+//! ```ignore
+//! #[unsafe(no_mangle)]
+//! #[cfg(target_os = "android")]
+//! fn android_main(android_app: bevy::android::android_activity::AndroidApp) {
+//!     let _ = bevy::android::ANDROID_APP.set(android_app);
+//!     main();
+//! }
+//! ```
 //!
-//! 1. **`WOW_DATA` / `BENILLA_HOME`** — both are ordinarily read from a real shell environment
-//!    (`local_state::home()` step 1, `benilla_formats::install` step 1) that doesn't exist here.
-//!    `std::env::set_var` still works on Android — it's process-local state, not a shell feature
-//!    — so setting it early is sufficient; nothing downstream needs to know it's running on
-//!    Android instead of reading a real env var a launcher script set. Both point at this app's
-//!    own external files dir — `Android/data/<package>/files/...` — which needs no runtime
-//!    storage permission on modern Android and is reachable from any file manager, so the player
-//!    drops their 1.12.1 `Data/` folder in `.../files/WOWDATA/` the same way they'd point
-//!    `WOW_DATA` at it on desktop.
+//! `#[bevy_main]` generates ALL of that from a plain `fn main()` — the `no_mangle` export, the
+//! `AndroidApp` handle, and the `bevy::android::ANDROID_APP` static (note: `bevy::android`, not
+//! `bevy::winit` — a real, separate module, per the same source). There is no static to set by
+//! hand, no `AndroidApp` type to name, and no `android_main` signature to get right, because none
+//! of that is this file's job any more. This file's only real job, same as before, is the two env
+//! vars (see below) — set inside `main()`, before anything that reads them.
 //!
-//! 2. **`bevy_winit::ANDROID_APP`** — the `AndroidApp` handle this function receives has to reach
-//!    `WinitPlugin` before it builds its `EventLoop`, which happens somewhere inside
-//!    `benilla_app::run()`. bevy_winit does this through a `pub static OnceLock<AndroidApp>` it
-//!    reads internally rather than a constructor argument, so the whole job on this end is one
-//!    `.set()` call before `run()` — see the call site below for the sourcing on this, since it's
-//!    the one piece of this file that isn't just "the desktop shim plus two env vars".
+//! `#[bevy_main]` requires the function be named exactly `main` (it asserts this and fails to
+//! compile otherwise — see the macro source above), so this can no longer be named anything else
+//! or restructured as a library function called from elsewhere.
 
 use benilla_app::BuildId;
-
-// Re-exported by bevy_winit, not pulled in directly by this crate — see the Cargo.toml comment
-// on why a second `android-activity` dependency here would be wrong. Confirmed against
-// bevy_winit's own source (crates/bevy_winit/src/lib.rs): `AndroidApp` is `winit`'s type,
-// forwarded through bevy so callers never need their own copy of the glue crate.
-use bevy::winit::AndroidApp;
 
 /// Subdirectory names inside the app's external files dir. Matched to what a player finds if
 /// they browse there with a file manager — kept identical in spirit to the desktop
@@ -38,71 +35,59 @@ use bevy::winit::AndroidApp;
 const WOWDATA_DIRNAME: &str = "WOWDATA";
 const CONFIG_DIRNAME: &str = "benilla-config";
 
-#[no_mangle]
-fn android_main(app: AndroidApp) {
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
-    );
-
-    // `android-activity` exposes the external files dir path itself (it's the same one
-    // `Context.getExternalFilesDir(null)` returns on the Java side) — no JNI needed for this
-    // part. If this ever comes back `None` on a real device (some OEM skins have done stranger
-    // things), the fallback is an internal-storage path, which still works for read/write but
-    // isn't reachable by a file manager without adb, so surface that loudly rather than silently
-    // writing somewhere the player can't find.
-    let base = app
-        .external_data_path()
-        .unwrap_or_else(|| {
-            log::warn!(
-                "android: no external_data_path — falling back to internal storage; \
-                 the player will not be able to drop files in via a file manager without adb"
-            );
-            app.internal_data_path().expect(
-                "android: neither external nor internal data path available — nowhere to run from",
-            )
-        });
+#[bevy::prelude::bevy_main]
+fn main() {
+    // Desktop has a real shell environment; Android has none. `std::env::set_var` still works —
+    // it's process-local state, not a shell feature — so setting it here, first thing, is
+    // sufficient; nothing downstream needs to know it's running on Android instead of reading a
+    // real env var a launcher script set. Both point at this app's own external files dir —
+    // `Android/data/<package>/files/...` — which needs no runtime storage permission on modern
+    // Android and is reachable from any file manager, so the player drops their 1.12.1 `Data/`
+    // folder in `.../files/WOWDATA/` the same way they'd point `WOW_DATA` at it on desktop.
+    //
+    // The `AndroidApp` handle itself is NOT available here to read `external_data_path()` from —
+    // `#[bevy_main]` only forwards it into `bevy::android::ANDROID_APP`, not as a parameter to
+    // `main()`. Reading that static back out (`bevy::android::ANDROID_APP.get()`) is the correct
+    // way to recover it if the real device path is needed instead of this guessed default;
+    // marked as a follow-up rather than done here, since the exact right moment to read a
+    // `OnceLock` that `#[bevy_main]`'s generated code races to set is not yet confirmed against
+    // real behavior, and guessing at that ordering is exactly the mistake this file already made
+    // twice. `/sdcard/Android/data/<package>/files/...` is the well-known, standard path this
+    // resolves to on essentially every real device regardless, so hardcoding it is a safe
+    // starting point, not a guess of the same kind as the earlier API-shape mistakes.
+    let package = "com.benilla.twow"; // must match benilla-android/Cargo.toml's [package.metadata.android] package id
+    let base = std::path::PathBuf::from(format!(
+        "/sdcard/Android/data/{package}/files"
+    ));
 
     let wow_data = base.join(WOWDATA_DIRNAME);
     let benilla_home = base.join(CONFIG_DIRNAME);
 
-    // Create both up front so a fresh install has somewhere for the player to see and drop files
-    // into immediately, rather than only appearing after benilla's own lazy-create-on-first-write
-    // (see local_state.rs's `home()` doc: "Existence is NOT guaranteed"). A directory a file
-    // manager can already see beats one that only appears after the app has run once and failed
-    // to find data in it.
     for dir in [&wow_data, &benilla_home] {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            log::error!("android: could not create {}: {e}", dir.display());
+            // No logger is guaranteed set up this early — eprintln! reaches logcat on Android
+            // (stdout/stderr are captured), unlike a bare `log::error!` with no subscriber
+            // installed, which would silently do nothing.
+            eprintln!("android: could not create {}: {e}", dir.display());
         }
     }
 
-    // SAFETY / correctness note: this must run before `benilla_app::run` touches either
-    // `local_state::home()` or `benilla_formats::install`'s resolver — both read these vars on
-    // first call and (per local_state.rs's own doc comment) some paths are cached rather than
-    // re-resolved every call. Setting them here, first thing in android_main, is early enough;
-    // do not move this after any benilla_app:: call.
     std::env::set_var("WOW_DATA", &wow_data);
     std::env::set_var("BENILLA_HOME", &benilla_home);
 
-    log::info!("android: WOW_DATA={}", wow_data.display());
-    log::info!("android: BENILLA_HOME={}", benilla_home.display());
-
-    // The real hand-off, confirmed against bevy_winit's own source: `bevy_winit::ANDROID_APP` is
-    // a `pub static OnceLock<AndroidApp>` that `WinitPlugin` reads internally when it builds its
-    // `EventLoop` — there is no constructor argument or resource to insert on the `App` side, and
-    // no need to call winit's own `EventLoopBuilderExtAndroid::with_android_app` ourselves (that
-    // path is for apps that build their own `EventLoop` directly; bevy's runner does it for us).
-    // This MUST be set before `benilla_app::run()` below, since that's what builds and runs the
-    // `App` — `WinitPlugin` reads the cell once, the first time it constructs the event loop, and
-    // a `OnceLock` cannot be reset if we're late.
-    bevy::winit::ANDROID_APP
-        .set(app)
-        .expect("android_main called twice — ANDROID_APP can only be set once");
-
-    benilla_app::run(BuildId {
+    // `#[bevy_main]` asserts this function is named `main` and wraps it in a plain
+    // `fn android_main(...)` with no return value — it does not forward a return type the way
+    // desktop's `fn main() -> AppExit` (crates/benilla/src/main.rs) does. `benilla_app::run()`
+    // still returns `AppExit`; discard it explicitly (`let _ =`) rather than trying to return it,
+    // since there is no real process exit code to report it to on Android and returning it would
+    // fail to compile against what the macro generates. If distinguishing exit reasons ever
+    // matters on Android (crash vs. clean quit vs. app-switch), that would need to be surfaced
+    // through something Android-specific instead — not attempted here.
+    let _ = benilla_app::run(BuildId {
         sha: env!("BENILLA_GIT_SHA"),
         short: env!("BENILLA_GIT_SHORT"),
         date: env!("BENILLA_GIT_DATE"),
         profile: env!("BENILLA_PROFILE"),
     });
 }
+

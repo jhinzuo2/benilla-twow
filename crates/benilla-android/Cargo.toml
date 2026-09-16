@@ -3,15 +3,24 @@ name = "benilla-android"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = """Android entry point. Mirrors crates/benilla's desktop shim, but as a cdylib the \
-    JVM loads instead of a bin: no real fn main() on Android, so the entry point is \
-    android_main(AndroidApp), which sets WOW_DATA/BENILLA_HOME and hands the AndroidApp to \
-    bevy_winit's ANDROID_APP static before calling the same benilla_app::run() the desktop shim \
-    calls."""
+description = """Android entry point: a #[bevy_main] fn main(), matching bevy's own maintained \
+    mobile example (bevyengine/bevy examples/mobile). The macro generates the real \
+    android_main/AndroidApp/ANDROID_APP plumbing itself (verified against bevy_derive 0.18.1's \
+    own macro source) -- this crate only sets WOW_DATA/BENILLA_HOME before calling the same \
+    benilla_app::run() the desktop shim calls. An earlier version of this file hand-wrote \
+    android_main and guessed at bevy::winit::AndroidApp/ANDROID_APP; both were wrong and failed \
+    to compile -- see src/lib.rs's header for what actually happened and where the real paths \
+    (bevy::android, not bevy::winit) came from."""
 
-# Android needs a cdylib the JVM/NativeActivity loads (libbenilla_android.so), not a bin target.
-# Keep the desktop `benilla` crate's bin untouched — this is a parallel entry point, not a
-# replacement, so `cargo build -p benilla` on desktop is unaffected.
+# Android needs a cdylib the JVM/NativeActivity loads (libbenilla_android.so), not a bin target --
+# confirmed against bevy's own mobile example (crate-type = ["staticlib", "cdylib"] there, for an
+# iOS+Android-shared crate; cdylib alone is right here since this crate is Android-only) and
+# against a real practitioner's write-up (nikl.me, "Notes on Android development using Bevy")
+# describing the identical two-crate split this workspace already has: a desktop bin
+# (crates/benilla) plus a separate `#[bevy_main]`-only cdylib (this crate) for Android, because
+# cargo-apk specifically requires a cdylib. Keep the desktop `benilla` crate's bin untouched --
+# this is a parallel entry point, not a replacement, so `cargo build -p benilla` on desktop stays
+# unaffected.
 [lib]
 name = "benilla_android"
 crate-type = ["cdylib"]
@@ -24,21 +33,13 @@ crate-type = ["cdylib"]
 benilla-app = { path = "../benilla-app", default-features = false }
 benilla-buildstamp = { path = "../benilla-buildstamp" }
 
-# Needed directly (not just transitively through benilla-app) for `bevy::winit::AndroidApp` (the
-# type this crate's `android_main` takes) and `bevy::winit::ANDROID_APP` (the hand-off static —
-# see src/lib.rs). `default-features = false` here too, matching benilla-app's own pin, so this
-# doesn't pull in a second differently-featured copy of bevy for the dependency resolver to
-# reconcile. The workspace's shared `[workspace.dependencies] bevy = ...` entry supplies the
-# version and feature list; this just opts in.
+# Needed directly (not just transitively through benilla-app) for `bevy::prelude::bevy_main` --
+# the attribute macro this crate's src/lib.rs uses on its `fn main()`. `default-features = false`
+# here too, matching benilla-app's own pin, so this doesn't pull in a second differently-featured
+# copy of bevy for the dependency resolver to reconcile. The workspace's shared
+# `[workspace.dependencies] bevy = ...` entry supplies the version and feature list; this just
+# opts in.
 bevy.workspace = true
-
-# NOT a direct android-activity dependency. winit's own docs are explicit: "there can only be a
-# single implementation of the android_activity glue crate linked with an application because it
-# is responsible for the application's android_main() entry point" — and apps should import
-# AndroidApp from winit's re-export, not pull the crate in a second time themselves. A second
-# copy is the textbook cause of a silent black screen / no-panic startup hang on Android.
-android_logger = "0.14"
-log = "0.4"
 
 [build-dependencies]
 benilla-buildstamp = { path = "../benilla-buildstamp" }
