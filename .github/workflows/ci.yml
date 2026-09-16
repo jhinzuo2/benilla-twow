@@ -1,4 +1,4 @@
-name: CI ( Build without Test blockage)
+name: CI ( Build without Test blockage) + Android
 
 on:
   push:
