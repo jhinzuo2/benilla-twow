@@ -502,6 +502,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "benilla-android"
+version = "0.1.0"
+dependencies = [
+ "benilla-app",
+ "benilla-buildstamp",
+ "bevy",
+]
+
+[[package]]
 name = "benilla-app"
 version = "0.1.0"
 dependencies = [
