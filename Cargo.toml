@@ -27,7 +27,40 @@ anyhow = "1.0.102"
 # `ui`, which would quietly bring the audio stack with it.
 bevy = { version = "0.18.1", default-features = false, features = [
     "default_app",
-    "default_platform",
+    # `default_platform` decomposed, MINUS `android-game-activity` — same technique as the
+    # `audio` subtraction above. Bevy 0.18.1's `default_platform` is `[std, android-game-activity,
+    # android_shared_stdcxx, bevy_gilrs, bevy_winit, default_font, multi_threaded, webgl2, x11,
+    # wayland, sysinfo_plugin]`; the ten features below are that list with `android-game-activity`
+    # left out, nothing added or renamed.
+    #
+    # Why: `crates/benilla-app/Cargo.toml` turns on `android-native-activity` under
+    # `cfg(target_os = "android")` — NativeActivity is the activity class `benilla-android`'s
+    # scaffold targets, and the one cargo-apk builds against with no extra Gradle/Java. Cargo
+    # unions feature sets across every place a workspace names the same dependency at the same
+    # version, so leaving `default_platform` intact here meant the aarch64 build got BOTH
+    # `game-activity` (from this collection) and `native-activity` (from benilla-app) — and
+    # `android-activity` 0.6.1 refuses that combination outright:
+    #   error: The "game-activity" and "native-activity" features cannot be enabled at the same
+    #   time
+    # decomposing the collection and dropping the one entry is the same fix as the `audio` case:
+    # a workspace-level default can't be subtracted from downstream, so the subtraction has to
+    # happen here, at the source.
+    #
+    # This keeps the activity backend chosen in exactly ONE place: benilla-app's android target
+    # block. If that ever moves to GameActivity (needs a Java/Kotlin GameActivity subclass and
+    # the AndroidX Game SDK on the Gradle side — not compatible with a bare cargo-apk build),
+    # flip it there and drop this line's exclusion — don't reach back for `default_platform`
+    # instead, which would quietly reintroduce this exact conflict.
+    "std",
+    "android_shared_stdcxx",
+    "bevy_gilrs",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "webgl2",
+    "x11",
+    "wayland",
+    "sysinfo_plugin",
     "2d_bevy_render",
     "3d_bevy_render",
     "ui_api",
