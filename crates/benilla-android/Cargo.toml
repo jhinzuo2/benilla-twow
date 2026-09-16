@@ -3,11 +3,11 @@ name = "benilla-android"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Android entry point. Mirrors crates/benilla's desktop shim, but as a cdylib the \
+description = """Android entry point. Mirrors crates/benilla's desktop shim, but as a cdylib the \
     JVM loads instead of a bin: no real fn main() on Android, so the entry point is \
     android_main(AndroidApp), which sets WOW_DATA/BENILLA_HOME and hands the AndroidApp to \
     bevy_winit's ANDROID_APP static before calling the same benilla_app::run() the desktop shim \
-    calls."
+    calls."""
 
 # Android needs a cdylib the JVM/NativeActivity loads (libbenilla_android.so), not a bin target.
 # Keep the desktop `benilla` crate's bin untouched — this is a parallel entry point, not a
