@@ -1,57 +1,90 @@
-# benilla Android scaffold — status
+<div align="center">
+  <h1>benilla</h1>
+  <p><b>A from-scratch World of Warcraft 1.12.1 client in Rust and <a href="https://bevy.org">Bevy</a></b></p>
+  <p>
+    <a href="https://discord.gg/wJSJx467G4"><img src="https://img.shields.io/discord/1529280129518538922?style=for-the-badge&logo=discord&logoColor=white&label=discord&color=5865F2" alt="Discord"></a>
+    <a href="https://www.youtube.com/playlist?list=PLdCnpZNKxyb8"><img src="https://img.shields.io/badge/devlog-youtube-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube devlog"></a>
+    <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue?style=for-the-badge" alt="License"></a>
+  </p>
+</div>
 
-Goal for this pass: get to "opens a window on a real device" — no touch UI, no storage-permission
-UX, no addon/FrameXML work. That's it.
+> [!IMPORTANT]
+> **Issues and pull requests are closed here.** benilla is a solo project developed in a private
+> tree; this repo is its export, published as squashed snapshots, so a PR here has nothing to land
+> on. The best way to contribute is to join the [Discord](https://discord.gg/wJSJx467G4) and report
+> the bugs you find. Questions and ideas are welcome in the same place.
 
-## What's here
+benilla speaks the original 1.12.1 protocol, so it connects to any server the real client could,
+and reads its game data at runtime from your own 1.12.1 install. Every file format and the network
+protocol are implemented from scratch, with no original client code, no third-party WoW crates,
+and no bundled game assets.
 
-- `crates/benilla-android/` — drop this whole folder into your fork's `crates/` directory.
-  `members = ["crates/*"]` in the workspace root picks it up with no other Cargo.toml edit.
-- A one-line addition to `crates/benilla-app/Cargo.toml` (already applied to the clone this was
-  built against — re-apply the same `[target.'cfg(target_os = "android")'.dependencies]` block to
-  your fork) that turns on bevy_winit's `android-native-activity` feature.
+## What works
 
-## What this actually does
+- **Formats:** readers for the full asset stack (MPQ patch chain, BLP, DBC, ADT/WDT/WDL, M2, WMO),
+  wired into Bevy as an asset source.
+- **World:** streamed terrain out to the horizon, portal-culled WMOs with interior lighting,
+  doodads and ground clutter, swimmable liquids, sky and weather, and the client's own day/night
+  lighting, fog and gamma passes.
+- **Models:** GPU-skinned M2s with the full animation controller, a near feature-complete particle
+  system, ribbons, and animated gameobjects from doors to lifts.
+- **Characters:** customization end to end, the armor texture composite, weapons with sheathing and
+  enchant glows, shapeshift forms, stealth and mounts.
+- **Movement:** a WoW-feel controller, networked movement in both directions, the server-granted
+  modes from slow fall to roots, a follow camera with collision, boats, zeppelins and taxi flights.
+- **Networking:** SRP6 auth through world-session crypto, the object mirror into the ECS, and live
+  wire coverage from movement and chat through spells, party, quests, mail, trade, vendors, bank,
+  loot, the auction house and PvP honor.
+- **UI:** a from-scratch FrameXML + Lua engine driving the built-in interface, from the login and
+  character screens through the full HUD, the classic windows (guild, macros and key bindings
+  included), chat, nameplates, floating combat text and tooltips; third-party addons load from
+  a `benilla-config/AddOns/` folder beside the executable (partial: AtlasLoot and Bagnon run,
+  see below).
+- **Combat:** melee on the faithful swing law, ranged and Auto Shot, casting with GCD and
+  cooldowns, combo points, crowd control that really holds you, and the spell visual pipeline.
+- **Audio:** music, ambience and SFX under the client's own selection and crossfade rules, with
+  interior and underwater transitions and zone reverb.
 
-1. `android_main(app: AndroidApp)` is the entry point the JVM reaches via `cargo-apk`/`cargo-ndk`
-   (build tooling — see "not done" below).
-2. Sets `WOW_DATA` and `BENILLA_HOME` to `<external-files-dir>/WOWDATA` and
-   `<external-files-dir>/benilla-config` — i.e. `Android/data/<package>/files/...`, which needs no
-   runtime storage permission and is where you'd drop your 1.12.1 `Data/` folder via any file
-   manager. Verified against `local_state.rs` and `benilla-formats/src/install.rs`: both already
-   resolve these as their first-priority env var override, so no engine code changes were needed
-   for this part.
-3. Hands the `AndroidApp` to `bevy::winit::ANDROID_APP` (a `pub static OnceLock<AndroidApp>`),
-   which is the real mechanism `WinitPlugin` reads when it builds its `EventLoop` — confirmed
-   against bevy_winit's own source, not guessed. No `benilla_app::run()` signature change needed.
-4. Calls the same `benilla_app::run()` the desktop shim calls, unmodified.
+## Where it's going
 
-## What's NOT done — the actual next steps, roughly in order
+benilla is done when a 1.12.1 player can do everything here that they could in the original
+client, it looks and feels the same, and it runs from a download on Windows, Linux and macOS.
+No dates; the order is what is likely, not a promise.
 
-1. **Build tooling.** Nothing here sets up `cargo-apk` or `cargo-ndk` + a Gradle wrapper, an
-   `AndroidManifest.xml`, or app icons/package id. That's the very next thing needed before any
-   of this can even compile-and-run — right now this is source with no way to produce an APK yet.
-2. **First-run reality check.** wgpu's Vulkan backend on Android, surface creation timing on
-   `Resumed` (NativeActivity's surface isn't available until after that lifecycle callback, and
-   Bevy/winit's Android backend has had real historical bugs here — see bevyengine/bevy#8874, a
-   black-screen issue with a `Gl` backend fallback on one device), and whatever your specific
-   device's GPU/driver does that a search engine can't predict. Expect this to be where most of
-   the actual debugging time goes, not the Rust code.
-3. **Touch input.** Nothing here adds a movement joystick or camera-drag. The existing
-   keyboard/mouse-driven movement and camera systems are untouched; a touch source needs to feed
-   the same systems, not replace them.
-4. **Audio.** `cpal` is already in the dependency graph for non-macOS targets (confirmed in
-   `benilla-app/Cargo.toml`), and cpal has an Android/Oboe backend, but this hasn't been tested —
-   flagged as "probably fine, unverified" rather than "known working."
-5. **Lifecycle correctness.** Backgrounding, `Paused`/`Resumed` cycling, and the network
-   connection surviving any of that are explicitly out of scope for this pass — expect a quick
-   test session to break if you switch apps mid-session, and don't chase that yet.
+- Battlegrounds and meeting stones, then the long tail of small features that separates a
+  working client from a finished one.
+- Addons, options and performance, ongoing.
+- The no-brainer fixes from VanillaFixes, SuperWoW and the like.
+- Playable downloads for Windows, Linux and macOS. Linux first.
 
-## A note on how this was put together
+Not planned: other expansions or client versions, Warden (anticheat).
 
-Earlier drafts of this scaffold assumed a standalone `android-activity` dependency and a manual
-`EventLoopBuilderExtAndroid::with_android_app()` call — both wrong, corrected after checking
-winit's actual docs and bevy_winit's actual source rather than trusting the first plausible-looking
-API shape. Worth rebuilding early and reading the real compiler errors rather than assuming the
-rest of this is equally solid — it's been checked against real sources where checked, but it has
-never been compiled.
+## Running it
+
+You need a **1.12.1 (build 5875) client install** for game data, a vanilla server to connect to,
+and stable Rust. Any 1.12.1 core works; [vmangos](https://github.com/vmangos/core) is what
+development runs against, and cMaNGOS and the rest speak the same protocol.
+
+```sh
+WOW_DATA=/path/to/WoW/Data cargo run --release -p benilla
+```
+
+The server defaults to `localhost:3724`, the stock `realmd` auth port. Point `WOW_HOST`
+at any IP or hostname, appending the auth port if yours is remapped
+(`WOW_HOST=play.example.com:5000`). Credentials go in at the login screen, or set `WOW_USER` /
+`WOW_PASS` to skip it.
+
+---
+
+Early inspiration and file format guidance came from the
+[wowemulation-dev](https://github.com/wowemulation-dev) community, and
+[warcraft-rs](https://github.com/wowemulation-dev/warcraft-rs) in particular.
+
+benilla is an independent fan project, not affiliated with or endorsed by Blizzard Entertainment.
+It ships **no Blizzard content** — no art, models, sounds, maps, MPQ contents or FrameXML; you
+provide your own legally obtained 1.12.1 client. The interface code under
+`crates/benilla-app/assets/ui/` is ours, written to the client's own layout and API names so that
+the windows look right and 1.12.1 addons find the names they expect.
+
+World of Warcraft is a trademark of Blizzard Entertainment, Inc. Our own code is licensed under
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
