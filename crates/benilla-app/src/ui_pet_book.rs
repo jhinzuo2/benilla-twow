@@ -72,8 +72,7 @@ impl Plugin for UiPetBookPlugin {
                 // tab flipped this frame already reads a populated book.
                 feed_pet_book
                     .in_set(UnitFeed)
-                    .before(crate::ui_action::CooldownEvents)
-                    .before(UiInput),
+                    .before(crate::ui_action::CooldownEvents),
                 // After the input pass, and — like `ui_pet`'s own drain — writing back into
                 // `PetBar`, whose next feed carries the mirrored autocast bit.
                 drain_pet_book.after(UiInput),
@@ -89,7 +88,6 @@ struct FeedMemory {
     pushed: PetBookState,
 }
 
-#[allow(clippy::too_many_arguments)] // a Bevy system's full input set
 fn feed_pet_book(
     script: Option<NonSendMut<UiScript>>,
     bar: Res<PetBar>,
@@ -176,7 +174,6 @@ fn book_changed(fresh: &PetBookState, old: &PetBookState) -> bool {
 }
 
 /// One book slot, fully resolved.
-#[allow(clippy::too_many_arguments)]
 fn slot_view(
     entry: PetActionEntry,
     d: &SpellDisplay,
