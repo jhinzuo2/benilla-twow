@@ -123,8 +123,9 @@ fn windows_documents_dir() -> Option<PathBuf> {
     unsafe {
         let mut raw: *mut u16 = std::ptr::null_mut();
         // dwFlags = 0 (KF_FLAG_DEFAULT: no special handling — the ordinary, possibly-redirected
-        // path); hToken = 0 (the calling process's own user, no impersonation).
-        let hr = SHGetKnownFolderPath(&FOLDERID_Documents, 0, 0, &mut raw);
+        // path); hToken = null (the calling process's own user, no impersonation) — HANDLE is
+        // `*mut c_void` in windows-sys 0.59, not an integer, hence `null_mut()` rather than `0`.
+        let hr = SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut raw);
         if hr != S_OK || raw.is_null() {
             return None;
         }
