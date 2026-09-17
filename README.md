@@ -9,7 +9,7 @@
 </div>
 
 > [!IMPORTANT]
-> **Issues and pull requests are closed here.** benilla is a solo project developed in a private
+> **Issues and pull requests are closed upstream at benilla here at benilla-twow I'd love some Issues posted or PR's incase you found something i missed .** benilla is a solo project developed in a private
 > tree; this repo is its export, published as squashed snapshots, so a PR here has nothing to land
 > on. The best way to contribute is to join the [Discord](https://discord.gg/wJSJx467G4) and report
 > the bugs you find. Questions and ideas are welcome in the same place.
