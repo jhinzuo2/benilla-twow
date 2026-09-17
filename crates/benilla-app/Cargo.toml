@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "The Bevy app as a library: everything but the build-id stamp, which lives in the `benilla` launcher shim so a commit dirties ~30 lines instead of this crate (decision 0993)"
 
-[lints]
-workspace = true
-
 [features]
 # **The dev/player seam** (decisions 0026 + 1173). Default-ON, so every ordinary `cargo run`,
 # capture, probe and gate builds exactly what it built before. `--no-default-features` compiles
@@ -189,7 +186,15 @@ cpal = "0.17"
 # `GetProcessTimes`, `GetThreadTimes` and `GetSystemTimes`, the twins of the `getrusage`,
 # `clock_gettime` and `host_statistics64` arms. The version is one the graph already carries.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # `local_state::windows_documents_dir` — SHGetKnownFolderPath (Win32_UI_Shell) and the
+    # CoTaskMemFree that frees the string it allocates (Win32_System_Com). Added for the
+    # Documents-folder config fix; see that function's doc comment for why it exists.
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+] }
 
 # Android: turns on bevy_winit's NativeActivity backend, which is what makes
 # `bevy::winit::AndroidApp`/`ANDROID_APP` exist at all (crates/benilla-android reads both — see

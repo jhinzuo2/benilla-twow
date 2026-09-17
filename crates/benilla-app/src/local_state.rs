@@ -21,15 +21,20 @@
 //! point-in-time snapshot of the law it set and, like every decision record, immutable — it lists
 //! none of the residents added since, and it should not.
 //!
-//! Resolution, in order — deliberately the **same three-step shape** as
-//! [`benilla_formats::wow_data`], because it is one law over two folders:
+//! Resolution, in order — the same three-step shape as [`benilla_formats::wow_data`] for the
+//! platform-agnostic steps (one law over two folders), with one Windows-only step ahead of them
+//! (see [`windows_documents_dir`] for why Windows alone needed one):
 //! 1. **`$BENILLA_HOME`** — explicit override (tests point it at a tempdir; a shared-config setup
 //!    points it wherever it likes).
-//! 2. **`<project folder>/benilla-config/`** — `#[cfg(feature = "dev")]` only, so dev runs across the
+//! 2. **Windows only: `Documents\benilla-twow\benilla-config\`** — ahead of steps 3/4 because both
+//!    of those name a path known only to the machine that *compiled* the binary, which breaks in a
+//!    way unique to a binary handed to someone else on Windows (`home`'s own comment has the
+//!    failure mode). Not gated to dev or player builds — both carry the bug it fixes.
+//! 3. **`<project folder>/benilla-config/`** — `#[cfg(feature = "dev")]` only, so dev runs across the
 //!    worktree pool keep one predictable place. Gated for the same reason the install resolver's
 //!    project-folder probe is: a shipped binary must not carry the build machine's source tree.
-//!    (`.gitignore` carries `/benilla-config` for it.)
-//! 3. **`<exe dir>/benilla-config/`** — the release answer: your settings sit next to the program that
+//!    (`.gitignore` carries `/benilla-config` for it.) Unreached on Windows once step 2 succeeds.
+//! 4. **`<exe dir>/benilla-config/`** — the release answer: your settings sit next to the program that
 //!    wrote them.
 //!
 //! **Capture/probe runs are hermetic**: with `$WOW_CAPTURE` set every path resolves to `None` —
@@ -61,19 +66,80 @@ pub(crate) fn home() -> Option<PathBuf> {
     if let Some(over) = std::env::var_os("BENILLA_HOME") {
         return Some(PathBuf::from(over));
     }
-    // 2 · the project folder, dev builds only — see [`dev_project_root`] for why that is the
+    // Windows: `Documents\benilla-twow\benilla-config`, unconditionally — dev and player builds
+    // alike, ahead of steps 3/4 below rather than added after them. Both of those steps name a
+    // path known only to the machine that COMPILED the binary — step 3 bakes in
+    // `CARGO_MANIFEST_DIR`, step 4 resolves next to whatever `current_exe()` reports — and on
+    // every other platform that is exactly the intended behaviour (§3/§4's own doc comments).
+    // Windows breaks that assumption in a way the other platforms don't: a `dev`-feature binary
+    // built on a GitHub Actions Windows runner and handed to a player carries that runner's own
+    // checkout path baked in at compile time (`D:\a\<repo>\<repo>\benilla-config`) — a directory
+    // that exists on no machine but the one that built it, and Windows will happily create it in
+    // place given a `D:` drive of some description exists. This is not a hardening step in the
+    // 0954/1175 sense (that decision record's reasoning against a hidden platform config dir
+    // still holds, and Documents is user-visible, so it is not in tension with it) — it exists
+    // because this bug class doesn't reproduce anywhere the CI/local checkout path happens to
+    // match the running machine's, which on macOS/Linux dev boxes it usually does, and on a
+    // Windows player's machine it never can. Not gated behind `#[cfg(feature = "dev")]`: a
+    // `ship`-profile (`--no-default-features`) Windows binary has the same bug one step later,
+    // landing beside whatever folder the player happened to unzip it into rather than a build
+    // path — less alarming, but just as much "wherever it got compiled/unpacked" as the dev case,
+    // and just as much not what a player expects. `windows_documents_dir` returning `None`
+    // (SHGetKnownFolderPath failing, or a caller on a matching test path) falls through to
+    // steps 3/4 as before rather than losing persistence outright.
+    #[cfg(windows)]
+    if let Some(docs) = windows_documents_dir() {
+        return Some(docs.join("benilla-twow").join(STATE_DIR));
+    }
+    // 3 · the project folder, dev builds only — see [`dev_project_root`] for why that is the
     // PRIMARY checkout and not the worktree this binary was built in. `None` in a player build,
     // where there is no source tree to name (`run_mode::dev_source_dir`).
     if let Some(root) = dev_project_root() {
         return Some(root.join(STATE_DIR));
     }
-    // 3 · beside the binary. A dev build never reaches here — that is what step 2 means by "one
+    // 4 · beside the binary. A dev build never reaches here — that is what step 3 means by "one
     // predictable place", and it is why the release path is proven with a player build, not a
     // dev one.
     std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
         .map(|dir| dir.join(STATE_DIR))
+}
+
+/// The current user's Documents folder via the shell API Microsoft documents for exactly this
+/// (`FOLDERID_Documents`), not `%USERPROFILE%\Documents` string-glued by hand: a redirected or
+/// OneDrive-relocated Documents folder — both common, neither the player's fault — lives somewhere
+/// else entirely, and `SHGetKnownFolderPath` is the one call that already knows where. `None` on
+/// any failure (the call erroring, or the returned pointer being null); callers fall back to the
+/// existing resolution rather than treating that as fatal.
+#[cfg(windows)]
+fn windows_documents_dir() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::S_OK;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+
+    unsafe {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // dwFlags = 0 (KF_FLAG_DEFAULT: no special handling — the ordinary, possibly-redirected
+        // path); hToken = 0 (the calling process's own user, no impersonation).
+        let hr = SHGetKnownFolderPath(&FOLDERID_Documents, 0, 0, &mut raw);
+        if hr != S_OK || raw.is_null() {
+            return None;
+        }
+        let len = {
+            let mut n = 0isize;
+            while *raw.offset(n) != 0 {
+                n += 1;
+            }
+            n as usize
+        };
+        let wide = std::slice::from_raw_parts(raw, len);
+        let path = PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(raw as *const core::ffi::c_void);
+        Some(path)
+    }
 }
 
 /// The project folder a dev build keeps its state in: **the primary checkout**, whichever worktree
@@ -523,6 +589,10 @@ mod tests {
     /// hung off the shared install. The dev half is asserted structurally (a `.git` *file* means a
     /// linked worktree, and then the answer must be somewhere else), so it says the same thing
     /// whether it runs in the primary or in a slot.
+    ///
+    /// Windows is a third, earlier-winning case (the Documents-folder fix above) rather than a
+    /// variant of either of the other two, so it gets its own branch up front instead of being
+    /// forced into the project-folder/exe-dir shape the other platforms share.
     #[test]
     fn the_state_folder_lands_where_the_build_says() {
         let _l = ENV_LOCK
@@ -532,6 +602,18 @@ mod tests {
         let _h = EnvGuard::unset("BENILLA_HOME");
         let h = home().expect("home() always resolves outside a capture");
         assert!(h.ends_with(STATE_DIR), "{}", h.display());
+
+        #[cfg(windows)]
+        {
+            // `home()` tries this before either of the other two steps, so as long as the shell
+            // call succeeds (true on every CI/player Windows box — it fails only in exotic
+            // sandboxes with no Documents folder at all) this is the whole answer, and the
+            // project-folder/exe-dir cases below are unreachable on this platform.
+            if let Some(docs) = windows_documents_dir() {
+                assert_eq!(h, docs.join("benilla-twow").join(STATE_DIR));
+                return;
+            }
+        }
 
         let Some(here) = crate::run_mode::dev_source_dir().and_then(|d| d.ancestors().nth(2))
         else {
