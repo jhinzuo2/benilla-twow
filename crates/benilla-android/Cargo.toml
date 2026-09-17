@@ -77,6 +77,17 @@ strip = "strip"
 # point, rather than picking a newer number unverified. Raise deliberately once a first build is
 # confirmed working, not preemptively.
 target_sdk_version = 31
+# Left unset until the aarch64-linux-android23 link failure below: cargo-apk defaults an unset
+# min_sdk_version to 23, and cpal's Android backend links `-laaudio` UNCONDITIONALLY -- it has no
+# Oboe/OpenSL ES fallback path, so the crate simply requires AAudio to exist at link time. AAudio
+# was added to the NDK sysroot at API level 26 (Android 8.0); at 23 there is no `libaaudio.so`
+# stub anywhere in the sysroot for the linker to find:
+#   ld.lld: error: unable to find library -laaudio
+# not a missing search path or a misspelled flag -- the library genuinely does not exist for that
+# platform level. 26 is the floor cpal's chosen backend imposes, not a preference picked here;
+# raising it further later is a product decision, but going below 26 will reintroduce this exact
+# failure regardless of anything else in this file.
+min_sdk_version = 26
 
 [package.metadata.android.application]
 label = "Benilla"
