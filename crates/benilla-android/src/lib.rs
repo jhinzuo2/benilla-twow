@@ -40,25 +40,33 @@ fn main() {
     // Desktop has a real shell environment; Android has none. `std::env::set_var` still works —
     // it's process-local state, not a shell feature — so setting it here, first thing, is
     // sufficient; nothing downstream needs to know it's running on Android instead of reading a
-    // real env var a launcher script set. Both point at this app's own external files dir —
-    // `Android/data/<package>/files/...` — which needs no runtime storage permission on modern
-    // Android and is reachable from any file manager, so the player drops their 1.12.1 `Data/`
-    // folder in `.../files/WOWDATA/` the same way they'd point `WOW_DATA` at it on desktop.
+    // real env var a launcher script set.
     //
-    // The `AndroidApp` handle itself is NOT available here to read `external_data_path()` from —
-    // `#[bevy_main]` only forwards it into `bevy::android::ANDROID_APP`, not as a parameter to
-    // `main()`. Reading that static back out (`bevy::android::ANDROID_APP.get()`) is the correct
-    // way to recover it if the real device path is needed instead of this guessed default;
-    // marked as a follow-up rather than done here, since the exact right moment to read a
-    // `OnceLock` that `#[bevy_main]`'s generated code races to set is not yet confirmed against
-    // real behavior, and guessing at that ordering is exactly the mistake this file already made
-    // twice. `/sdcard/Android/data/<package>/files/...` is the well-known, standard path this
-    // resolves to on essentially every real device regardless, so hardcoding it is a safe
-    // starting point, not a guess of the same kind as the earlier API-shape mistakes.
+    // IMPORTANT: this deliberately does NOT use `Android/data/<package>/files/...`
+    // (`AndroidApp::external_data_path()`), despite that being the "obvious" no-permission app
+    // storage dir and despite an EARLIER version of this file using exactly that. Confirmed by
+    // hands-on device testing (not assumed): as of Android 11 (API 30), `Android/data/<pkg>/...`
+    // is blocked at the storage layer for every app except the owner — no file manager, including
+    // third-party ones, can browse into it, regardless of manifest permissions or a
+    // DocumentsProvider. `Android/obb` and `Android/media` are the only two subtrees Android
+    // exempted from that lockdown. `Android/media/<package>/...` is used here — still no runtime
+    // storage permission required, and (per on-device testing) actually visible and browsable in
+    // real file managers, unlike `Android/data`.
+    //
+    // The path is constructed directly (`/sdcard/Android/media/<package>`) rather than queried
+    // via `Context.getExternalMediaDirs()`, because `android-activity` 0.6.1 does not expose that
+    // call — only `external_data_path()`/`internal_data_path()`/`obb_path()` are bound (confirmed
+    // against android-activity's own docs.rs page). Getting the OS-reported path instead of this
+    // constructed one would mean a manual JNI call through `app.vm_as_ptr()` (the same pattern
+    // this file's header doc-comment already shows for the Toast example) — flagged as a
+    // follow-up, not done here, since it needs a new `jni` crate dependency and cannot be
+    // compile-verified without real device/CI access. `Android/media/<package>` (no `/files`
+    // suffix — that's an `Android/data`-specific convention, not shared by `Android/media`) is
+    // the standard, documented layout on the primary external volume on the overwhelming majority
+    // of real devices, same tier of "known-good default, not an OS guarantee" as the previous
+    // `Android/data` guess was — the difference is this one is confirmed actually reachable.
     let package = "com.benilla.twow"; // must match benilla-android/Cargo.toml's [package.metadata.android] package id
-    let base = std::path::PathBuf::from(format!(
-        "/sdcard/Android/data/{package}/files"
-    ));
+    let base = std::path::PathBuf::from(format!("/sdcard/Android/media/{package}"));
 
     let wow_data = base.join(WOWDATA_DIRNAME);
     let benilla_home = base.join(CONFIG_DIRNAME);
