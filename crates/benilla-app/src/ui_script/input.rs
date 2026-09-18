@@ -156,15 +156,6 @@ pub(super) fn feed_ui_input(
     // for a person — which is what lets a rig run reproduce "open the map, close it, and the world
     // under it goes quiet". A person's pointer always wins; an unarmed probe answers `None` and
     // nothing here changes.
-    // The active touch, if any — arbitrarily, the first one `Touches::iter()` yields. Only a
-    // SINGLE touch drives the UI pointer; a second concurrent finger (pinch/rotate gestures) is
-    // deliberately not read here, since those belong to camera/zoom input elsewhere, not clicks.
-    // `Touch::position()` is logical pixels, origin top-left — the same space
-    // `Window::cursor_position()` reports (confirmed: both are documented against the window's
-    // logical/scaled coordinate system, unlike `ComputedNode` layout, which is physical) — so it
-    // can be used as a drop-in alternative source with no extra scale conversion, through the
-    // exact same `s`/seam-scale line below that already converts a mouse cursor's logical
-    // position into the UI's virtual-unit space.
     // The touch driving the UI pointer this frame. NOT simply `touches.iter().next()` — that
     // picks whichever touch id the `Touches` resource happens to store first, which has no
     // relationship to which finger is actually the one tapping. That mismatch is exactly what
@@ -176,7 +167,14 @@ pub(super) fn feed_ui_input(
     // this: a touch that just started THIS frame is unambiguously "the tap in progress", so it's
     // tried first regardless of iteration order; only when nothing started this frame do we fall
     // back to an already-resting touch (`iter().next()`), which covers press-and-hold-drag frames
-    // after the initial press frame has passed.
+    // after the initial press frame has passed. `Touch::position()` is logical pixels, origin
+    // top-left — the same space `Window::cursor_position()` reports (confirmed: both are
+    // documented against the window's logical/scaled coordinate system, unlike `ComputedNode`
+    // layout, which is physical) — so it can be used as a drop-in alternative source with no
+    // extra scale conversion, through the exact same `s`/seam-scale line below that already
+    // converts a mouse cursor's logical position into the UI's virtual-unit space. Only a SINGLE
+    // touch drives the UI pointer; a second concurrent finger (pinch/rotate gestures) is
+    // deliberately not read here, since those belong to camera/zoom input elsewhere, not clicks.
     let touch = touches
         .iter_just_pressed()
         .next()
