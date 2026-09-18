@@ -42,6 +42,12 @@ pub(super) fn control(
         // here, for the self-avatar fade's reference plane; the far half is the wall's, read by
         // the world.
         Res<benilla_world::view::ViewDistance>,
+        // The virtual stick and the swipe-look delta (`crate::touch`). They ride this tuple for
+        // the same reason everything else here does — the system is at Bevy's 16-param ceiling —
+        // and they belong with the pointer group on merit: one is a pointer, the other is a
+        // movement source, and both are this frame's input state scaled by the same camera knobs.
+        Res<crate::touch::TouchMove>,
+        Res<crate::touch::TouchLook>,
     ),
     // The net bridge, bundled into one param (16-param limit): the outbound command channel + the
     // inbound teleport/worldport messages `apply_net_updates` wrote earlier this frame
@@ -154,6 +160,10 @@ pub(super) fn control(
     let mouse_motion = &pointer.0;
     let look_cfg = *pointer.1;
     let zoom_max = pointer.2.max;
+    // Copied out rather than borrowed: `pointer` is read again further down and the movement
+    // decoder wants an owned snapshot of this frame's stick.
+    let touch_move = *pointer.6;
+    let touch_look = *pointer.7;
     let (move_speed, capsule, inspect, ui_capture, click_consumed) = (
         &speed_capsule.0,
         &speed_capsule.1 .0,
@@ -350,6 +360,7 @@ pub(super) fn control(
     run_look_session(
         &buttons,
         mouse_motion,
+        &touch_look,
         both_buttons,
         &mut rig,
         &mut cam,
@@ -570,6 +581,7 @@ pub(super) fn control(
             &mut player,
             &rig,
             both_buttons,
+            &touch_move,
             may_translate,
             may_turn,
         );

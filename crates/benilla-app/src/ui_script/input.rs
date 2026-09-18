@@ -6,7 +6,6 @@
 
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::AccumulatedMouseScroll;
-use bevy::input::touch::Touches;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -85,7 +84,7 @@ pub(super) fn feed_ui_input(
     // players see on Android is coming from a different system (frame-level pressed-state styling
     // keyed off something other than this pass), while `OnClick` itself, which only ever fires
     // from `script.mouse_button` below, never receives a press.
-    touches: Res<Touches>,
+    touch_pointer: Res<crate::touch::TouchPointer>,
     // One [`PointerFeed`] (clippy's argument ceiling): the hover + click-consumed outputs this
     // pass writes, the world pick that routes the world-click payload legs (decision 0571), and
     // the payload-held mirror written for the Send-side world-click consumers.
@@ -156,32 +155,15 @@ pub(super) fn feed_ui_input(
     // for a person — which is what lets a rig run reproduce "open the map, close it, and the world
     // under it goes quiet". A person's pointer always wins; an unarmed probe answers `None` and
     // nothing here changes.
-    // The touch driving the UI pointer this frame. NOT simply `touches.iter().next()` — that
-    // picks whichever touch id the `Touches` resource happens to store first, which has no
-    // relationship to which finger is actually the one tapping. That mismatch is exactly what
-    // was observed on-device: a SECOND finger resting anywhere on screen was enough to make
-    // taps register, because with two touches active `iter().next()` had a coin-flip chance of
-    // returning the correct one, whereas with only one touch active, an unrelated already-down
-    // touch (e.g. a thumb resting near the edge from how the device is held) could occupy that
-    // "first" slot outright and starve every real tap. Preferring `iter_just_pressed()` fixes
-    // this: a touch that just started THIS frame is unambiguously "the tap in progress", so it's
-    // tried first regardless of iteration order; only when nothing started this frame do we fall
-    // back to an already-resting touch (`iter().next()`), which covers press-and-hold-drag frames
-    // after the initial press frame has passed. `Touch::position()` is logical pixels, origin
-    // top-left — the same space `Window::cursor_position()` reports (confirmed: both are
-    // documented against the window's logical/scaled coordinate system, unlike `ComputedNode`
-    // layout, which is physical) — so it can be used as a drop-in alternative source with no
-    // extra scale conversion, through the exact same `s`/seam-scale line below that already
-    // converts a mouse cursor's logical position into the UI's virtual-unit space. Only a SINGLE
-    // touch drives the UI pointer; a second concurrent finger (pinch/rotate gestures) is
-    // deliberately not read here, since those belong to camera/zoom input elsewhere, not clicks.
-    let touch = touches
-        .iter_just_pressed()
-        .next()
-        .or_else(|| touches.iter().next());
+    // Touch no longer derives its own pointer here. `crate::touch` classifies every finger on
+    // touchdown and publishes the UI one as `TouchPointer` — including, crucially, on the frame it
+    // lifts. The old expression read `touches.iter()`, which yields only *pressed* touches, so on a
+    // release frame it answered `None`; with no mouse attached that made `cursor` `None` too and
+    // skipped this whole block, losing the release and with it the click. See `crate::touch`'s
+    // module doc for the full account of that bug and its two disguises.
     if let Some(cursor) = window
         .cursor_position()
-        .or_else(|| touch.map(|t| t.position()))
+        .or(touch_pointer.pos)
         .or_else(crate::target::hover_probe_point)
         .filter(|_| !ui_hidden && !synthetic)
     {
@@ -232,8 +214,10 @@ pub(super) fn feed_ui_input(
         // kind of cross-finger mismatch `Touches` tracks per-id specifically to avoid. A frame
         // with no active touch (`touch` is `None`) answers `false` for both — no synthetic click
         // fires from stale state.
-        let touch_just_pressed = touch.is_some_and(|t| touches.just_pressed(t.id()));
-        let touch_just_released = touch.is_some_and(|t| touches.just_released(t.id()));
+        // Both edges come off the SAME finger, tracked across its whole lifetime by the arbiter,
+        // so a press can never pair with a different finger's release.
+        let touch_just_pressed = touch_pointer.just_pressed;
+        let touch_just_released = touch_pointer.just_released;
         for (btn, name) in [
             (MouseButton::Left, "LeftButton"),
             (MouseButton::Right, "RightButton"),

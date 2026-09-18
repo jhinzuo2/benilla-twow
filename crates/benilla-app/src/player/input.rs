@@ -144,6 +144,11 @@ pub(super) fn move_axes(
     player: &mut Player,
     rig: &CameraControl,
     both_buttons: bool,
+    // The virtual stick, entering as an extra HELD source on each axis — the same door `/follow`
+    // comes through (decision 0890). Held and not edge-triggered, so pushing the stick never trips
+    // the autorun cancel set: toggle autorun, steer with the stick, autorun survives, exactly as
+    // it does under a held W.
+    touch: &crate::touch::TouchMove,
     // The reference's two movement-input predicates this frame ([`state::may_translate`],
     // [`state::may_turn`]) — `0x514560` and `0x5145b0`. Both go down on death (decision 1753).
     may_translate: bool,
@@ -227,8 +232,10 @@ pub(super) fn move_axes(
     // rides the HELD state and not the key-DOWN edge, so it never trips the autorun cancel set
     // above — which is right: synthesized input is not a keypress.
     let fwd_axis = state::forward_axis(
-        binds.pressed(crate::bindings::cmd::MOVE_FORWARD) || player.follow_forward,
-        binds.pressed(crate::bindings::cmd::MOVE_BACKWARD),
+        binds.pressed(crate::bindings::cmd::MOVE_FORWARD)
+            || player.follow_forward
+            || touch.forward,
+        binds.pressed(crate::bindings::cmd::MOVE_BACKWARD) || touch.backward,
         both_buttons,
         autorun,
     );
@@ -246,8 +253,12 @@ pub(super) fn move_axes(
     // packets in one session, 0 received by a watching client, against 0 in the reference
     // client's entire 1.12.1 capture. That is decision 0056's invariant — the wire mirrors the
     // avatar's actual motion — violated on this one axis only; the swim branch already nets.
-    let strafe_left = binds.pressed(crate::bindings::cmd::STRAFE_LEFT);
-    let strafe_right = binds.pressed(crate::bindings::cmd::STRAFE_RIGHT);
+    // The stick's lateral axis enters as Q/E (always-strafe) and not as A/D: A/D only strafe while
+    // mouse-looking, and on touch "mouse-looking" is not a state you hold — the swipe is always
+    // available. Routing it through the unconditional pair keeps the stick's left/right meaning the
+    // same whether or not a look finger happens to be down. `WOW_TOUCH_STRAFE=0` opts out.
+    let strafe_left = binds.pressed(crate::bindings::cmd::STRAFE_LEFT) || touch.strafe_left;
+    let strafe_right = binds.pressed(crate::bindings::cmd::STRAFE_RIGHT) || touch.strafe_right;
     let turn_left = binds.pressed(crate::bindings::cmd::TURN_LEFT);
     let turn_right = binds.pressed(crate::bindings::cmd::TURN_RIGHT);
     let side_axis = i32::from(strafe_right) - i32::from(strafe_left)

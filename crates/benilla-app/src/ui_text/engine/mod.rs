@@ -830,12 +830,61 @@ impl UiFontAtlas {
 /// lowercase `d`, and ships `mailrays.TTF` while its table says `mailrays.ttf`), and a
 /// dot-component is refused before any filesystem call.
 fn read_font_bytes(source: &FontSource, path: &str) -> Option<Vec<u8>> {
+    // ── User font override (issue #4) ──────────────────────────────────────────────────────
+    //
+    // `benilla-config/Fonts/<file>` wins over the chain, matched on the BASENAME so a drop-in
+    // replacement needs no knowledge of the client's `Fonts\` layout: put `FRIZQT__.ttf` in the
+    // folder and every request for `Fonts\FRIZQT__.ttf` resolves to it. That is what makes this a
+    // CJK/Cyrillic fix — the shipped 1.12 faces have no coverage for either, and nothing else in
+    // the stack can add a glyph the face does not contain, so the only real fix is letting the
+    // player supply a face that does.
+    //
+    // Deliberately an override and not a *fallback*: a fallback would only engage for a font the
+    // chain is missing entirely, which is never the case here — the chain always has FRIZQT, it
+    // just has a version with no CJK in it. Overriding is also why this needs no font-switcher UI
+    // (the issue's other suggestion): the file name *is* the selection.
+    //
+    // Case-insensitive, because the chain's own reader is (MSBT ships `mailrays.TTF` against a
+    // table that says `mailrays.ttf`) and a player on a case-sensitive filesystem should not have
+    // to care either.
+    if let Some(bytes) = read_user_font(path) {
+        return Some(bytes);
+    }
     if let Ok(bytes) = source.chain.lock_recover().read(path) {
         return Some(bytes);
     }
     let root = source.loose_root.as_deref()?;
     let file = benilla_assets::loose_addon_file(root, &benilla_assets::normalize_path(path))?;
     std::fs::read(file).ok()
+}
+
+/// A player-supplied face from `benilla-config/Fonts/`, matched on `path`'s basename.
+///
+/// Returns `None` in a hermetic run (no config home), when the folder does not exist, or when the
+/// basename is not present — every one of which simply falls through to the chain, so adding the
+/// folder is purely additive and its absence changes nothing.
+fn read_user_font(path: &str) -> Option<Vec<u8>> {
+    // Both separators: the engine speaks `Fonts\X.ttf`, addon tables sometimes use `/`.
+    let base = path.rsplit(['\\', '/']).next()?;
+    if base.is_empty() || base.contains("..") {
+        return None;
+    }
+    let dir = crate::local_state::home()?.join("Fonts");
+    // Exact hit first — one `read` and no directory walk in the common case.
+    if let Ok(bytes) = std::fs::read(dir.join(base)) {
+        return Some(bytes);
+    }
+    let want = base.to_ascii_lowercase();
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(&want))
+        {
+            return std::fs::read(entry.path()).ok();
+        }
+    }
+    None
 }
 
 /// A real-font engine for a test: the client faces, read through the app's own patch chain. `None`

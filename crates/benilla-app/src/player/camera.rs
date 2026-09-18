@@ -1088,6 +1088,12 @@ pub(crate) struct CameraPivot {
 pub(super) fn run_look_session(
     buttons: &ButtonInput<MouseButton>,
     mouse_motion: &AccumulatedMouseMotion,
+    // Free-swipe look (`crate::touch`). Enters in the SAME units and sign convention as
+    // `AccumulatedMouseMotion::delta` so it can be summed straight into the existing integrator
+    // rather than growing a parallel one — every downstream consequence of a look (the pitch
+    // clamp, the smart-pivot routing, the right-drag facing coupling) then applies to a swipe for
+    // free, and there is only one place where look feel is defined.
+    touch_look: &crate::touch::TouchLook,
     both_buttons: bool,
     rig: &mut CameraControl,
     cam: &mut FlyCam,
@@ -1221,8 +1227,19 @@ pub(super) fn run_look_session(
 
     // Apply this frame's accumulated motion as look rotation while a button is held. Right-drag also
     // turns the character (its facing tracks the camera yaw); left-drag leaves the character facing.
+    // A swipe is a look session with no button to hold. `LookButton::Left` is the right stand-in:
+    // it orbits the camera and leaves the character's facing alone, which is what a look-around
+    // gesture should do — the avatar turns when you *steer*, not when you glance. (Right-drag
+    // semantics, where the facing tracks the camera, stay reachable from the stick.)
+    if rig.look.is_none() && touch_look.active {
+        rig.look = Some(LookButton::Left);
+    } else if rig.look == Some(LookButton::Left) && !touch_look.active && !rig.world_mouse.held(LookButton::Left) {
+        // The finger lifted and no real button is holding the session open — end it. Without this
+        // the camera would stay latched in look mode for the rest of the session.
+        rig.look = None;
+    }
     if let Some(active) = rig.look {
-        let delta = mouse_motion.delta;
+        let delta = mouse_motion.delta + touch_look.delta;
         let d_yaw = -delta.x * yaw_rate;
         cam.yaw += d_yaw;
         // `mouseInvertPitch` flips only the pitch axis (the 1.12 checkbox's whole meaning).
