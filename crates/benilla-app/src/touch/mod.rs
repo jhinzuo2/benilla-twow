@@ -51,8 +51,6 @@ use bevy::window::PrimaryWindow;
 
 mod joystick;
 
-pub(crate) use joystick::JoystickVisuals;
-
 /// What a finger was claimed for on touchdown. Assigned once; never reassigned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Role {

@@ -46,7 +46,7 @@ impl Plugin for JoystickVisualsPlugin {
 /// Marker resource so other modules can ask whether the stick is drawn without reaching for the
 /// entities.
 #[derive(Resource, Default)]
-pub(crate) struct JoystickVisuals {
+pub(super) struct JoystickVisuals {
     pub visible: bool,
 }
 
@@ -68,9 +68,12 @@ fn spawn_stick(mut commands: Commands, cfg: Res<JoystickCfg>) {
             left: Val::Px(-9999.0),
             top: Val::Px(-9999.0),
             border: UiRect::all(Val::Px(2.0)),
+            // A field on `Node` in bevy_ui 0.18, not a component of its own — `BorderRadius`
+            // carries no `Component` derive in this version (ui_node.rs:2464), so spawning it
+            // alongside `Node` is what made the tuple stop being a `Bundle`.
+            border_radius: BorderRadius::MAX,
             ..default()
         },
-        BorderRadius::MAX,
         BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.18)),
         GlobalZIndex(STICK_Z),
@@ -86,9 +89,9 @@ fn spawn_stick(mut commands: Commands, cfg: Res<JoystickCfg>) {
             height: Val::Px(knob),
             left: Val::Px(-9999.0),
             top: Val::Px(-9999.0),
+            border_radius: BorderRadius::MAX,
             ..default()
         },
-        BorderRadius::MAX,
         BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.35)),
         GlobalZIndex(STICK_Z + 1),
         Pickable::IGNORE,
