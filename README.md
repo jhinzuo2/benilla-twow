@@ -45,6 +45,89 @@ and no bundled game assets.
 - **Audio:** music, ambience and SFX under the client's own selection and crossfade rules, with
   interior and underwater transitions and zone reverb.
 
+## Platforms
+
+Desktop and Android build from the same source tree. Status below is what has actually been run
+and fixed against on real hardware, not just what compiles in CI.
+
+- **Windows** — actively developed against. `benilla-config` now resolves to the running user's
+  Documents folder through the Windows shell API (`SHGetKnownFolderPath`), rather than assuming
+  an XDG-style path the way Linux does, including a follow-up fix for a Windows API type
+  mismatch the first pass got wrong (a null handle, not a zero integer). Builds in CI
+  (`windows-latest`) and has been run for real.
+- **Android** — the primary mobile target, and the platform with the most fixes behind it so
+  far: the missing `INTERNET` permission (nothing connects without it — `cargo-apk` has no
+  manifest-merging step, so the permission list in `benilla-android/Cargo.toml` is the *entire*
+  source of truth for the APK's manifest) is fixed, `WOW_DATA` defaults to the app's own media
+  directory, a Bevy default-feature conflict between `game-activity` and the `native-activity`
+  this project actually targets is resolved, and a signed release APK builds from CI. See
+  **Touch input** below for the control scheme. Compile-and-link and signed packaging are
+  proven; nobody has confirmed a full play session on a device or emulator yet, so treat it as
+  "should work," not "confirmed."
+- **Linux (Ubuntu)** — builds in CI (`ubuntu-latest`) the same as upstream, and is presumed fine
+  since it's the primary Bevy development target — no Linux-specific bugs have come up because
+  none have needed fixing. Not independently verified by this fork beyond that CI build.
+- **macOS** — builds in CI (`macos-latest`). No macOS-specific work has happened in this fork at
+  all — genuinely unverified; nobody here has run it.
+
+### Touch input (Android)
+
+- An on-screen virtual joystick, bottom-left, floating — it centers on wherever your thumb lands
+  rather than sitting at a fixed spot — mapped to WASD-equivalent movement.
+- Free-swipe camera look anywhere else on the screen.
+- Every finger is classified once, on touchdown — joystick, UI, or world-look — and keeps that
+  role until it lifts. That structure is what fixed an earlier bug where a tap's release could be
+  silently dropped (the real cause of "taps need spamming" and "a second resting finger fixes
+  it"), rather than patching around it case by case.
+- **Status:** implemented and merged, not yet confirmed on a real device. CI proves the APK
+  compiles, packages, and — as of the last signed build — that release signing works; an actual
+  play session hasn't happened yet.
+- Planned next, tracked in
+  [#8](https://github.com/jhinzuo2/benilla-twow/issues/8): face/camera-based target selection
+  without needing Tab, and a more mobile-tailored FrameXML layout with auto-login.
+
+## TurtleWoW compatibility
+
+benilla already speaks the stock 1.12.1 protocol, which gets you onto a TurtleWoW realm on its
+own — this section is the gap-filling on top of that, specific to what TurtleWoW's own client
+patch changed or added.
+
+- **Two extra playable races** — Goblin (Horde) and Blood Elf / High Elf (Alliance) — through
+  character creation, the race-select icon art (read from the client's own
+  `CharacterCreate.lua` icon table when present, the frozen vanilla math otherwise), and the
+  per-race equipment/helm model variants.
+- **Sound kits TurtleWoW references that the vanilla DBC doesn't ship** no longer error-spam — a
+  missing kit id is warned once, then plays as silence, same as a kit with no attached file.
+- **Everlook's internet-radio towers are recognized** — their `SoundEntries` path is a stream
+  URL, not an MPQ path — and no longer error every 5 seconds. Actually streaming the station
+  isn't implemented yet: tuning in correctly silences the zone music but plays nothing, tracked
+  in [#3](https://github.com/jhinzuo2/benilla-twow/issues/3).
+- **Camera Lua API extended** with `CameraZoomIn` / `CameraZoomOut` (used by things like the
+  barbershop's chair camera) and `FlipCameraYaw`.
+- **`benilla.toc` updated** to load TurtleWoW's own `json.lua` codec and the block of
+  TurtleWoW-exclusive FrameXML files its manifest appends, in TurtleWoW's own load order; the
+  two real functionality gaps that block on (`StopMusic`, `CameraZoomOut`) are filled by host
+  verbs.
+- **Options → Graphics no longer errors** on a TurtleWoW install — its patch replaces
+  `OptionsFrame.lua` with its own category/search system, which doesn't define the
+  slider-bounds table the panel reads, so those bounds are now vendored as a fallback.
+- **Fixed a client-breaking Lua gap:** `getfenv`/`setfenv` weren't implemented at all, and
+  TurtleWoW's own `Globals.lua` opens with `_G = getfenv(0)` — so the whole file, and everything
+  chained after it (`wipe`, `trim`, `explode`, `sizeof`, `print`), silently failed to load. That
+  surfaced as unrelated-looking nil-global errors deep inside `UIParent.lua`, nowhere near the
+  real cause. Both are implemented now.
+- **Warden is not implemented** — no crypto, no module execution, and that isn't planned to
+  change — but the client no longer disconnects over receiving `SMSG_WARDEN_DATA`, since
+  TurtleWoW appears to send it without enforcing it. This is a "don't treat an unenforced packet
+  as fatal" decision, not Warden support: a server that does enforce it will still silently kick
+  you after about 30 seconds rather than giving a clear error.
+
+Known open gaps, tracked as issues: TransmogUI renders only its background
+([#2](https://github.com/jhinzuo2/benilla-twow/issues/2)), the Inspect window's Talents tab is
+empty pending FrameXML work ([#7](https://github.com/jhinzuo2/benilla-twow/issues/7)), and some
+Tauren gear/hair combinations render white under a cause not yet identified
+([#6](https://github.com/jhinzuo2/benilla-twow/issues/6)).
+
 ## Where it's going
 
 benilla is done when a 1.12.1 player can do everything here that they could in the original
