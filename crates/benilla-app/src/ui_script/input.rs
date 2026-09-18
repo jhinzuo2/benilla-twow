@@ -6,6 +6,7 @@
 
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::AccumulatedMouseScroll;
+use bevy::input::touch::Touches;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -74,6 +75,17 @@ pub(super) fn feed_ui_input(
     window: Query<(&Window, Option<&bevy::window::RawHandleWrapper>), With<PrimaryWindow>>,
     buttons: Res<ButtonInput<MouseButton>>,
     scroll: Res<AccumulatedMouseScroll>,
+    // Touch → synthetic-left-mouse bridge (see the `touch_as_mouse` block below): NativeActivity
+    // (`benilla-android`'s scaffold — `crates/benilla-app/Cargo.toml`'s
+    // `android-native-activity` feature) delivers finger contact as `bevy::input::touch` events,
+    // NOT as `ButtonInput<MouseButton>`/`window.cursor_position()` — confirmed against Bevy's own
+    // Android touch example and the bevy_winit source (`android-native-activity` only wires the
+    // touch path; there is no touch→mouse synthesis anywhere in bevy_winit or android-activity).
+    // Without this, every tap updates hover/glow through NOTHING here at all — the visual "glow"
+    // players see on Android is coming from a different system (frame-level pressed-state styling
+    // keyed off something other than this pass), while `OnClick` itself, which only ever fires
+    // from `script.mouse_button` below, never receives a press.
+    touches: Res<Touches>,
     // One [`PointerFeed`] (clippy's argument ceiling): the hover + click-consumed outputs this
     // pass writes, the world pick that routes the world-click payload legs (decision 0571), and
     // the payload-held mirror written for the Send-side world-click consumers.
@@ -144,8 +156,19 @@ pub(super) fn feed_ui_input(
     // for a person — which is what lets a rig run reproduce "open the map, close it, and the world
     // under it goes quiet". A person's pointer always wins; an unarmed probe answers `None` and
     // nothing here changes.
+    // The active touch, if any — arbitrarily, the first one `Touches::iter()` yields. Only a
+    // SINGLE touch drives the UI pointer; a second concurrent finger (pinch/rotate gestures) is
+    // deliberately not read here, since those belong to camera/zoom input elsewhere, not clicks.
+    // `Touch::position()` is logical pixels, origin top-left — the same space
+    // `Window::cursor_position()` reports (confirmed: both are documented against the window's
+    // logical/scaled coordinate system, unlike `ComputedNode` layout, which is physical) — so it
+    // can be used as a drop-in alternative source with no extra scale conversion, through the
+    // exact same `s`/seam-scale line below that already converts a mouse cursor's logical
+    // position into the UI's virtual-unit space.
+    let touch = touches.iter().next();
     if let Some(cursor) = window
         .cursor_position()
+        .or_else(|| touch.map(|t| t.position()))
         .or_else(crate::target::hover_probe_point)
         .filter(|_| !ui_hidden && !synthetic)
     {
@@ -190,12 +213,27 @@ pub(super) fn feed_ui_input(
                 );
             }
         }
+        // A tap's press/release is read off the SAME touch id `touch` above came from — using
+        // `touches.any_just_pressed()`/`any_just_released()` instead would let one finger's
+        // press pair with a DIFFERENT finger's release under multi-touch, which is exactly the
+        // kind of cross-finger mismatch `Touches` tracks per-id specifically to avoid. A frame
+        // with no active touch (`touch` is `None`) answers `false` for both — no synthetic click
+        // fires from stale state.
+        let touch_just_pressed = touch.is_some_and(|t| touches.just_pressed(t.id()));
+        let touch_just_released = touch.is_some_and(|t| touches.just_released(t.id()));
         for (btn, name) in [
             (MouseButton::Left, "LeftButton"),
             (MouseButton::Right, "RightButton"),
             (MouseButton::Middle, "MiddleButton"),
         ] {
-            if buttons.just_pressed(btn) {
+            // Only LEFT gets the touch merge: a tap is a left click, the same as it is on desktop
+            // (there is no touch equivalent of a right/middle mouse button here — those still
+            // come from `buttons` alone, unaffected).
+            let just_pressed =
+                buttons.just_pressed(btn) || (btn == MouseButton::Left && touch_just_pressed);
+            let just_released =
+                buttons.just_released(btn) || (btn == MouseButton::Left && touch_just_released);
+            if just_pressed {
                 // A LEFT press that would complete as a world DROP belongs to the drop flow
                 // (the drop itself fires on the completed click's RELEASE — 0218's
                 // byte-verified trigger — but the press is when the world click-pick and
@@ -215,7 +253,7 @@ pub(super) fn feed_ui_input(
                 }
                 script.mouse_button(x, y, name, true);
             }
-            if buttons.just_released(btn) {
+            if just_released {
                 script.mouse_button(x, y, name, false);
             }
         }
