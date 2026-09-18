@@ -89,6 +89,27 @@ target_sdk_version = 31
 # failure regardless of anything else in this file.
 min_sdk_version = 26
 
+# See https://developer.android.com/guide/topics/manifest/uses-permission-element
+#
+# Note: there can be multiple .uses_permission entries -- cargo-apk (confirmed against the 0.10
+# line this project pins in CI, `cargo install cargo-apk --locked`) only emits a `<uses-permission>`
+# into the generated manifest for what's listed here; nothing else in this file implies INTERNET,
+# and no dependency's own manifest fragment merges one in either (cargo-apk 0.10 has no manifest
+# merging step at all -- this file is the WHOLE source of truth for what ends up in the APK). That
+# is why, prior to this entry, the installed app had no network access whatsoever: realmlist/login
+# connect over a plain TCP socket (`benilla-app`'s `net/io.rs`), and Android denies socket() with
+# EACCES for any app lacking this permission, regardless of the code being otherwise correct and
+# already proven working on desktop.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+# Not strictly required to open a socket, but `benilla-app`'s net layer (and most Rust networking
+# crates transitively) commonly check reachability/connectivity type via this before attempting a
+# connection; harmless to include even if nothing currently reads it, and saves a second
+# confused-silence bug report later if that ever changes.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
 [package.metadata.android.application]
 label = "Benilla"
 # No `icon` line: bevy's example points this at its own `@mipmap/ic_launcher`, which lives in a
