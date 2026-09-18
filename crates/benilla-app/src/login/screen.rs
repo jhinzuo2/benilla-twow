@@ -11,7 +11,9 @@
 //! Remember Account Name checkbox (20×20 at its resolved absolute (17, top 653) with the 10 px
 //! shadowed gold label at LEFT+24), the Blizzard logo (100×100 at BOTTOM (0,8)) under the
 //! `BLIZZ_DISCLAIMER` line (BOTTOM (0,10)), and the version block (BOTTOMLEFT (0,10),
-//! `VERSION_TEMPLATE` filled with the 5875 build facts). The Credits/Cinematics/TOS side of the
+//! `VERSION_TEMPLATE` filled with our wire identity's frozen facts and a build number that reads
+//! 7272 against extracted Turtle WoW data, 5875 otherwise — display only; see
+//! `detect_display_build`). The Credits/Cinematics/TOS side of the
 //! reference layout is deliberately absent (decision 0539 §1). The dialog is the ref's shared
 //! `GlueDialog` box (512-wide `UI-DialogBox`, text wrapping at 440, one 200×40 button).
 
@@ -21,12 +23,12 @@ use bevy::window::PrimaryWindow;
 use crate::char_select::wow_font;
 use crate::glue::art::{GlueArt, BACKDROP, GOLD};
 use crate::glue::widgets::{
-    abs, glue_button, glue_edit_box, outlined_text, overlay, paint_glue_field, ArtSwap,
-    GlueBtnKind, GlueFieldPart, GlueText, Hilight,
+    abs, glue_button, glue_edit_box, outlined_text, outlined_text_centered, overlay,
+    paint_glue_field, ArtSwap, GlueBtnKind, GlueFieldPart, GlueText, Hilight,
 };
 use crate::glue_strings::GlueStrings;
 use crate::portrait::{PortraitImages, PortraitSource, GLUE_SLOT};
-use benilla_assets::WorldAssets;
+use benilla_assets::{LockRecover, WorldAssets};
 
 use super::{ClientState, Field, LoginForm};
 
@@ -87,7 +89,7 @@ pub(super) fn materialize_screen(
     assets: Res<AssetServer>,
     portraits: Res<PortraitImages>,
     mut art: ResMut<GlueArt>,
-    world_assets: Option<ResMut<WorldAssets>>,
+    mut world_assets: Option<ResMut<WorldAssets>>,
     mut images: ResMut<Assets<Image>>,
     mut add_mats: ResMut<Assets<crate::glue::add_material::AddUiMaterial>>,
     strings: Option<Res<GlueStrings>>,
@@ -96,8 +98,12 @@ pub(super) fn materialize_screen(
     window: Query<&Window, With<PrimaryWindow>>,
     time: Res<Time>,
 ) {
-    if let Some(mut wa) = world_assets {
-        art.ensure_loaded(&mut wa, &mut images, &mut add_mats);
+    // A reborrow (`as_deref_mut`), not the old `if let Some(mut wa) = world_assets` — that
+    // pattern took the `ResMut` by value and consumed the parameter, so nothing later in this
+    // function could read `world_assets` again. The build-number detection below needs it too,
+    // on the same call.
+    if let Some(wa) = world_assets.as_deref_mut() {
+        art.ensure_loaded(wa, &mut images, &mut add_mats);
     }
     let with_art = art.button_up.is_some();
     let s = crate::glue::screen_scale(window.single().ok());
@@ -107,6 +113,13 @@ pub(super) fn materialize_screen(
             // (mac fullscreen, a drag) has changed the glue scale the tree was baked at.
             if (!ui.with_art && with_art) || ui.s != s {
                 commands.entity(root).despawn();
+                // Read only on an actual (re)spawn, not the top of this function: this system
+                // runs every frame the login screen is up, and `detect_display_version` walks
+                // the chain's listing — see its own doc comment.
+                let display_version = world_assets
+                    .as_deref()
+                    .map(detect_display_version)
+                    .unwrap_or(STOCK_VERSION);
                 spawn_screen(
                     &mut commands,
                     &assets,
@@ -116,11 +129,16 @@ pub(super) fn materialize_screen(
                     &form,
                     &realmlist,
                     &window,
+                    display_version,
                 );
             }
         }
         Err(_) => {
             if with_art || time.elapsed_secs() > 1.0 {
+                let display_version = world_assets
+                    .as_deref()
+                    .map(detect_display_version)
+                    .unwrap_or(STOCK_VERSION);
                 spawn_screen(
                     &mut commands,
                     &assets,
@@ -130,9 +148,70 @@ pub(super) fn materialize_screen(
                     &form,
                     &realmlist,
                     &window,
+                    display_version,
                 );
             }
         }
+    }
+}
+
+/// The version + build the login screen's version line **displays** — cosmetic only, and the
+/// only thing this changes.
+///
+/// [`benilla_protocol::CLIENT_BUILD`] (5875, sent to the world server) and `REALMD_CLIENT_BUILD`
+/// (7272, sent to realmd) are unconditional constants already, on every install — see their own
+/// doc comments for why presenting 7272 to a stock vanilla realmd still verifies. Login against a
+/// 7272 realm already works today, with no detection involved; this struct and the function below
+/// do not touch either constant or anything on the wire. All they decide is what a player *reads*
+/// on the login screen, so it matches the data they actually extracted instead of always reading
+/// "1.12.1 (5875)" regardless of which client it came from.
+///
+/// The two fields travel together **on purpose** — there is no path that can hand out "1.18.1
+/// (5875)" or "1.12.1 (7272)", both of which would misdescribe the data just as badly as the
+/// original always-5875 text did.
+#[derive(Clone, Copy)]
+struct DisplayVersion {
+    /// The `%s` `VERSION_TEMPLATE` fills with the client line — "1.12.1" or "1.18.1".
+    version: &'static str,
+    /// The `(%s)` build token, right after it.
+    build: u16,
+}
+
+/// What a stock, non-Turtle 1.12.1 install shows: our real wire identity, [`CLIENT_BUILD`]
+/// included ([`benilla_protocol::CLIENT_BUILD`]).
+const STOCK_VERSION: DisplayVersion = DisplayVersion {
+    version: "1.12.1",
+    build: benilla_protocol::CLIENT_BUILD,
+};
+
+/// What a Turtle WoW install shows: Turtle's own advertised version and build — 1.18.1 (7272), the
+/// same build [`benilla_protocol::REALMD_CLIENT_BUILD`] already presents to realmd on every
+/// install, detected or not.
+const TURTLE_VERSION: DisplayVersion = DisplayVersion {
+    version: "1.18.1",
+    build: benilla_protocol::REALMD_CLIENT_BUILD,
+};
+
+/// Turtle WoW's FrameXML ships a family of `Turtle_`-prefixed files alongside the stock ones —
+/// `Turtle_ArenaUI.lua`, `Turtle_GuildBankUI.lua`, `Turtle_TransmogUI.lua` among them (confirmed
+/// against a real Turtle extraction). MPQ paths are flat — there is no literal folder to stat —
+/// so "the `Turtle_***` folder" is read here as its nearest real meaning: any file under
+/// `Interface\FrameXML\` whose name starts with `Turtle_`. `Chain::list` unions every archive's
+/// `(listfile)`, so it sees the same names `contains`/`read` would resolve against.
+fn detect_display_version(assets: &WorldAssets) -> DisplayVersion {
+    let chain = assets.chain.lock_recover();
+    let turtle_data = chain.list().is_ok_and(|entries| {
+        entries.iter().any(|e| {
+            e.name
+                .replace('/', "\\")
+                .to_ascii_lowercase()
+                .starts_with("interface\\framexml\\turtle_")
+        })
+    });
+    if turtle_data {
+        TURTLE_VERSION
+    } else {
+        STOCK_VERSION
     }
 }
 
@@ -145,6 +224,7 @@ fn spawn_screen(
     form: &LoginForm,
     realmlist: &crate::realmlist::Realmlist,
     window: &Query<&Window, With<PrimaryWindow>>,
+    display_version: DisplayVersion,
 ) {
     let font = wow_font(assets);
     // The edit boxes type in `GlueEditBoxFont` — ARIALN, not FRIZQT (GlueFonts.xml).
@@ -242,10 +322,12 @@ fn spawn_screen(
 
         // The version block (`AccountLoginVersion`, GlueFontNormalSmall at BOTTOMLEFT (0,10),
         // justifyH LEFT): `VERSION_TEMPLATE` = "%s %s (%s) (%s)\n%s" filled with our wire
-        // identity's frozen facts — versionType, version, internalVersion, buildType, date.
+        // identity's facts — versionType, version, date and buildType are frozen; internalVersion
+        // (the build number) is `detect_display_build`'s, display-only (issue's build-detection
+        // ask) and independent of what the wire actually presents to either server.
         let version = {
             let template = strings.text("VERSION_TEMPLATE", "%s %s (%s) (%s)\n%s");
-            let build = benilla_protocol::CLIENT_BUILD.to_string();
+            let build = display_build.to_string();
             let mut out = template.to_string();
             for piece in [
                 "Version",

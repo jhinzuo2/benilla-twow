@@ -131,12 +131,26 @@ pub(super) fn glue_scene_framing(fov: f32, window_aspect: f32, art: Option<ArtEx
     let t0 = (authored * 0.5).tan(); // the authored vertical half-extent
     let h0 = t0 * GLUE_AUTHORED_ASPECT; // …and horizontal
     if window_aspect >= GLUE_AUTHORED_ASPECT {
-        // hor+: the authored vertical opening, until the width reaches the box's edge; past it
-        // the width is held there and the vertical closes — down to the 16:9 floor, past which
-        // the window is wider than the framing can honestly fill and [`glue_box_aspect`] boxes it.
+        // hor+: the authored vertical opening, until the width reaches the frame's edge; past it
+        // the width is **held there and the vertical keeps closing**, for as wide a window as the
+        // panel is.
+        //
+        // The `.max(floor)` that used to sit on the vertical is gone, and with it the pillarbox
+        // (decision 2187's successor). Holding the vertical at the 16:9 floor once the width
+        // reached `GLUE_BOX_ASPECT · floor` meant the framing stopped growing sideways, so
+        // everything past ~1.672:1 — every 16:9 panel included — had to be boxed, and a 16:9
+        // player got bars on a screen whose aspect the reference fills exactly. Letting the
+        // vertical close instead is the ordinary *cover* fit: the horizontal half-extent stays
+        // pinned to the widest the art supports, and the window's own aspect divides it down. The
+        // scale stays uniform — this is one FOV, not a stretch — so an 18:9, 19.5:9 or 21:9 panel
+        // shows the frame at full width with the top and bottom cropped, which is what "scale to
+        // the maximum width without distortion" means and what every modern client does here.
+        //
+        // The cap itself is unchanged: `GLUE_BOX_ASPECT · floor` is still the widest half-extent
+        // no scene's authored composition pays for, so nothing crops *inside* the art.
         let floor = glue_zoom_floor(fov);
         let half_w = (t0 * window_aspect).min(GLUE_BOX_ASPECT * floor);
-        2.0 * (half_w / window_aspect).max(floor).atan()
+        2.0 * (half_w / window_aspect).atan()
     } else {
         // The mirror: hold the authored horizontal half-extent and open upward, until the art's
         // top/bottom edge; past it the height is held and the sides crop — the stage's edges,
@@ -155,7 +169,20 @@ pub(super) fn glue_scene_framing(fov: f32, window_aspect: f32, art: Option<ArtEx
 /// come from here, so neither moves when the selected character's race changes the stage behind
 /// them, and neither flickers in the frames a stage swap is in flight.
 pub(crate) fn glue_box_aspect(window_aspect: f32) -> Option<f32> {
-    (window_aspect > GLUE_BOX_ASPECT).then_some(GLUE_BOX_ASPECT)
+    // **Always `None` now: the glue screens are fullscreen at every aspect.**
+    //
+    // The box existed because [`glue_scene_framing`] stopped widening at the 16:9 vertical floor,
+    // so past `GLUE_BOX_ASPECT` there was width the framing could not fill and bars were the
+    // honest answer. The framing now covers instead of stopping, so there is no unfilled width
+    // left to bar off — at 16:9 the scene fills the panel exactly as the reference does, and past
+    // it the frame is held at full width with the vertical cropped.
+    //
+    // Kept as a function rather than deleted: it is the single seat of this decision, read by both
+    // the booth camera's viewport ([`super::glue_booth::pillarbox_glue_scene`]) and the chrome's
+    // canvas ([`crate::glue::GlueCanvas`]), and those two must never disagree. A future screen that
+    // *does* want a box asks here. `_window_aspect` stays in the signature for the same reason.
+    let _ = window_aspect;
+    None
 }
 
 /// **The glue frame: `1.672:1`** — the aspect every glue scene is pillarboxed to once the window
@@ -847,13 +874,31 @@ mod tests {
             assert!(glue_box_aspect(a).is_none(), "a{a} fills the window");
             last = vert;
         }
-        // At and past the frame: the reference's own 16:9 opening, exactly, for ever.
+        // At 16:9 the frame lands on the reference's own opening — and fills the panel, which is
+        // the whole point of retiring the box: the aspect the reference was authored for gets no
+        // bars.
         let reference_16_9 = diag_to_vert(1.0, REFERENCE_PANEL);
         assert!(close(reference_16_9, 0.490_26));
-        for wide in [REFERENCE_PANEL, 3440.0 / 1440.0, 32.0 / 9.0] {
-            let vert = glue_scene_framing(1.0, wide, None);
-            assert!(close(vert, reference_16_9), "a{wide}: {vert}");
-            assert_eq!(glue_box_aspect(wide), Some(GLUE_BOX_ASPECT));
+        assert!(close(
+            glue_scene_framing(1.0, REFERENCE_PANEL),
+            reference_16_9
+        ));
+        assert!(glue_box_aspect(REFERENCE_PANEL).is_none());
+        // Past it the width is HELD and the vertical keeps closing — a cover fit, never a bar and
+        // never a stretch. The half-width is the same number at every ultra-wide aspect.
+        let half_width = |vert: f32, a: f32| (vert * 0.5).tan() * a;
+        let held = half_width(glue_scene_framing(1.0, REFERENCE_PANEL), REFERENCE_PANEL);
+        let mut last = reference_16_9;
+        for wide in [REFERENCE_PANEL, 2.0, 19.5 / 9.0, 3440.0 / 1440.0, 32.0 / 9.0] {
+            let vert = glue_scene_framing(1.0, wide);
+            assert!(
+                close(half_width(vert, wide), held),
+                "a{wide}: half-width {} vs {held}",
+                half_width(vert, wide)
+            );
+            assert!(vert <= last + 1e-6, "a{wide}: the vertical reopened");
+            assert!(glue_box_aspect(wide).is_none(), "a{wide} got bars");
+            last = vert;
         }
         // What we are NOT doing any more — the reference's own number on the reporter's panel,
         // kept here so the size of the correction stays legible.
@@ -920,19 +965,18 @@ mod tests {
                 );
                 assert!(vert < authored && vert >= 2.0 * floor.atan() - 1e-6);
             }
-            // Past it: the floor holds the opening and the box is the frame — one number, no
-            // scene of its own in it.
-            for a in [REFERENCE_PANEL, 3440.0 / 1440.0, 32.0 / 9.0] {
-                let vert = glue_scene_framing(fov, a, None);
+            // Past it: the width stays pinned at the frame's edge for every aspect, the vertical
+            // pays for all of it, and nothing is boxed. One width, no scene of its own in it.
+            for a in [REFERENCE_PANEL, 2.0, 19.5 / 9.0, 3440.0 / 1440.0, 32.0 / 9.0] {
+                let vert = glue_scene_framing(fov, a);
                 assert!(
-                    close((vert * 0.5).tan(), floor),
-                    "fov {fov} a{a} off the floor"
+                    close(half_width(vert, a), GLUE_BOX_ASPECT * floor),
+                    "fov {fov} a{a}: half-width {}",
+                    half_width(vert, a)
                 );
-                assert_eq!(glue_box_aspect(a), Some(GLUE_BOX_ASPECT));
-                assert!(
-                    close(half_width(vert, GLUE_BOX_ASPECT), GLUE_BOX_ASPECT * floor),
-                    "fov {fov} a{a}: the box ends where the width does"
-                );
+                assert!(glue_box_aspect(a).is_none(), "fov {fov} a{a} got bars");
+                // …and the vertical closes monotonically as the panel widens: a cover fit.
+                assert!(vert <= glue_scene_framing(fov, REFERENCE_PANEL) + 1e-6);
             }
             // The art no longer reaches the wide leg at all: a scene measured narrow and a scene
             // measured wide are framed identically. (`half_h` still binds the NARROW leg.)
