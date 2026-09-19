@@ -40,6 +40,7 @@
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 pub mod addon_harness;
+mod android_keyboard;
 mod area;
 mod area_poi;
 mod area_trigger;
@@ -477,6 +478,7 @@ pub fn run(build: BuildId) -> AppExit {
     // context the perf pill needs). `--no-default-features` compiles every one of them out; see
     // `dev.rs` for what is in the group and the one rule that governs the boundary.
     .add_plugins(touch::TouchPlugin)
+    .add_plugins(android_keyboard::AndroidKeyboardPlugin)
     .add_plugins(dev::DevToolsPlugin)
     // The FPS journal — the one instrument that ships (2008): `/console fpsJournal 1` in any
     // build appends a per-second row of position, frame cost and the GPU's per-pass split to

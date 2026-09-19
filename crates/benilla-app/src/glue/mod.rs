@@ -99,34 +99,85 @@ impl GlueClicks {
 /// exactly this (`benilla_ui::script::pointer`'s `same_frame` gate); the glue screens were the half
 /// that dispatched on the press edge, and every one of them moved here (1533).
 ///
-/// Bevy's [`Interaction`] carries the same three states under other names, so the up edge is a
-/// state transition and needs no cursor maths: `ui_focus_system` sets `Pressed` only on the frame
-/// the press lands on a hovered node, holds it through a drag that leaves the node, and on release
-/// clears every `Pressed` back to `None` — after which the same run re-raises `Hovered` on whatever
-/// still contains the cursor. **`Pressed → Hovered` is therefore exactly "released inside"**, and
-/// `Pressed → None` exactly "released outside, or hidden mid-press". The `pushed` set is the ref's
-/// state byte.
+/// Bevy's [`Interaction`] carries the same three states under other names for a **mouse**, so the
+/// up edge is a state transition and needs no cursor maths: `ui_focus_system` sets `Pressed` only
+/// on the frame the press lands on a hovered node, holds it through a drag that leaves the node,
+/// and on release clears every `Pressed` back to `None` — after which the same run re-raises
+/// `Hovered` on whatever still contains the cursor. **`Pressed → Hovered` is therefore exactly
+/// "released inside"**, and `Pressed → None` exactly "released outside, or hidden mid-press". The
+/// `pushed` set is the ref's state byte.
+///
+/// **A lifted finger breaks that re-raise, and this is the fix.** `ui_focus_system`'s hover
+/// recompute has to have *some* pointer still over the node to raise `Hovered` with — a mouse
+/// cursor stays put, but a finger's contact point is simply gone the instant it lifts (the same
+/// "only *currently pressed* touches are visible" gap [`crate::touch`]'s own module doc documents
+/// for the world/UI split, one layer up: there, a lifted finger vanished from `Touches::iter()`
+/// before its release could be read at all; here, Bevy's own picking has the same blind spot one
+/// step later, after `crate::touch` has already done the work of keeping the release visible).
+/// With no pointer left to hit-test, this frame's `Interaction` reads `None`, not `Hovered` — a
+/// touch release is therefore indistinguishable, at the `Interaction` level, from "released
+/// outside", and every glue tap was dropped: the "second finger" workaround players found gave
+/// `ui_focus_system` a pointer to re-raise `Hovered` *with* (the resting finger), which is the
+/// same disguise of the same bug `crate::touch`'s doc catalogues, one layer up. The fix does not
+/// touch the mouse half above — the `Hovered` arm already reads correctly and is left alone — it
+/// only answers the one case Bevy cannot: when a still-`pushed` widget reads `None` on exactly the
+/// frame [`crate::touch::TouchPointer`] reports its finger lifted, its last known position (which
+/// `TouchPointer` guarantees is still `Some` on that frame — see its own doc) is hit-tested
+/// against the widget directly, standing in for the hover Bevy had nothing left to compute.
 pub(crate) fn glue_clicks(
-    interactions: Query<(Entity, &Interaction)>,
+    interactions: Query<(Entity, &Interaction, &ComputedNode, &UiGlobalTransform)>,
     mut pushed: Local<EntityHashSet>,
     mut clicks: ResMut<GlueClicks>,
+    touch_pointer: Res<crate::touch::TouchPointer>,
+    window: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     clicks.0.clear();
-    pushed.retain(|&e| match interactions.get(e) {
-        Ok((_, Interaction::Pressed)) => true, // still held
-        Ok((_, Interaction::Hovered)) => {
-            clicks.0.insert(e); // released inside — the click
-            false
+    let scale = window.single().map(Window::scale_factor).unwrap_or(1.0);
+    // `Some` only on the exact frame the UI finger lifted — never stale, per `TouchPointer`'s own
+    // contract that `pos` and `just_released` land together.
+    let touch_release_at = touch_pointer.just_released.then_some(touch_pointer.pos).flatten();
+    pushed.retain(|&e| {
+        let Ok((_, interaction, node, transform)) = interactions.get(e) else {
+            return false; // despawned mid-press
+        };
+        match interaction {
+            Interaction::Pressed => true, // still held
+            Interaction::Hovered => {
+                clicks.0.insert(e); // released inside — the click (mouse path, unchanged)
+                false
+            }
+            Interaction::None => {
+                // Not necessarily "released outside" — could just as well be Bevy's touch blind
+                // spot. Ask the position directly rather than trust a hover this frame cannot
+                // raise.
+                if let Some(pos) = touch_release_at {
+                    if node_hit_test(node, transform, scale, pos) {
+                        clicks.0.insert(e);
+                    }
+                }
+                false
+            }
         }
-        // Released outside, hidden mid-press, or despawned: the press is simply dropped, as the
-        // ref drops one whose release fails the hit test.
-        _ => false,
     });
-    for (e, interaction) in &interactions {
+    for (e, interaction, ..) in &interactions {
         if *interaction == Interaction::Pressed {
             pushed.insert(e);
         }
     }
+}
+
+/// Is `pos` (logical px, y-down — [`crate::touch::TouchPointer`]'s space, matching
+/// `Window::cursor_position`) inside `node`'s laid-out rect?
+///
+/// [`ComputedNode::size`] and [`UiGlobalTransform`]'s translation are both **physical** px and the
+/// translation is the node's **center**, not its corner (confirmed against this same conversion in
+/// `capture::probes::world_census`, the one other place this crate reads a node's rect back from
+/// the live layout) — so both need `/ scale` before they can be compared against a logical-px
+/// point, and the half-size has to come off the center before it is a min/max box.
+fn node_hit_test(node: &ComputedNode, transform: &UiGlobalTransform, scale: f32, pos: Vec2) -> bool {
+    let half = node.size() / scale * 0.5;
+    let center = transform.translation / scale;
+    (center - half).cmple(pos).all() && pos.cmple(center + half).all()
 }
 
 /// Seat every outline copy at exactly ONE device pixel from its real string (`dir / scale_factor`
@@ -454,9 +505,68 @@ mod tests {
     fn click_app() -> (App, Entity) {
         let mut app = App::new();
         app.init_resource::<GlueClicks>()
+            .init_resource::<crate::touch::TouchPointer>()
             .add_systems(Update, glue_clicks);
-        let widget = app.world_mut().spawn(Interaction::None).id();
+        // A real glue button carries `ComputedNode`/`UiGlobalTransform` once laid out —
+        // `glue_clicks` now reads both, for the touch-release fallback below — so the harness
+        // gives the widget both too. `Default` (a zero-size box at the origin) is enough: it
+        // keeps every existing test in this module (none of which ever sets `TouchPointer`, so
+        // the fallback never runs for them) byte-identical to before, and it is enough geometry
+        // for the two new tests to hit-test `Vec2::ZERO` against, without standing up the full
+        // `UiPlugin` render-app apparatus `text_reshape`'s own tests found impractical here.
+        let widget = app
+            .world_mut()
+            .spawn((
+                Interaction::None,
+                ComputedNode::default(),
+                UiGlobalTransform::default(),
+            ))
+            .id();
         (app, widget)
+    }
+
+    /// **The touch bug this fixes.** A finger presses the button, then lifts with nothing else
+    /// touching the screen: Bevy's own hover recompute has no pointer left to raise `Hovered`
+    /// with, so `Interaction` reads `None` on the release frame — the same shape, at the
+    /// `Interaction` level, as "released outside". This is why it used to take a second resting
+    /// finger to complete a tap: the second finger was the only way to hand `ui_focus_system` a
+    /// pointer it could still raise `Hovered` from.
+    #[test]
+    fn a_single_finger_release_is_still_a_click() {
+        let (mut app, widget) = click_app();
+        click_run(&mut app, widget, Interaction::Pressed);
+        // The finger lifts, alone. `TouchPointer` reports the release with the finger's last
+        // position — the origin, which is exactly where `click_app`'s zero-size default rect
+        // sits, so this position reads as "inside".
+        *app.world_mut().resource_mut::<crate::touch::TouchPointer>() =
+            crate::touch::TouchPointer {
+                pos: Some(Vec2::ZERO),
+                just_pressed: false,
+                just_released: true,
+            };
+        assert!(
+            click_run(&mut app, widget, Interaction::None),
+            "a lone finger lifting over the button is still a click, not a silent drop"
+        );
+    }
+
+    /// The same lone-finger release, but its last position was elsewhere: still no click. The
+    /// fallback only stands in for the hover Bevy had no pointer left to raise — it is not a
+    /// license to fire regardless of where the finger actually was.
+    #[test]
+    fn a_finger_that_lifts_elsewhere_is_not_a_click() {
+        let (mut app, widget) = click_app();
+        click_run(&mut app, widget, Interaction::Pressed);
+        *app.world_mut().resource_mut::<crate::touch::TouchPointer>() =
+            crate::touch::TouchPointer {
+                pos: Some(Vec2::new(500.0, 500.0)),
+                just_pressed: false,
+                just_released: true,
+            };
+        assert!(
+            !click_run(&mut app, widget, Interaction::None),
+            "released away from the button → nothing, same as the mouse law above"
+        );
     }
 
     /// **A press is not a click.** The reference dispatches a stock `<Button>` from the mouse-UP

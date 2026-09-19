@@ -303,16 +303,24 @@ impl TextEngine {
         let mut font_system = client_font_system();
         let mut faces: Vec<Face> = Vec::new();
         let mut path_to_face = HashMap::new();
+        // **The source is built FIRST, and the four client faces are read through it** (issue #4).
+        //
+        // This loop used to call `chain.read(path)` directly. `read_font_bytes`'s
+        // `benilla-config/Fonts/` override therefore never ran for the four faces that matter:
+        // they are all registered here, at load, so `face_for` finds them in `path_to_face` and
+        // `load_face` — the only caller of `read_font_bytes` — is never reached for them. A
+        // player who dropped a CJK `FRIZQT__.ttf` in the folder got the chain's Latin-only copy
+        // and no diagnostic, which is exactly the "custom fonts ignored, fallback loaded instead"
+        // report. The override only ever worked for paths the chain does NOT preload (an addon's
+        // own faces), which is why it looked correct in the tests that exercised it.
+        let source = FontSource {
+            chain: world_assets.chain.clone(),
+            loose_root: crate::ui_script::addons::root(),
+        };
         for &path in CLIENT_FONTS {
-            let bytes = {
-                let chain = world_assets.chain.lock_recover();
-                match chain.read(path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("ui_text: failed to read {path} from the patch chain: {e:#}");
-                        continue;
-                    }
-                }
+            let Some(bytes) = read_font_bytes(&source, path) else {
+                warn!("ui_text: failed to read {path} from the patch chain or benilla-config/Fonts");
+                continue;
             };
             let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
             match register_font(&mut font_system, bytes) {
@@ -334,9 +342,25 @@ impl TextEngine {
         // Friz is index 0 in CLIENT_FONTS and is the fallback; without it nothing downstream has a
         // face to fall back to.
         let default_face = *path_to_face.get(&CLIENT_FONTS[0].to_ascii_lowercase())?;
+        // ── Coverage faces ────────────────────────────────────────────────────────────────────
+        //
+        // Every *other* face in `benilla-config/Fonts/` — one that does not share a basename with
+        // one of the four above, so it replaced nothing — is registered into the same `fontdb`
+        // without being mapped to a path. Nothing can name it, and no `SetFont` will ever resolve
+        // to it; it exists only so `cosmic-text`'s own per-character fallback has somewhere to go.
+        //
+        // This is the half the basename override cannot do. Overriding `FRIZQT__.ttf` with a CJK
+        // face gets CJK glyphs but loses Friz's own letterforms everywhere; dropping a CJK face in
+        // *beside* the four keeps the client's faces for Latin and answers the codepoints they do
+        // not carry. `get_font_matches` orders the whole database and shapes with the first face
+        // that can draw the character, so a Latin character still lands on Friz (it is registered
+        // first and matches the query) and a CJK one falls through to here instead of drawing
+        // nothing. The pool stays closed — these are the player's own files, not
+        // `load_system_fonts()` — so the hazard the module doc warns about does not reopen.
+        let coverage = register_coverage_faces(&mut font_system, &path_to_face);
         info!(
-            "ui_text: font engine ready — {} face(s), glyphs rasterized on demand at {dpi}× \
-             device pixels",
+            "ui_text: font engine ready — {} face(s) + {coverage} coverage face(s), glyphs \
+             rasterized on demand at {dpi}× device pixels",
             faces.len()
         );
         Some(Self {
@@ -344,10 +368,7 @@ impl TextEngine {
             swash: SwashCache::new(),
             faces,
             path_to_face,
-            source: Some(FontSource {
-                chain: world_assets.chain.clone(),
-                loose_root: crate::ui_script::addons::root(),
-            }),
+            source: Some(source),
             missing_fonts: HashSet::new(),
             default_face,
             dpi,
@@ -869,7 +890,7 @@ fn read_user_font(path: &str) -> Option<Vec<u8>> {
     if base.is_empty() || base.contains("..") {
         return None;
     }
-    let dir = crate::local_state::home()?.join("Fonts");
+    let dir = user_font_dir()?;
     // Exact hit first — one `read` and no directory walk in the common case.
     if let Ok(bytes) = std::fs::read(dir.join(base)) {
         return Some(bytes);
@@ -885,6 +906,81 @@ fn read_user_font(path: &str) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// The player's font folder under the config home, found **case-insensitively**.
+///
+/// `Fonts` is what this project writes and documents, but issue #4 and every report since spell it
+/// `fonts`, and on Linux and Android — the two platforms the whole CJK request comes from — those
+/// are different directories. `join("Fonts")` alone silently found nothing there, which reads to a
+/// player exactly like the override being ignored. Windows and macOS were never affected, which is
+/// why this survived: the exact-case `join` below still answers first on both.
+fn user_font_dir() -> Option<std::path::PathBuf> {
+    let home = crate::local_state::home()?;
+    let exact = home.join("Fonts");
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    std::fs::read_dir(&home)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case("fonts"))
+                && e.path().is_dir()
+        })
+        .map(|e| e.path())
+}
+
+/// Register every face in the player's font folder that did **not** already replace a client font,
+/// as an unnamed coverage face. Returns how many were added.
+///
+/// Unnamed on purpose: nothing is inserted into `path_to_face`, so no `SetFont` path can ever
+/// resolve to one of these and no measurement changes for a string the client faces can already
+/// draw. They are reachable only through `cosmic-text`'s own per-character fallback — which is the
+/// single thing that was missing for CJK and Cyrillic.
+fn register_coverage_faces(
+    font_system: &mut FontSystem,
+    path_to_face: &HashMap<String, usize>,
+) -> usize {
+    let Some(dir) = user_font_dir() else {
+        return 0;
+    };
+    // The basenames the four client paths answer to — a file matching one of these was already
+    // read as an override above, and registering it a second time would put two copies of the same
+    // face in the ordering.
+    let replaced: HashSet<String> = path_to_face
+        .keys()
+        .filter_map(|p| p.rsplit(['\\', '/']).next())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut added = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".ttc")) {
+            continue;
+        }
+        if replaced.contains(&lower) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        match register_font(font_system, bytes) {
+            Ok(r) => {
+                info!("ui_text: coverage face {name} ({}) registered", r.family);
+                added += 1;
+            }
+            Err(e) => warn!("ui_text: {name} in the Fonts folder is not a usable face: {e:#}"),
+        }
+    }
+    added
 }
 
 /// A real-font engine for a test: the client faces, read through the app's own patch chain. `None`

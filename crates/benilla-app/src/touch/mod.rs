@@ -33,7 +33,7 @@
 //! |---|---|---|
 //! | [`Role::Joystick`] | touchdown inside the joystick zone (and no joystick finger yet) | [`TouchMove`] → WASD |
 //! | [`Role::Ui`] | touchdown over a mouse-enabled UI frame | [`TouchPointer`] → the UI pointer |
-//! | [`Role::Look`] | anything else | [`TouchLook`] → camera yaw/pitch, and world taps |
+//! | [`Role::Look`] | anything else | [`TouchLook`] → camera yaw/pitch, and world taps. One finger turns the body (right-click's job); two or more orbit the camera only (left-click's — `TouchLook::finger_count` is how `player::camera` tells them apart) |
 //!
 //! The order matters: the joystick is tested first so it keeps working even if an addon parks a
 //! transparent full-screen frame over the world (a real failure mode — a frame that takes the
@@ -133,6 +133,10 @@ pub(crate) struct TouchLook {
     /// A look finger is down — the camera treats this as "a look button is held", which is what
     /// makes free-swipe work without a mouse button to hold.
     pub active: bool,
+    /// How many [`Role::Look`] fingers are down this frame. The camera reads this to pick which
+    /// mouse button a swipe stands in for: 1 finger turns the body (right-click's job), 2+ fingers
+    /// orbit the camera only (left-click's job) — see `player::camera`'s own doc on the split.
+    pub finger_count: u8,
 }
 
 /// The UI pointer as touch sees it. The UI pass reads this **instead of** re-deriving a touch from
@@ -200,8 +204,13 @@ impl Default for JoystickCfg {
                 .unwrap_or(d)
         };
         Self {
-            zone_w: env_f("WOW_TOUCH_ZONE_W", 0.45).clamp(0.05, 1.0),
-            zone_h: env_f("WOW_TOUCH_ZONE_H", 0.60).clamp(0.05, 1.0),
+            // ~15% smaller than the original 0.45×0.60 footprint (issue's touch-enhancement ask):
+            // 0.45×0.85 ≈ 0.38, 0.60×0.85 = 0.51. This only shrinks the RECTANGLE a touchdown has
+            // to land inside to claim the stick — `radius` (how far the thumb then has to drag for
+            // full deflection once anchored) is a separate, untouched knob; the ask was the
+            // touchzone's screen footprint, not the stick's own feel.
+            zone_w: env_f("WOW_TOUCH_ZONE_W", 0.38).clamp(0.05, 1.0),
+            zone_h: env_f("WOW_TOUCH_ZONE_H", 0.51).clamp(0.05, 1.0),
             radius: env_f("WOW_TOUCH_RADIUS", 110.0).max(20.0),
             dead_zone: env_f("WOW_TOUCH_DEADZONE", 0.18).clamp(0.0, 0.9),
             look_scale: env_f("WOW_TOUCH_LOOK", 1.0).max(0.01),
@@ -362,6 +371,7 @@ fn classify_touches(
             Role::Look => {
                 look.delta += (f.pos - f.last) * cfg.look_scale;
                 look.active = true;
+                look.finger_count += 1;
             }
             Role::Ui => {
                 pointer.pos = Some(f.pos);

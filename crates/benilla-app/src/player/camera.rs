@@ -1227,16 +1227,27 @@ pub(super) fn run_look_session(
 
     // Apply this frame's accumulated motion as look rotation while a button is held. Right-drag also
     // turns the character (its facing tracks the camera yaw); left-drag leaves the character facing.
-    // A swipe is a look session with no button to hold. `LookButton::Left` is the right stand-in:
-    // it orbits the camera and leaves the character's facing alone, which is what a look-around
-    // gesture should do — the avatar turns when you *steer*, not when you glance. (Right-drag
-    // semantics, where the facing tracks the camera, stay reachable from the stick.)
+    //
+    // A swipe is a look session with no button to hold, and now picks its stand-in from the finger
+    // count rather than always answering `Left` (issue's touch-enhancement ask — "mimic right-click
+    // behaviour", i.e. turn the body, not just the camera): one finger is `Right` — the avatar turns
+    // when you swipe with a thumb, matching mouse-look's own right-drag — and two or more is `Left`,
+    // the camera-only orbit that used to be the only touch gesture available, now reserved for a
+    // deliberate two-finger swipe so a single-finger glance no longer spins the character under it.
     if rig.look.is_none() && touch_look.active {
-        rig.look = Some(LookButton::Left);
-    } else if rig.look == Some(LookButton::Left) && !touch_look.active && !rig.world_mouse.held(LookButton::Left) {
-        // The finger lifted and no real button is holding the session open — end it. Without this
-        // the camera would stay latched in look mode for the rest of the session.
-        rig.look = None;
+        rig.look = Some(if touch_look.finger_count >= 2 {
+            LookButton::Left
+        } else {
+            LookButton::Right
+        });
+    } else if let Some(active) = rig.look {
+        // The finger lifted and no real button is holding the session open — end it, whichever
+        // button touch armed it with. Without this the camera would stay latched in look mode for
+        // the rest of the session. (Generalized from a `Left`-only check: touch could only ever
+        // start `Left` before this turn, but now starts either.)
+        if !touch_look.active && !rig.world_mouse.held(active) {
+            rig.look = None;
+        }
     }
     if let Some(active) = rig.look {
         let delta = mouse_motion.delta + touch_look.delta;

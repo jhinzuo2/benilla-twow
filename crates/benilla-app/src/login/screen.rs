@@ -11,9 +11,9 @@
 //! Remember Account Name checkbox (20×20 at its resolved absolute (17, top 653) with the 10 px
 //! shadowed gold label at LEFT+24), the Blizzard logo (100×100 at BOTTOM (0,8)) under the
 //! `BLIZZ_DISCLAIMER` line (BOTTOM (0,10)), and the version block (BOTTOMLEFT (0,10),
-//! `VERSION_TEMPLATE` filled with our wire identity's frozen facts and a build number that reads
-//! 7272 against extracted Turtle WoW data, 5875 otherwise — display only; see
-//! `detect_display_build`). The Credits/Cinematics/TOS side of the
+//! `VERSION_TEMPLATE` filled with our wire identity's frozen facts and a version/build pair that
+//! reads "1.18.1 (7272)" against extracted Turtle WoW data, "1.12.1 (5875)" otherwise — display
+//! only; see `detect_display_version`). The Credits/Cinematics/TOS side of the
 //! reference layout is deliberately absent (decision 0539 §1). The dialog is the ref's shared
 //! `GlueDialog` box (512-wide `UI-DialogBox`, text wrapping at 440, one 200×40 button).
 
@@ -296,7 +296,19 @@ fn spawn_screen(
                     ));
                 });
         }
-        outlined_text(
+        // Center-justified (`outlined_text_centered`, not `outlined_text`) and `wrap: true`, not
+        // `false`: pixel-measured against the 1.12.1 reference, both of the disclaimer's two rows
+        // share one horizontal midpoint despite different left/right edges (510.5 vs 510.0 of
+        // 512.0 center — independently centered lines, not left-flush ones), and the line break
+        // between them is data, not layout — Turtle's `BLIZZ_DISCLAIMER` carries its own `|n`
+        // between "...the original lore of the game." and "World of Warcraft remains...". With
+        // `wrap: false` that `|n` fell into `markup_spans`'s "collapse to a space" branch — the
+        // right call for a one-line label, the wrong one for a two-sentence disclaimer — so the
+        // whole string ran onto a single overlong line. `wrap: true` lets the authored break
+        // through; `LineBreak::WordBoundary`'s own width-based wrapping stays inert here since the
+        // wrapper is already full window width and neither authored line comes close to filling
+        // it, so nothing beyond that one `|n` gets a break added.
+        outlined_text_centered(
             ui,
             Node {
                 position_type: PositionType::Absolute,
@@ -314,7 +326,7 @@ fn spawn_screen(
                 ),
                 size: 12.0, // GlueFontNormalSmall
                 color: GOLD,
-                wrap: false,
+                wrap: true,
             },
             &font,
             s,
@@ -322,16 +334,17 @@ fn spawn_screen(
 
         // The version block (`AccountLoginVersion`, GlueFontNormalSmall at BOTTOMLEFT (0,10),
         // justifyH LEFT): `VERSION_TEMPLATE` = "%s %s (%s) (%s)\n%s" filled with our wire
-        // identity's facts — versionType, version, date and buildType are frozen; internalVersion
-        // (the build number) is `detect_display_build`'s, display-only (issue's build-detection
-        // ask) and independent of what the wire actually presents to either server.
+        // identity's facts — versionType, buildType and date are frozen; version and
+        // internalVersion (the "1.12.1"/"1.18.1" and the build number) are `display_version`'s,
+        // display-only (issue's build-detection ask) and independent of what the wire actually
+        // presents to either server — see [`DisplayVersion`]'s own doc comment.
         let version = {
             let template = strings.text("VERSION_TEMPLATE", "%s %s (%s) (%s)\n%s");
-            let build = display_build.to_string();
+            let build = display_version.build.to_string();
             let mut out = template.to_string();
             for piece in [
                 "Version",
-                "1.12.1",
+                display_version.version,
                 build.as_str(),
                 "Release",
                 "Sep 19 2006",
