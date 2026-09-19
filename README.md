@@ -8,10 +8,10 @@
   </p>
 </div>
 
-> [!IMPORTANT]
-> **Issues and pull requests are closed upstream at benilla here at benilla-twow I'd love some Issues posted or PR's incase you found something i missed .** benilla is a solo project developed in a private
-> tree; this repo is its export, published as squashed snapshots, so a PR here has nothing to land
-> on. The best way to contribute is to join the [Discord](https://discord.gg/wJSJx467G4) and report
+> **Issues and pull requests are closed upstream at @samwhosung/benilla here in my fork (@jhinzuo2/benilla-twow) I'd love some Issues posted or PR's incase you found something i missed regarding turtle-wow, windows build or the Android one.** 
+> 
+>
+>The main way to contribute for anything regarding benilla and not benilla-twow(my Fork) should join the [Discord](https://discord.gg/wJSJx467G4) and report
 > the bugs you find. Questions and ideas are welcome in the same place.
 
 benilla speaks the original 1.12.1 protocol, so it connects to any server the real client could,
@@ -142,7 +142,7 @@ No dates; the order is what is likely, not a promise.
 
 Not planned: other expansions or client versions, Warden (anticheat).
 
-## Running it
+## Running it / Environment Variables
 
 You need a **1.12.1 (build 5875) client install** for game data, a vanilla server to connect to,
 and stable Rust. Any 1.12.1 core works; [vmangos](https://github.com/vmangos/core) is what
@@ -156,6 +156,17 @@ The server defaults to `localhost:3724`, the stock `realmd` auth port. Point `WO
 at any IP or hostname, appending the auth port if yours is remapped
 (`WOW_HOST=play.example.com:5000`). Credentials go in at the login screen, or set `WOW_USER` /
 `WOW_PASS` to skip it.
+
+Windows config lands in C:\Users\USERNAME\Documents\benilla-twow\benilla-config
+
+Android config lands in /sdcard/Android/media/benilla-config
+
+Font Support via the 5 Original Fontnames inside /benilla-config/fonts. 
+(ARIALN.ttf, 
+FRITZQT__.ttf, 
+skurri.ttf, 
+MORPHEUS.ttf, 
+WarSansTT-Bliz-500.ttf)
 
 ---
 
