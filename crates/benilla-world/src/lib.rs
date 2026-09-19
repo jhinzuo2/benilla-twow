@@ -143,6 +143,7 @@ pub mod rig_palette;
 pub mod rig_rider;
 pub mod schedule;
 mod shaders;
+pub mod single_model;
 pub mod sky;
 pub mod sky_order;
 pub mod skybox;
