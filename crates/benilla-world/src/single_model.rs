@@ -34,12 +34,28 @@ use crate::model_forms::FormSlices;
 use crate::model_render::{M2BatchMaterials, ModelKind, ModelPart};
 use crate::particles::{spawn_emitter, EmitClock, EmitterFade, EmitterFrames, OwnerLoss};
 use crate::ribbons::{spawn_ribbon, RibbonSeq};
-use crate::rig_anim::{GlobalSeqDrive, RigPose};
+use crate::rig_anim::{GlobalSeqDrive, RigFrame, RigPose};
 use crate::rig_palette::{RigPalettes, RigPart, RigSkin};
 
 /// The fade sphere the instance's emitters and ribbons are gated by. A lone model is always
 /// "near", so this only needs to be larger than any sensible viewing distance.
 const FX_FADE_RADIUS: f32 = 200.0;
+
+/// Where an instance hangs when it does not stand in the world on its own: under a **bone
+/// anchor of a host rig**, which is how a spell kit's effect model rides a caster's hand.
+///
+/// The anchor comes from [`RigPose::anchor_for`] on the host, so it is minted only for bones
+/// something actually consumes and is re-seated by the compose pass every frame the host poses.
+/// The instance is an ordinary child of it: no per-frame work of its own, and it inherits the
+/// host's visibility chain.
+#[derive(Clone, Copy, Debug)]
+pub struct AttachTo {
+    /// The host's anchor entity for the bone this instance rides.
+    pub anchor: Entity,
+    /// The attachment point's offset under that bone, in the host's model space --
+    /// `benilla_assets::ModelAttachment::offset`, which is already Bevy-axed.
+    pub offset: Vec3,
+}
 
 /// Everything [`spawn_single_model`] needs to know about the one model it places.
 pub struct SingleModelSpec<'a> {
@@ -57,13 +73,18 @@ pub struct SingleModelSpec<'a> {
     pub model_path: &'a str,
     /// The display this instance stands for (the [`WorldObject`] id).
     pub display_id: u32,
-    /// Where it stands, Bevy space; `scale` is the instance scale.
+    /// Where it stands, Bevy space; `scale` is the instance scale. When [`Self::attach`] is
+    /// set this no longer places the instance -- the anchor does -- but it is still read as the
+    /// instance's **world estimate**, for the rig's first-frame seed and the emitter fade
+    /// sphere's centre. An attached caller passes its host's transform.
     pub transform: Transform,
     /// `AnimationData.dbc` id to loop from the first frame; `None` = the model's idle seed.
     pub start_anim: Option<u16>,
     /// Rig the model (skinned parts, palette slot, player-driven pose). `false` draws the static
     /// form at bind pose — a viewer's "show me the mesh" and the rig lane's own A/B control.
     pub rig: bool,
+    /// Hang this instance on a host rig's bone anchor instead of standing it in the world.
+    pub attach: Option<AttachTo>,
     /// A character-model NPC's **pre-baked body atlas**, as an `mpq://` URL
     /// (`CreatureDisplayInfoExtra`'s bake name under `Textures\BakedNpcTextures\`). A
     /// `CharSkinSlot::Body` batch carries texture type 1 — the M2 names no file, because the
@@ -117,18 +138,26 @@ pub fn spawn_single_model(
         return None;
     }
     let model = spec.model;
-    let root = commands
-        .spawn((
-            spec.transform,
-            Visibility::default(),
-            WorldObject {
-                kind: ModelKind::Creature,
-                label: spec.model_path.to_owned(),
-                id: spec.display_id,
-                detail: String::new(),
-            },
-        ))
-        .id();
+    // Attached: the anchor places the instance, and the local transform is the attachment
+    // point's own offset under the bone. Free-standing: the caller's world transform.
+    let placement = match &spec.attach {
+        Some(at) => Transform::from_translation(at.offset),
+        None => spec.transform,
+    };
+    let mut root_cmd = commands.spawn((
+        placement,
+        Visibility::default(),
+        WorldObject {
+            kind: ModelKind::Creature,
+            label: spec.model_path.to_owned(),
+            id: spec.display_id,
+            detail: String::new(),
+        },
+    ));
+    if let Some(at) = &spec.attach {
+        root_cmd.insert(ChildOf(at.anchor));
+    }
+    let root = root_cmd.id();
 
     // The rig: a collapsed pose buffer (decision 1365 — no joint entities) plus an EAGER palette
     // slot, the booth's law rather than the doodad lane's lazy one.
@@ -303,6 +332,13 @@ pub fn spawn_single_model(
     }
     if let Some(pose) = pose {
         commands.entity(root).insert(pose);
+        if spec.attach.is_some() {
+            // This root holds a rig AND lives inside another rig's anchor subtree, so a patch
+            // walk that re-seats the host's anchor must re-finalize this rig in the same frame
+            // or the effect lags the hand it hangs from by one (`finalize_rig_worlds`; the
+            // quest-marker seat's law, and the mount seat's before it).
+            commands.entity(root).insert(RigFrame(root));
+        }
     }
 
     Some(SingleModel {
