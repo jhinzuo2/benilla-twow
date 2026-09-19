@@ -12,9 +12,13 @@
 //! the clip, and the rig is allocated eagerly — a viewer's one model is never a palette-pressure
 //! case.
 //!
-//! Character models (`CreatureDisplayInfoExtra` appearance) are out of scope: their body
-//! textures are composited by the game's `char_skin`, and a character model spawned here draws
-//! with whatever the M2 names directly.
+//! **Character models** are supported as far as a *shipped* appearance goes: a caller that knows
+//! the `CreatureDisplayInfoExtra` row passes the pre-baked body atlas, the geoset selection and
+//! the hair sheet ([`SingleModelSpec::body_atlas`] / [`SingleModelSpec::visible_geosets`] /
+//! [`SingleModelSpec::hair_texture`]), and the body renders dressed. What stays out of scope is
+//! the **live composite**: a player's (or a bake-less NPC row's) atlas is layered from
+//! CharSections + worn region textures by the game's `char_skin`, and nothing here re-implements
+//! that — such a subject still draws with an untextured body.
 
 use bevy::camera::visibility::{NoAutoAabb, NoFrustumCulling};
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
@@ -22,6 +26,7 @@ use bevy::mesh::MeshTag;
 use bevy::prelude::*;
 
 use benilla_assets::{skin_url, M2Model, ModelAnimations, ModelSubmesh};
+use benilla_formats::CharSkinSlot;
 
 use crate::interact::WorldObject;
 use crate::mesh_tag::spawn_tag;
@@ -59,6 +64,28 @@ pub struct SingleModelSpec<'a> {
     /// Rig the model (skinned parts, palette slot, player-driven pose). `false` draws the static
     /// form at bind pose — a viewer's "show me the mesh" and the rig lane's own A/B control.
     pub rig: bool,
+    /// A character-model NPC's **pre-baked body atlas**, as an `mpq://` URL
+    /// (`CreatureDisplayInfoExtra`'s bake name under `Textures\BakedNpcTextures\`). A
+    /// `CharSkinSlot::Body` batch carries texture type 1 — the M2 names no file, because the
+    /// client supplies the body at runtime — so without this a humanoid NPC draws untextured.
+    ///
+    /// `None` for a beast model (which names its own textures) and for the live-composite case:
+    /// a row with no bake name wants CharSections compositing, which is the game's `char_skin`
+    /// and is deliberately not reimplemented here. Hair, cape and extra-skin slots are likewise
+    /// left to whoever needs them — this is the body, the one slot a viewer cannot do without.
+    pub body_atlas: Option<String>,
+    /// For a character model: the geoset ids to draw
+    /// ([`benilla_formats::CharacterGeosets::visible_geosets`]). A character M2 ships **every**
+    /// variant of every group — every hairstyle, both ear shapes, six cloaks — and the client
+    /// draws only what the appearance selects; a batch whose `geoset_id` is outside this set is
+    /// skipped. `None` draws every batch, which is right for a creature/doodad model (they carry
+    /// one geoset, id 0) and wrong for a character body.
+    pub visible_geosets: Option<&'a [u16]>,
+    /// A character body's **hair sheet** as an `mpq://` URL (M2 texture type 6, the CharSections
+    /// row for the appearance's style + colour). The baked atlas covers the head *skin*, never the
+    /// hair cards, so without this a styled head draws untextured. `None` for a bald style, and
+    /// for every model with no hair batch.
+    pub hair_texture: Option<String>,
 }
 
 /// What [`spawn_single_model`] spawned. `parts` are children of `root`; `fx` are world roots
@@ -137,28 +164,48 @@ pub fn spawn_single_model(
     let dir = model_dir(spec.model_path);
     let mut parts = Vec::with_capacity(model.submeshes.len());
     for (i, sub) in model.submeshes.iter().enumerate() {
+        // The appearance's geoset selection, when the caller computed one (a character body).
+        if spec
+            .visible_geosets
+            .is_some_and(|set| !set.contains(&sub.geoset_id))
+        {
+            continue;
+        }
         let mesh = if use_rig {
             spec.forms.skin.and_then(|s| s.get(i)).cloned()
         } else {
             spec.forms.stat.get(i).map(|(h, _)| h.clone())
         };
         let Some(mesh) = mesh else { continue };
-        let texture = resolve_skin(sub, dir, spec.skins, asset_server);
+        let texture = resolve_skin(
+            sub,
+            dir,
+            spec.skins,
+            spec.body_atlas.as_deref(),
+            spec.hair_texture.as_deref(),
+            asset_server,
+        );
         let order = u16::try_from(i + 1).unwrap_or(u16::MAX);
         debug!(
-            "single_model: batch {i} tex {} skin_slot {:?} blend {:?} billboard {} two_sided {} aabb {:?}",
-            match (&sub.texture, texture.is_some()) {
-                (Some(_), _) => "authored",
-                (None, true) => "skin",
-                (None, false) => "NONE",
+            "single_model: batch {i} geoset {} tex {} char_slot {:?} skin_slot {:?} blend {:?} billboard {} two_sided {} aabb {:?}",
+            sub.geoset_id,
+            match (&sub.texture, sub.char_slot, texture.is_some()) {
+                (Some(_), _, _) => "authored",
+                (None, Some(CharSkinSlot::Body), true) => "body-atlas",
+                (None, Some(CharSkinSlot::Hair), true) => "hair-sheet",
+                (None, _, true) => "skin",
+                (None, _, false) => "NONE",
             },
+            sub.char_slot,
             sub.skin_slot,
             sub.blend,
             sub.billboard.is_some(),
             sub.two_sided,
             spec.forms.stat.get(i).and_then(|(_, a)| a.as_ref()).map(|a| a.half_extents)
         );
-        let Some(material) = mats.steady(sub, texture, order) else { continue };
+        let Some(material) = mats.steady(sub, texture, order) else {
+            continue;
+        };
         let mut part = commands.spawn((
             Mesh3d(mesh),
             MeshMaterial3d(material),
@@ -277,14 +324,26 @@ pub fn play_sequence(player: &mut AnimationPlayer, anims: &ModelAnimations, anim
     true
 }
 
-/// A batch's texture: the one the M2 names, else the display's variation for its skin slot,
-/// loaded beside the model — the entity lane's own rule.
+/// A batch's texture: the one the M2 names, else a character body atlas for a
+/// [`CharSkinSlot::Body`] batch, else the display's variation for its skin slot, loaded beside the
+/// model — the entity lane's own rule, plus the one runtime slot a viewer cannot skip.
 fn resolve_skin(
     sub: &ModelSubmesh,
     dir: &str,
     skins: &[Option<String>; 3],
+    body_atlas: Option<&str>,
+    hair_texture: Option<&str>,
     asset_server: &AssetServer,
 ) -> Option<Handle<Image>> {
+    // Texture types 1 and 6 name no file in the M2 — the client supplies the body and the hair at
+    // runtime. For a character-model NPC the body is the shipped pre-baked atlas (loaded whole,
+    // never composited) and the hair is its CharSections sheet.
+    match (sub.char_slot, body_atlas, hair_texture) {
+        (Some(CharSkinSlot::Body), Some(url), _) | (Some(CharSkinSlot::Hair), _, Some(url)) => {
+            return Some(asset_server.load(url.to_owned()));
+        }
+        _ => {}
+    }
     match (&sub.texture, sub.skin_slot) {
         (Some(t), _) => Some(t.clone()),
         (None, Some(slot)) => skins
