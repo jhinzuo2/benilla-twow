@@ -145,6 +145,7 @@ pub(crate) fn outlined_text<W: Bundle, T: Bundle>(
         spec.size,
         spec.wrap,
         Justify::Left,
+        LineHeight::default(),
         font,
         s,
     )
@@ -180,6 +181,53 @@ pub(crate) fn outlined_text_centered<W: Bundle, T: Bundle>(
         spec.size,
         spec.wrap,
         Justify::Center,
+        LineHeight::default(),
+        font,
+        s,
+    )
+}
+
+/// [`outlined_text`] for a **multi-row block drawn with the reference client's pixel metrics** —
+/// the login screen's bottom band, the `BLIZZ_DISCLAIMER` pair and the version block. Takes the
+/// justification too, since the two blocks differ (centred / left).
+///
+/// The reference does not draw a `FontString` at the fractional `size × s` this file's other
+/// strings use (12 × 1.875 = 22.5 at 1440p). Measured against a real Turtle WoW client at 1440p
+/// its glyph run is ~2 % *narrower* than ours (1117 vs 1147 px on the disclaimer's first row, 793
+/// vs 806 on its second — exactly the 22.5 → 22 ratio), and its rows sit **23 px** apart where
+/// Bevy's default 1.2× gave 27. Both fit one rule: the font's pixel height is **truncated** to a
+/// whole pixel (22) and the row pitch is that same nominal height **rounded** (23). Nothing here
+/// hardcodes 22.5 — it was always `size × s` — so the rule is applied as arithmetic, and follows
+/// the window's scale rather than being a 1440p constant.
+///
+/// A separate door for the same reason [`outlined_text_centered`] is one: the fractional path is
+/// right for every other string and this is the exception, so it is named at the two call sites
+/// that want it instead of becoming a field on every [`GlueText`] literal. The line height has to
+/// reach all nine strings (the eight outline copies share the layout), so it cannot be inserted
+/// onto the real text afterwards either.
+pub(crate) fn outlined_text_lined<W: Bundle, T: Bundle>(
+    parent: &mut ChildSpawnerCommands,
+    node: Node,
+    wrapper_extra: W,
+    text_extra: T,
+    spec: GlueText,
+    justify: Justify,
+    font: &Handle<Font>,
+    s: f32,
+) -> Entity {
+    let nominal_px = spec.size * s;
+    // `outlined_spans` multiplies by `s` again, so hand it the truncated size in glue units.
+    let size = nominal_px.floor().max(1.0) / s;
+    outlined_spans(
+        parent,
+        node,
+        wrapper_extra,
+        text_extra,
+        &markup_spans(spec.text, spec.color, spec.wrap),
+        size,
+        spec.wrap,
+        justify,
+        LineHeight::Px(nominal_px.round().max(1.0)),
         font,
         s,
     )
@@ -265,6 +313,7 @@ fn outlined_spans<W: Bundle, T: Bundle>(
     size: f32,
     wrap: bool,
     justify: Justify,
+    line_height: LineHeight,
     font: &Handle<Font>,
     s: f32,
 ) -> Entity {
@@ -312,6 +361,7 @@ fn outlined_spans<W: Bundle, T: Bundle>(
                             Text::new(flat.clone()),
                             tf.clone(),
                             layout,
+                            line_height,
                             TextColor(Color::BLACK),
                             Node {
                                 position_type: PositionType::Absolute,
@@ -328,6 +378,7 @@ fn outlined_spans<W: Bundle, T: Bundle>(
                     Text::new(first.0.clone()),
                     tf.clone(),
                     layout,
+                    line_height,
                     TextColor(first.1),
                     TextShadow {
                         offset: Vec2::splat(s),
@@ -337,7 +388,12 @@ fn outlined_spans<W: Bundle, T: Bundle>(
                 ));
                 e.with_children(|spans| {
                     for (text, color) in rest {
-                        spans.spawn((TextSpan::new(text.clone()), tf.clone(), TextColor(*color)));
+                        spans.spawn((
+                            TextSpan::new(text.clone()),
+                            tf.clone(),
+                            line_height,
+                            TextColor(*color),
+                        ));
                     }
                 });
                 real = e.id();

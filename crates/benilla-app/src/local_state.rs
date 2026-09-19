@@ -282,6 +282,18 @@ pub(crate) fn saved_account_path() -> Option<PathBuf> {
     home().map(|h| h.join("account"))
 }
 
+/// `benilla-config/password` — the password the login screen's Remember Password box keeps, beside
+/// [`saved_account_path`]'s name and read back only together with it. Ours: the reference has no
+/// such file (its own client remembers a password through the saved-account list, which is not
+/// built here).
+///
+/// **Stored in clear** — see `login::save_password_to` for the trade and the owner-only mode it is
+/// written with. Through [`home`], so it inherits the same hermetic guard as the account name: a
+/// capture reads no saved password, and cannot photograph one into the frame.
+pub(crate) fn saved_password_path() -> Option<PathBuf> {
+    home().map(|h| h.join("password"))
+}
+
 /// `benilla-config/chat/<realm>-<character>.txt` — the chat windows' saved state (decision 1589):
 /// the background tint, the background alpha, the font size a chat tab's right-click menu sets,
 /// and the window's lock. **Character-scoped**, where the reference keeps the same four inside its
@@ -522,6 +534,11 @@ mod tests {
             saved_account_path(),
             Some(tmp.join("benilla-config/account"))
         );
+        // ...and the password the Remember Password box keeps beside it.
+        assert_eq!(
+            saved_password_path(),
+            Some(tmp.join("benilla-config/password"))
+        );
         assert_eq!(shots_path(), Some(tmp.join("benilla-config/shots.txt")));
         // The print-screen folder (decisions 1486/1487) — the one resident that is a DIRECTORY,
         // and the one whose reference lives inside the install we refuse to write to.
@@ -540,6 +557,11 @@ mod tests {
             saved_account_path(),
             None,
             "a capture reads no saved account"
+        );
+        assert_eq!(
+            saved_password_path(),
+            None,
+            "a capture reads no saved password"
         );
         assert_eq!(shots_path(), None);
         assert_eq!(

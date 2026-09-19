@@ -708,6 +708,10 @@ pub(crate) struct LoginForm {
     pub(super) password: EditBoxState,
     pub(super) focus: Field,
     pub(super) save: bool,
+    /// The Remember Password checkbox. Only ever set together with [`Self::save`] — a saved
+    /// password with no saved name to go with it is no use — so checking it checks the name box
+    /// too, and unchecking the name box unchecks this one.
+    pub(super) save_password: bool,
 }
 
 impl Default for LoginForm {
@@ -718,6 +722,7 @@ impl Default for LoginForm {
             password: textinput::field(MAX_LETTERS, true),
             focus: Field::default(),
             save: false,
+            save_password: false,
         }
     }
 }
@@ -772,18 +777,28 @@ impl LoginForm {
 struct QuitArm(Option<f32>);
 
 /// Entering the login screen: the ref's `AccountLogin_OnShow` — prefill the saved account name,
-/// clear the password, focus account when empty / password otherwise, checkbox = saved-name
-/// exists — and stand the `UI_MainMenu` scene up.
+/// clear the password (**unless one is remembered**, then prefill that), focus account when empty /
+/// password otherwise, checkboxes = saved-name / saved-password exist — and stand the
+/// `UI_MainMenu` scene up.
 fn enter_login(mut form: ResMut<LoginForm>, mut preview: ResMut<GluePreview>) {
     let saved = load_saved_account();
+    // A password is only ever read back alongside the name it was saved with (see
+    // [`LoginForm::save_password`]): an orphaned file is ignored rather than filled in under
+    // whatever the box holds.
+    let saved_password = if saved.is_empty() {
+        String::new()
+    } else {
+        load_saved_password()
+    };
     form.save = !saved.is_empty();
+    form.save_password = !saved_password.is_empty();
     form.focus = if saved.is_empty() {
         Field::Account
     } else {
         Field::Password
     };
     form.account.set_text(&saved);
-    form.password.set_text("");
+    form.password.set_text(&saved_password);
     // `SetFocus` starts the caret solid — the screen never opens mid-blink-off (`set_text` alone
     // wouldn't do it: it no-ops when the saved name is already in the box) — and selects, so a
     // remembered account name is typed over rather than appended to.
@@ -898,6 +913,25 @@ fn login_input(
                 }));
                 if !form.save {
                     save_account("");
+                    // The password rides on the name: no name to remember, nothing to fill it in
+                    // under.
+                    form.save_password = false;
+                    save_password("");
+                }
+            }
+            // Ours (the reference has no such box). Same sounds as its checkbox — the same widget.
+            LoginAction::TogglePassword => {
+                form.save_password = !form.save_password;
+                sounds.write(GlueSound(if form.save_password {
+                    "igMainMenuOptionCheckBoxOff"
+                } else {
+                    "igMainMenuOptionCheckBoxOn"
+                }));
+                if form.save_password {
+                    // Remembering a password remembers the name it belongs to.
+                    form.save = true;
+                } else {
+                    save_password("");
                 }
             } // The dialog's own buttons are `crate::glue::dialog`'s, and this loop is
               // skipped entirely while one is open.
@@ -989,7 +1023,16 @@ fn login_input(
                     save_account("");
                 }
                 let (user, pass) = (form.account.text.clone(), form.password.text.clone());
-                form.password.set_text("");
+                // Remember Password: stored in clear beside the account name (same folder, same
+                // trust — owner-only on Unix) and kept in the box, so a refused login shows the
+                // masked password still there to correct. Unchecked: the box is cleared after the
+                // grab, as the ref does.
+                if form.save && form.save_password {
+                    save_password(&pass);
+                } else {
+                    save_password("");
+                    form.password.set_text("");
+                }
                 dialog.open_status(strings.text("LOGIN_STATE_CONNECTING", "Connecting"));
                 attempt.send(&user, &pass, true);
             }
@@ -1033,6 +1076,13 @@ fn on_account_edited(form: &mut LoginForm) {
         if !saved.is_empty() && saved != form.account.text {
             save_account("");
             form.save = false;
+            // The remembered password belonged to the name just edited away from — drop it, and
+            // the copy sitting in the box, rather than offering it to a different account.
+            if form.save_password {
+                save_password("");
+                form.save_password = false;
+                form.password.set_text("");
+            }
         }
     }
 }
@@ -1178,6 +1228,68 @@ fn load_saved_account() -> String {
 fn save_account(name: &str) {
     if let Some(path) = crate::local_state::saved_account_path() {
         save_account_to(&path, name);
+    }
+}
+
+// ── The saved password (ours — the reference has no such thing) ──────────────────────────────────
+
+/// Read the saved password from `path` (missing file/dir = empty). Only a trailing line ending is
+/// stripped, never other whitespace: a password is bytes the player chose.
+fn load_saved_password_from(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.trim_end_matches(|c: char| c == '\r' || c == '\n')
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Write (or, for an empty password, remove) the saved password at `path`.
+///
+/// **In clear, on purpose, for now** (the request's own trade: a build-state convenience). It is
+/// created owner-only on Unix so the least it does is not hand itself to the machine's other
+/// users; Windows has no equivalent bit and inherits the profile folder's own ACL. Storing the
+/// SRP6 pre-hash `SHA1("USER:PASS")` instead would keep the clear text off disk — but that hash
+/// *is* the credential (realmd derives its verifier from exactly it), so it is a cleaner file, not
+/// a safer one, and it needs an entry point in the auth crate that takes it. Left for when this
+/// stops being a build-state convenience.
+fn save_password_to(path: &std::path::Path, password: &str) {
+    if password.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(password.as_bytes())
+    });
+    if let Err(e) = written {
+        warn!("login: saving password failed: {e}");
+    }
+}
+
+/// The saved password, from [`crate::local_state`]'s folder beside the saved account name.
+fn load_saved_password() -> String {
+    crate::local_state::saved_password_path()
+        .map(|p| load_saved_password_from(&p))
+        .unwrap_or_default()
+}
+
+/// Remember `password` (empty clears).
+fn save_password(password: &str) {
+    if let Some(path) = crate::local_state::saved_password_path() {
+        save_password_to(&path, password);
     }
 }
 
@@ -1833,6 +1945,41 @@ mod tests {
         save_account_to(&path, "");
         assert_eq!(load_saved_account_from(&path), "");
         assert!(!path.exists(), "clearing the name removes the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save → load → clear round-trips the password file too, keeps everything but the trailing
+    /// line ending, and (on Unix) is not readable by other users.
+    #[test]
+    fn saved_password_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "benilla-login-pw-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("password");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(load_saved_password_from(&path), "");
+        save_password_to(&path, " Pa$$ w0rd ");
+        assert_eq!(
+            load_saved_password_from(&path),
+            " Pa$$ w0rd ",
+            "inner and edge spaces are the player's"
+        );
+        // A hand-edited file with a line ending still loads clean.
+        std::fs::write(&path, "hunter2\r\n").unwrap();
+        assert_eq!(load_saved_password_from(&path), "hunter2");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::remove_file(&path);
+            save_password_to(&path, "hunter2");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "group/other get no access: {mode:o}");
+        }
+        save_password_to(&path, "");
+        assert_eq!(load_saved_password_from(&path), "");
+        assert!(!path.exists(), "clearing the password removes the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -9,11 +9,15 @@
 //! 64-tall centered rect ≈ text center 9 px above the box top), Login (`GlueButtonTemplate`
 //! 170×45 at TOP (8,−519)), Quit (`GlueButtonSmallTemplate` 150×38 at BOTTOMRIGHT (−5,29)), the
 //! Remember Account Name checkbox (20×20 at its resolved absolute (17, top 653) with the 10 px
-//! shadowed gold label at LEFT+24), the Blizzard logo (100×100 at BOTTOM (0,8)) under the
-//! `BLIZZ_DISCLAIMER` line (BOTTOM (0,10)), and the version block (BOTTOMLEFT (0,10),
-//! `VERSION_TEMPLATE` filled with our wire identity's frozen facts and a version/build pair that
-//! reads "1.18.1 (7272)" against extracted Turtle WoW data, "1.12.1 (5875)" otherwise — display
-//! only; see `detect_display_version`). The Credits/Cinematics/TOS side of the
+//! shadowed gold label at LEFT+24) and, one row under it, Remember Password (the same widget at
+//! top 677 — ours, not the reference's), the Blizzard logo (100×100 at BOTTOM (0,20)) over the
+//! `BLIZZ_DISCLAIMER` pair (BOTTOM (0,8)), and the version block (BOTTOMLEFT (1.6,8),
+//! `VERSION_TEMPLATE` filled with our wire identity's frozen facts and a version/build/date
+//! triple that reads "1.18.1 (7272)" / "Mar 20 2026" against extracted Turtle WoW data,
+//! "1.12.1 (5875)" / "Sep 19 2006" otherwise — display only; see `detect_display_version`).
+//! The bottom band's numbers are **measured off a real Turtle WoW 1.18.1 client at 1440p**, not
+//! the stock 1.12.1 XML's: Turtle's disclaimer is two rows and its logo sits clear above them,
+//! where stock draws the logo over a one-row disclaimer. The Credits/Cinematics/TOS side of the
 //! reference layout is deliberately absent (decision 0539 §1). The dialog is the ref's shared
 //! `GlueDialog` box (512-wide `UI-DialogBox`, text wrapping at 440, one 200×40 button).
 
@@ -23,8 +27,8 @@ use bevy::window::PrimaryWindow;
 use crate::char_select::wow_font;
 use crate::glue::art::{GlueArt, BACKDROP, GOLD};
 use crate::glue::widgets::{
-    abs, glue_button, glue_edit_box, outlined_text, outlined_text_centered, overlay,
-    paint_glue_field, ArtSwap, GlueBtnKind, GlueFieldPart, GlueText, Hilight,
+    abs, glue_button, glue_edit_box, outlined_text, outlined_text_lined, overlay, paint_glue_field,
+    ArtSwap, GlueBtnKind, GlueFieldPart, GlueText, Hilight,
 };
 use crate::glue_strings::GlueStrings;
 use crate::portrait::{PortraitImages, PortraitSource, GLUE_SLOT};
@@ -48,6 +52,9 @@ pub(crate) enum LoginAction {
     Login,
     Quit,
     ToggleSave,
+    /// The Remember Password checkbox — ours; the reference has none (its saved-account list is
+    /// how a real Turtle client remembers a password).
+    TogglePassword,
     /// Open the realmlist editor (decision 1667) — on the button and on the address readout under
     /// it, so clicking the address you want to change does what it looks like it does.
     Realmlist,
@@ -71,6 +78,10 @@ pub(super) struct PasswordText;
 /// The checkbox's checked overlay (visibility = the form's save flag).
 #[derive(Component)]
 pub(super) struct CheckMark;
+/// Rides on the [`CheckMark`] of the **Remember Password** box, so [`refresh_checkbox`] can tell
+/// the two overlays apart: without it every mark followed `form.save`.
+#[derive(Component)]
+pub(super) struct PasswordCheck;
 /// The checkbox's hover highlight (driven by [`refresh_checkbox`] — the checkbox isn't a
 /// `GlueBtn`, so the shared button pass doesn't cover it).
 #[derive(Component)]
@@ -175,6 +186,10 @@ struct DisplayVersion {
     version: &'static str,
     /// The `(%s)` build token, right after it.
     build: u16,
+    /// The `%s` on the template's second row — the build date the binary was stamped with. Travels
+    /// with `build` for the same reason `build` travels with `version`: a Turtle 7272 under a
+    /// 2006 date describes neither client.
+    date: &'static str,
 }
 
 /// What a stock, non-Turtle 1.12.1 install shows: our real wire identity, [`CLIENT_BUILD`]
@@ -182,6 +197,7 @@ struct DisplayVersion {
 const STOCK_VERSION: DisplayVersion = DisplayVersion {
     version: "1.12.1",
     build: benilla_protocol::CLIENT_BUILD,
+    date: "Sep 19 2006",
 };
 
 /// What a Turtle WoW install shows: Turtle's own advertised version and build — 1.18.1 (7272), the
@@ -190,6 +206,9 @@ const STOCK_VERSION: DisplayVersion = DisplayVersion {
 const TURTLE_VERSION: DisplayVersion = DisplayVersion {
     version: "1.18.1",
     build: benilla_protocol::REALMD_CLIENT_BUILD,
+    // Read off the real 1.18.1 (7272) client's login screen: the `__DATE__` format, so "Mar", not
+    // "March".
+    date: "Mar 20 2026",
 };
 
 /// Turtle WoW's FrameXML ships a family of `Turtle_`-prefixed files alongside the stock ones —
@@ -274,13 +293,15 @@ fn spawn_screen(
             ui.spawn((ImageNode::new(logo.clone()), abs(s, 3.0, 7.0, 256.0, 128.0)));
         }
 
-        // The Blizzard logo (100×100 at BOTTOM (0,8), ARTWORK) with the `BLIZZ_DISCLAIMER`
-        // copyright line at BOTTOM (0,10) drawn over its lower band (the authored overlap — the
-        // wordmark pixels sit above it).
+        // The Blizzard logo (100×100, ARTWORK) at BOTTOM (0,20), clear above the two-row
+        // `BLIZZ_DISCLAIMER` at BOTTOM (0,8). Stock 1.12.1 authors the logo at (0,8) over a one-row
+        // disclaimer, so the line crosses the image's transparent lower band; Turtle's client
+        // raises it 12 units (22.5 px at 1440p — measured, screenshot against screenshot) so the
+        // wordmark ends above the text instead of being written over.
         if let Some(blizz) = &art.blizzard_logo {
             ui.spawn((Node {
                 position_type: PositionType::Absolute,
-                bottom: px(8.0),
+                bottom: px(20.0),
                 width: Val::Percent(100.0),
                 justify_content: JustifyContent::Center,
                 ..default()
@@ -296,7 +317,7 @@ fn spawn_screen(
                     ));
                 });
         }
-        // Center-justified (`outlined_text_centered`, not `outlined_text`) and `wrap: true`, not
+        // Center-justified (`Justify::Center`, not `outlined_text`'s left) and `wrap: true`, not
         // `false`: pixel-measured against the 1.12.1 reference, both of the disclaimer's two rows
         // share one horizontal midpoint despite different left/right edges (510.5 vs 510.0 of
         // 512.0 center — independently centered lines, not left-flush ones), and the line break
@@ -308,11 +329,17 @@ fn spawn_screen(
         // through; `LineBreak::WordBoundary`'s own width-based wrapping stays inert here since the
         // wrapper is already full window width and neither authored line comes close to filling
         // it, so nothing beyond that one `|n` gets a break added.
-        outlined_text_centered(
+        //
+        // Seated at BOTTOM (0,8) and drawn with the reference's pixel metrics
+        // ([`outlined_text_lined`]: 22 px glyphs, 23 px rows at 1440p): together that puts row 1 at
+        // y 1380 and row 2 at y 1403 of a 1440p frame, the two rows' tops in a real Turtle
+        // client's screenshot. The old (0,10) at the default 1.2× drew them at 1370 and 1397 — 10
+        // px high, and overlapping the Blizzard logo.
+        outlined_text_lined(
             ui,
             Node {
                 position_type: PositionType::Absolute,
-                bottom: px(10.0),
+                bottom: px(8.0),
                 width: Val::Percent(100.0),
                 justify_content: JustifyContent::Center,
                 ..default()
@@ -328,16 +355,25 @@ fn spawn_screen(
                 color: GOLD,
                 wrap: true,
             },
+            Justify::Center,
             &font,
             s,
         );
 
-        // The version block (`AccountLoginVersion`, GlueFontNormalSmall at BOTTOMLEFT (0,10),
-        // justifyH LEFT): `VERSION_TEMPLATE` = "%s %s (%s) (%s)\n%s" filled with our wire
-        // identity's facts — versionType, buildType and date are frozen; version and
-        // internalVersion (the "1.12.1"/"1.18.1" and the build number) are `display_version`'s,
+        // The version block (`AccountLoginVersion`, GlueFontNormalSmall at BOTTOMLEFT, justifyH
+        // LEFT): `VERSION_TEMPLATE` = "%s %s (%s) (%s)\n%s" filled with our wire identity's
+        // facts — versionType and buildType are frozen; version, internalVersion (the
+        // "1.12.1"/"1.18.1" and the build number) and the date are `display_version`'s,
         // display-only (issue's build-detection ask) and independent of what the wire actually
         // presents to either server — see [`DisplayVersion`]'s own doc comment.
+        //
+        // **`wrap: true`, because the template's `\n` is a real row break**: `markup_spans`
+        // collapses a line break to a space when `wrap` is false (right for a one-line label), which
+        // is how the date used to run onto the build's row — "…(Release) Sep 19 2006" — where the
+        // real client stacks it beneath as "…(Release)" / "Mar 20 2026". The block hangs off the
+        // left edge at 1.6 units (3 px at 1440p: the real glyphs start at x 4, ours at 1) and
+        // shares the disclaimer's bottom seat and pixel metrics, so the two blocks' rows line up
+        // exactly as they do in the original.
         let version = {
             let template = strings.text("VERSION_TEMPLATE", "%s %s (%s) (%s)\n%s");
             let build = display_version.build.to_string();
@@ -347,18 +383,18 @@ fn spawn_screen(
                 display_version.version,
                 build.as_str(),
                 "Release",
-                "Sep 19 2006",
+                display_version.date,
             ] {
                 out = out.replacen("%s", piece, 1);
             }
             out
         };
-        outlined_text(
+        outlined_text_lined(
             ui,
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                bottom: px(10.0),
+                left: px(1.6),
+                bottom: px(8.0),
                 ..default()
             },
             (),
@@ -367,8 +403,9 @@ fn spawn_screen(
                 text: &version,
                 size: 12.0,
                 color: GOLD,
-                wrap: false,
+                wrap: true,
             },
+            Justify::Left,
             &font,
             s,
         );
@@ -579,98 +616,126 @@ fn spawn_screen(
             s,
         );
 
-        // The Remember Account Name checkbox (20×20 at the resolved absolute (17, top 653) —
-        // the ref anchors it under the Community button we cut; the spot is the same) + its
-        // 10 px shadowed gold label at LEFT+24.
-        ui.spawn((Node {
-            position_type: PositionType::Absolute,
-            left: px(17.0),
-            top: px(653.0),
-            height: px(20.0),
-            align_items: AlignItems::Center,
-            flex_direction: FlexDirection::Row,
-            ..default()
-        },))
-            .with_children(|row| {
-                let mut b = row.spawn((
-                    LoginAction::ToggleSave,
-                    Button,
-                    Node {
-                        width: px(20.0),
-                        height: px(20.0),
-                        ..default()
-                    },
-                ));
-                match &art.checkbox {
-                    Some(check) => {
-                        b.insert((
-                            ImageNode::new(check.up.clone()),
-                            ArtSwap {
-                                up: check.up.clone(),
-                                down: check.down.clone(),
-                            },
-                        ));
-                        b.with_children(|inner| {
-                            inner.spawn((
-                                CheckMark,
-                                if form.save {
-                                    Visibility::Inherited
-                                } else {
-                                    Visibility::Hidden
+        // The two checkboxes (20×20 each, 10 px shadowed gold label at LEFT+24), stacked at LEFT 17:
+        //  · Remember Account Name — the resolved absolute top 653 (the ref anchors it under the
+        //    Community button we cut; the spot is the same);
+        //  · Remember Password — ours, one 24-unit row under it at top 677. The bottom-left corner
+        //    is clear there (the version block starts ~40 units lower), and the row is the same
+        //    widget on the same art, so it reads as part of the original screen.
+        // Data rows rather than two copies of an 80-line spawn: the checked state, the action and
+        // the label are the only things that differ, and a fix to one must reach both.
+        for (action, checked, top, label, is_password) in [
+            (
+                LoginAction::ToggleSave,
+                form.save,
+                653.0,
+                strings.text("SAVE_ACCOUNT_NAME", "Remember Account Name"),
+                false,
+            ),
+            (
+                LoginAction::TogglePassword,
+                form.save_password,
+                677.0,
+                strings.text("BENILLA_SAVE_PASSWORD", "Remember Password"),
+                true,
+            ),
+        ] {
+            ui.spawn((Node {
+                position_type: PositionType::Absolute,
+                left: px(17.0),
+                top: px(top),
+                height: px(20.0),
+                align_items: AlignItems::Center,
+                flex_direction: FlexDirection::Row,
+                ..default()
+            },))
+                .with_children(|row| {
+                    let mut b = row.spawn((
+                        action,
+                        Button,
+                        Node {
+                            width: px(20.0),
+                            height: px(20.0),
+                            ..default()
+                        },
+                    ));
+                    match &art.checkbox {
+                        Some(check) => {
+                            b.insert((
+                                ImageNode::new(check.up.clone()),
+                                ArtSwap {
+                                    up: check.up.clone(),
+                                    down: check.down.clone(),
                                 },
-                                ImageNode::new(check.checked.clone()),
-                                overlay(),
                             ));
-                            if let Some(hi) = &check.hi {
-                                inner.spawn((
-                                    CheckHilight,
-                                    Hilight,
-                                    Visibility::Hidden,
-                                    bevy::ui_render::ui_material::MaterialNode(hi.clone()),
+                            b.with_children(|inner| {
+                                let mut mark = inner.spawn((
+                                    CheckMark,
+                                    if checked {
+                                        Visibility::Inherited
+                                    } else {
+                                        Visibility::Hidden
+                                    },
+                                    ImageNode::new(check.checked.clone()),
                                     overlay(),
                                 ));
-                            }
-                        });
+                                if is_password {
+                                    mark.insert(PasswordCheck);
+                                }
+                                if let Some(hi) = &check.hi {
+                                    inner.spawn((
+                                        CheckHilight,
+                                        Hilight,
+                                        Visibility::Hidden,
+                                        bevy::ui_render::ui_material::MaterialNode(hi.clone()),
+                                        overlay(),
+                                    ));
+                                }
+                            });
+                        }
+                        None => {
+                            b.insert(BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.15)));
+                            b.with_children(|inner| {
+                                let mut mark = inner.spawn((
+                                    CheckMark,
+                                    if checked {
+                                        Visibility::Inherited
+                                    } else {
+                                        Visibility::Hidden
+                                    },
+                                    Text::new("x"),
+                                    TextFont {
+                                        font: font.clone(),
+                                        font_size: 14.0 * s,
+                                        ..default()
+                                    },
+                                    TextColor(GOLD),
+                                ));
+                                if is_password {
+                                    mark.insert(PasswordCheck);
+                                }
+                            });
+                        }
                     }
-                    None => {
-                        b.insert(BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.15)));
-                        b.with_children(|inner| {
-                            inner.spawn((
-                                CheckMark,
-                                if form.save {
-                                    Visibility::Inherited
-                                } else {
-                                    Visibility::Hidden
-                                },
-                                Text::new("x"),
-                                TextFont {
-                                    font: font.clone(),
-                                    font_size: 14.0 * s,
-                                    ..default()
-                                },
-                                TextColor(GOLD),
-                            ));
-                        });
-                    }
-                }
-                row.spawn((
-                    Text::new(strings.text("SAVE_ACCOUNT_NAME", "Remember Account Name")),
-                    TextFont {
-                        font: font.clone(),
-                        font_size: 10.0 * s, // the authored FontHeight 10
-                        ..default()
-                    },
-                    TextColor(GOLD),
-                    TextShadow {
-                        offset: Vec2::new(s, s),
-                        color: Color::BLACK,
-                    },
-                    Node {
-                        margin: UiRect::left(px(4.0)), // LEFT+24 from the checkbox's left edge
-                        ..default()
-                    },
-                ));
-            });
+                    row.spawn((
+                        Text::new(label),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 10.0 * s, // the authored FontHeight 10
+                            ..default()
+                        },
+                        TextColor(GOLD),
+                        TextShadow {
+                            offset: Vec2::new(s, s),
+                            color: Color::BLACK,
+                        },
+                        Node {
+                            margin: UiRect::left(px(4.0)), // LEFT+24 from the checkbox's left edge
+                            ..default()
+                        },
+                    ));
+                });
+        }
     });
 }
 
@@ -716,24 +781,46 @@ pub(super) fn refresh_realmlist(
     }
 }
 
-/// The checkbox's visuals: the checked overlay tracks the form's save flag; the ADD hover ring
-/// tracks the button's interaction (the checkbox isn't a `GlueBtn`, so the shared pass skips it).
+/// Show or hide one checkbox's checked overlay — written only on an actual change, so an unchanged
+/// box does not flag `Visibility` as changed every frame.
+fn set_checked(mut vis: Mut<Visibility>, checked: bool) {
+    let want = if checked {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    if *vis != want {
+        *vis = want;
+    }
+}
+
+/// The checkboxes' visuals: each checked overlay tracks its own flag — the account box's follows
+/// `form.save`, the Remember Password box's (the [`PasswordCheck`] one) `form.save_password`; the
+/// ADD hover ring tracks the button's interaction (the checkbox isn't a `GlueBtn`, so the shared
+/// pass skips it).
 #[allow(clippy::type_complexity)]
 pub(super) fn refresh_checkbox(
     form: Res<LoginForm>,
     boxes: Query<(&Interaction, &Children), With<ArtSwap>>,
-    mut marks: Query<&mut Visibility, (With<CheckMark>, Without<CheckHilight>)>,
+    mut marks: Query<
+        &mut Visibility,
+        (
+            With<CheckMark>,
+            Without<CheckHilight>,
+            Without<PasswordCheck>,
+        ),
+    >,
+    mut password_marks: Query<
+        &mut Visibility,
+        (With<CheckMark>, With<PasswordCheck>, Without<CheckHilight>),
+    >,
     mut hilights: Query<&mut Visibility, With<CheckHilight>>,
 ) {
-    for mut vis in &mut marks {
-        let want = if form.save {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        if *vis != want {
-            *vis = want;
-        }
+    for vis in &mut marks {
+        set_checked(vis, form.save);
+    }
+    for vis in &mut password_marks {
+        set_checked(vis, form.save_password);
     }
     for (interaction, children) in &boxes {
         for child in children {
