@@ -113,7 +113,7 @@ use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap,
 };
 
-use benilla_assets::{LockRecover, WorldAssets};
+use benilla_assets::WorldAssets;
 
 use faces::{hhea_ascent_ratio, register_font, CLIENT_FONTS};
 pub(crate) use gpu::UiTextPlugin;
@@ -851,6 +851,19 @@ impl UiFontAtlas {
 /// with a lowercase `d`, and ships `mailrays.TTF` while its table says `mailrays.ttf`), and a
 /// dot-component is refused before any filesystem call.
 fn read_font_bytes(source: &FontSource, path: &str) -> Option<Vec<u8>> {
+    // ── User font override (issue #4) ──────────────────────────────────────────────────────
+    //
+    // `benilla-config/Fonts/<file>` wins over the chain, matched on the BASENAME so a drop-in
+    // replacement needs no knowledge of the client's `Fonts\` layout: put `FRIZQT__.ttf` in the
+    // folder and every request for `Fonts\FRIZQT__.ttf` resolves to it. That is what makes this a
+    // CJK/Cyrillic fix — the shipped 1.12 faces have no coverage for either, and nothing else in
+    // the stack can add a glyph the face does not contain.
+    //
+    // Deliberately an override and not a *fallback*: the chain always has FRIZQT, it just has a
+    // version with no CJK in it. Case-insensitive, like the chain's own reader.
+    if let Some(bytes) = read_user_font(path) {
+        return Some(bytes);
+    }
     benilla_assets::read_chain_or_loose(&source.chain, source.loose_root.as_deref(), path)
 }
 
