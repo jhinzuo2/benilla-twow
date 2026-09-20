@@ -26,12 +26,17 @@ dev = ["benilla-assets/dev", "benilla-formats/dev", "benilla-world/dev", "dep:be
 # Opt-in Tracy profiling: `cargo run --features tracy` streams per-system `info_span!` markers (on the
 # hot systems) + render-pass CPU timings to a Tracy capture (decision 0026 — the dev/player seam;
 # a `docs/howto/running.md` this once cited never landed).
-tracy = ["bevy/trace_tracy"]
+# `bevy/debug` keeps system names in the spans. Without it Bevy 0.18 replaces every system's name
+# with "<Enable the debug feature to see the name>", so a capture cannot rank systems: all ~1,400
+# per frame collapse into one line. It rides ONLY on these opt-in tracing features, so the
+# `perf`/`ship` player builds are unchanged. Names make every span line longer -- keep captures
+# short (~10 s).
+tracy = ["bevy/trace_tracy", "bevy/debug"]
 # Opt-in Chrome-trace profiling: `cargo run --features trace_chrome` writes a `trace-<ts>.json` of
 # every system's per-run span next to the working dir. Tracy's offline twin — it needs no GUI and no
 # live capture, so a per-system cost question is answerable from a terminal (and from a run someone
 # else recorded). Aggregate it with `scripts/tracesum.py`.
-trace_chrome = ["bevy/trace_chrome"]
+trace_chrome = ["bevy/trace_chrome", "bevy/debug"]
 
 [dependencies]
 anyhow.workspace = true
