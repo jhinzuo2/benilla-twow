@@ -843,40 +843,15 @@ impl UiFontAtlas {
     }
 }
 
-/// Read one font path from the two stores, chain first.
+/// Read one font path from the two stores, chain first —
+/// [`benilla_assets::read_chain_or_loose`], the one rule every by-path addon asset resolves by.
 ///
-/// The loose leg goes through the same [`benilla_assets::loose_addon_file`] the sprite decoder
-/// uses, so it inherits its rules whole: only `Interface\AddOns\` paths reach the folder, the
-/// component walk is case-insensitive (MSBT names its own files `Interface\Addons\…` with a
-/// lowercase `d`, and ships `mailrays.TTF` while its table says `mailrays.ttf`), and a
+/// It inherits that rule whole rather than restating it: only `Interface\AddOns\` paths reach the
+/// folder, the component walk is case-insensitive (MSBT names its own files `Interface\Addons\…`
+/// with a lowercase `d`, and ships `mailrays.TTF` while its table says `mailrays.ttf`), and a
 /// dot-component is refused before any filesystem call.
 fn read_font_bytes(source: &FontSource, path: &str) -> Option<Vec<u8>> {
-    // ── User font override (issue #4) ──────────────────────────────────────────────────────
-    //
-    // `benilla-config/Fonts/<file>` wins over the chain, matched on the BASENAME so a drop-in
-    // replacement needs no knowledge of the client's `Fonts\` layout: put `FRIZQT__.ttf` in the
-    // folder and every request for `Fonts\FRIZQT__.ttf` resolves to it. That is what makes this a
-    // CJK/Cyrillic fix — the shipped 1.12 faces have no coverage for either, and nothing else in
-    // the stack can add a glyph the face does not contain, so the only real fix is letting the
-    // player supply a face that does.
-    //
-    // Deliberately an override and not a *fallback*: a fallback would only engage for a font the
-    // chain is missing entirely, which is never the case here — the chain always has FRIZQT, it
-    // just has a version with no CJK in it. Overriding is also why this needs no font-switcher UI
-    // (the issue's other suggestion): the file name *is* the selection.
-    //
-    // Case-insensitive, because the chain's own reader is (MSBT ships `mailrays.TTF` against a
-    // table that says `mailrays.ttf`) and a player on a case-sensitive filesystem should not have
-    // to care either.
-    if let Some(bytes) = read_user_font(path) {
-        return Some(bytes);
-    }
-    if let Ok(bytes) = source.chain.lock_recover().read(path) {
-        return Some(bytes);
-    }
-    let root = source.loose_root.as_deref()?;
-    let file = benilla_assets::loose_addon_file(root, &benilla_assets::normalize_path(path))?;
-    std::fs::read(file).ok()
+    benilla_assets::read_chain_or_loose(&source.chain, source.loose_root.as_deref(), path)
 }
 
 /// A player-supplied face from `benilla-config/Fonts/`, matched on `path`'s basename.
