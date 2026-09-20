@@ -279,7 +279,15 @@ pub fn spawn_single_model(
             .or_else(|| anims.idle_clip());
         let mut player = AnimationPlayer::default();
         if let Some(clip) = clip {
-            player.play(clip.node).repeat();
+            let active = player.play(clip.node);
+            // Loop only what the model says loops. A creature's Stand and Walk are authored
+            // looping and still repeat; a one-shot -- a Death, or a spell effect's single burst
+            // -- is authored `looping: false` and must play once. Repeating unconditionally
+            // restarted a 0.767 s explosion for as long as its stage was held, which reads as a
+            // second burst cut short rather than as one burst.
+            if clip.looping {
+                active.repeat();
+            }
         }
         commands.entity(root).insert((
             player,
