@@ -1,0 +1,70 @@
+name: Trace build (manual)
+
+# Manual, on-demand only -- never runs on push or PR. Actions tab -> "Trace build (manual)" ->
+# "Run workflow". Builds the PLAYER build (`--no-default-features`, the same shape as the `perf`
+# job, so numbers stay comparable with the perf artifact and the fps journal) plus
+# `trace_chrome`, which makes the game write a per-system Chrome trace, `trace-<ts>.json`, into
+# its working directory.
+#
+# Using it:
+#   1. Download the artifact, run benilla-trace.exe from a folder you don't mind filling.
+#   2. Stand at the spot you are measuring for ~15 seconds. TRACES ARE HUGE (hundreds of MB per
+#      minute at 100+ fps) -- keep the capture short.
+#   3. Quit the game CLEANLY from the menu so the trace is flushed. (A truncated file still
+#      works with scripts/tracesum.py, but you lose the tail.)
+#   4. python scripts/tracesum.py trace-<ts>.json
+#
+# `profile`: `release` links in a few minutes and is plenty for ranking systems. `ship` (fat
+# LTO, one codegen unit) is what the perf job builds; pick it only if you need the exact same
+# codegen as the perf artifact -- its single-threaded link is the slow part.
+#
+# Tracing inflates every span, so trust the ranking and the big gaps, not the absolute ms.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile"
+        type: choice
+        options:
+          - release
+          - ship
+        default: release
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trace:
+    name: trace build (windows, ${{ inputs.profile }})
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own key: a different feature set from `build` and `perf`, so it must not share (and
+          # ping-pong) their cache entries.
+          key: trace-${{ inputs.profile }}
+          cache-on-failure: true
+
+      - name: cargo build --profile ${{ inputs.profile }} --no-default-features --features trace_chrome -p benilla
+        shell: bash
+        run: cargo build --profile "${{ inputs.profile }}" --locked --no-default-features --features trace_chrome -p benilla
+
+      # Cargo names the output directory after the profile for both `release` and `ship`.
+      - name: Upload trace build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benilla-trace-windows-x86_64-${{ inputs.profile }}
+          path: target/${{ inputs.profile }}/benilla.exe
+          if-no-files-found: error
