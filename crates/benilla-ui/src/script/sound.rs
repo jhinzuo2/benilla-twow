@@ -66,16 +66,6 @@ pub enum MusicRequest {
     Stop,
 }
 
-/// One queued Lua **music** intent — the `PlayMusic`/`StopMusic` pair, drained by the app's music
-/// slot (module docs: a different slot, not a different sound, and **one verb with a NULL arm**).
-#[derive(Clone, Debug, PartialEq)]
-pub enum MusicRequest {
-    /// `PlayMusic("path")` — the name arm: start the caller's own looping stream on the slot.
-    Play(String),
-    /// `StopMusic()` — `0x460450`'s NULL arm, the same call with no name.
-    Stop,
-}
-
 impl super::UiScript {
     /// Drain the sounds queued by `PlaySound` since the last call. The app plays each through its
     /// kit player (2D — UI sounds have no world position).
