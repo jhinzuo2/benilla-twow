@@ -85,6 +85,11 @@ pub struct SingleModelSpec<'a> {
     pub rig: bool,
     /// Hang this instance on a host rig's bone anchor instead of standing it in the world.
     pub attach: Option<AttachTo>,
+    /// A held item's **object skin**, as an `mpq://` URL — the texture `ItemDisplayInfo` names
+    /// for the display. A `CharSkinSlot::Object` batch carries texture type 2, which the M2
+    /// leaves unnamed because the client supplies it, so without this a weapon or shield draws
+    /// untextured. Same shape as [`Self::body_atlas`], for the same reason.
+    pub object_texture: Option<String>,
     /// A character-model NPC's **pre-baked body atlas**, as an `mpq://` URL
     /// (`CreatureDisplayInfoExtra`'s bake name under `Textures\BakedNpcTextures\`). A
     /// `CharSkinSlot::Body` batch carries texture type 1 — the M2 names no file, because the
@@ -212,6 +217,7 @@ pub fn spawn_single_model(
             spec.skins,
             spec.body_atlas.as_deref(),
             spec.hair_texture.as_deref(),
+            spec.object_texture.as_deref(),
             asset_server,
         );
         let order = u16::try_from(i + 1).unwrap_or(u16::MAX);
@@ -369,13 +375,17 @@ fn resolve_skin(
     skins: &[Option<String>; 3],
     body_atlas: Option<&str>,
     hair_texture: Option<&str>,
+    object_texture: Option<&str>,
     asset_server: &AssetServer,
 ) -> Option<Handle<Image>> {
-    // Texture types 1 and 6 name no file in the M2 — the client supplies the body and the hair at
-    // runtime. For a character-model NPC the body is the shipped pre-baked atlas (loaded whole,
-    // never composited) and the hair is its CharSections sheet.
-    match (sub.char_slot, body_atlas, hair_texture) {
-        (Some(CharSkinSlot::Body), Some(url), _) | (Some(CharSkinSlot::Hair), _, Some(url)) => {
+    // Texture types 1, 6 and 2 name no file in the M2 — the client supplies the body, the hair
+    // and a held item's skin at runtime. For a character-model NPC the body is the shipped
+    // pre-baked atlas (loaded whole, never composited) and the hair is its CharSections sheet;
+    // for a weapon or shield the object skin is the one `ItemDisplayInfo` names for the display.
+    match (sub.char_slot, body_atlas, hair_texture, object_texture) {
+        (Some(CharSkinSlot::Body), Some(url), _, _)
+        | (Some(CharSkinSlot::Hair), _, Some(url), _)
+        | (Some(CharSkinSlot::Object), _, _, Some(url)) => {
             return Some(asset_server.load(url.to_owned()));
         }
         _ => {}
