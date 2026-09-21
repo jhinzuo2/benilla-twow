@@ -1131,6 +1131,16 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "2008: benilla's own — 1.12 has no player-side perf log; its nearest thing is the \
          Ctrl+R framerate label, a number with no file behind it",
     ),
+    // Turtle WoW's native nameplate cast bar switch. pfUI's `nameplates.lua` writes it once at
+    // load (`pcall(SetCVar, "ShowVKeyCastbar", 0)`) so its own cast bar is the only one. benilla
+    // draws no native one, so there is no knob behind it — registered so that write is accepted
+    // instead of warned about, and so `GetCVar` answers what the addon just set.
+    ours(
+        "ShowVKeyCastbar",
+        "0",
+        "Turtle WoW's own nameplate cast-bar toggle, absent from the 1.12 reference; benilla draws \
+         no native nameplate cast bar, so it only has to accept pfUI's write",
+    ),
     same(crate::char_select::CVAR_LAST_CHARACTER, "0"),
 ];
 
@@ -3468,6 +3478,10 @@ mod tests {
             (
                 "useUiScale",
                 "UIOptionsFrame.lua and OptionsFrame.lua branch on it to gate the uiScale slider",
+            ),
+            (
+                "ShowVKeyCastbar",
+                "pfUI's nameplates.lua writes it once at load; no host knob behind it",
             ),
         ];
         let app_src = crate::test_support::src_dir();

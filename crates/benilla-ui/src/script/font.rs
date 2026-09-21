@@ -358,7 +358,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "SetFont",
         lua.create_function(
-            |lua, (this, file, height, flags): (Table, Value, Value, Option<String>)| {
+            |lua, (this, file, height, flags): (Table, Value, Value, Value)| {
+                // The flags slot is read the way the reference gates it — a string (or a number,
+                // which coerces) is flags, ANYTHING else is "no flags", never a raise. pfUI's own
+                // `ChatFontNormal:SetFont(f, 13, outline == "1" and "OUTLINE")` hands it `false`.
+                let flags = binding_abi::optional_string(lua, &flags);
                 // The same gate the FontString and EditBox tables enter — one `0x79f210`, three
                 // entry points. This side used to take `Option`s, so `SetFont()` answered **nil**
                 // where the reference raises `0x87c69c`; the FontString's copy answered the boolean

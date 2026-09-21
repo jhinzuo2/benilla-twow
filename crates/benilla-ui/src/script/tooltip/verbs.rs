@@ -99,6 +99,14 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                         "ANCHOR_NONE" => TooltipAnchor::None,
                         "ANCHOR_PRESERVE" => TooltipAnchor::Preserve,
                         "" => TooltipAnchor::Left,
+                        // A bare frame-point name (`SetOwner(this, "BOTTOMRIGHT")`) is a common
+                        // addon slip for `ANCHOR_BOTTOMRIGHT`. The reference does not recognise
+                        // it and lands on ANCHOR_LEFT without a word, and so do we — same mode,
+                        // same placement — but it is a known, harmless spelling rather than an
+                        // unknown mode, so it does not raise the warning. Anything else that
+                        // is not one of the nine modes still does.
+                        "TOP" | "BOTTOM" | "LEFT" | "RIGHT" | "CENTER" | "TOPLEFT" | "TOPRIGHT"
+                        | "BOTTOMLEFT" | "BOTTOMRIGHT" => TooltipAnchor::Left,
                         other => {
                             model.record_warning(format!(
                                 "SetOwner: unknown anchor '{other}' (mode 0, ANCHOR_LEFT)"

@@ -81,6 +81,9 @@
             GameFontNormalMed1 (13px) by MainMenuFrameMixin:OnLoad. Both header idioms (1.12's
             TOP+12 texture / era's 39-tall frame with the art centered) seat the art within half
             a unit of each other; the 1.12 transcription is kept, the font and string are era's.
+        - **UPDATE: Edit Mode / Support are OFF the ladder** (frame 200x225, five rungs, tops
+          32/73/114/135/176) until something exists behind them; the paragraph below is the
+          design they were greyed under, kept for when they come back.
         - **Edit Mode / Support ship DISABLED** — nothing behind them yet
           (`GameMenuButton_Pending`): the template's own `-Disabled` art + grey label, exactly
           how the era menu greys a dead entry (SetEnabled(false) → DisabledFont). Each goes live
@@ -238,8 +241,10 @@
          decision 1318). Restored alone; the ref's `movable`/`parent` stay off deliberately. -->
     <Frame name="GameMenuFrame" parent="UIParent" frameStrata="DIALOG" toplevel="true" enableMouse="true" hidden="true">
         <!-- The era layout engine's own numbers (header SCOPE note): 28+144+28 wide, 32-top /
-             28-bottom padding around our seven 21-unit rungs with three 20-unit section gaps. -->
-        <Size><AbsDimension x="200" y="267"/></Size>
+             28-bottom padding around our FIVE 21-unit rungs with three 20-unit section gaps:
+             32 + 5*21 + 3*20 + 28 = 225. (Edit Mode and Support are off the ladder until they
+             have something behind them — see the rung notes below.) -->
+        <Size><AbsDimension x="200" y="225"/></Size>
         <Anchors><Anchor point="CENTER"/></Anchors>
         <Backdrop bgFile="Interface\DialogFrame\UI-DialogBox-Background" edgeFile="Interface\DialogFrame\UI-DialogBox-Border" tile="true">
             <BackgroundInsets><AbsInset left="11" right="12" top="12" bottom="11"/></BackgroundInsets>
@@ -276,8 +281,12 @@
                  frames replace each other); hiding the menu explicitly says the same thing
                  without relying on the eviction path. -->
             <Button name="GameMenuButtonOptions" inherits="GameMenuButtonTemplate" text="Options">
+                <!-- Anchored TOP at x=0, not TOPLEFT at x=28: the same seat at the era's 200-wide
+                     frame (200/2 - 144/2 = 28), but it stays centred when a skin resizes the frame
+                     — pfUI narrows it by 30 and adds its own centred buttons above, which left
+                     this whole ladder sitting right of centre. The 1.12 menu is TOP-anchored too. -->
                 <Anchors>
-                    <Anchor point="TOPLEFT"><Offset><AbsDimension x="28" y="-32"/></Offset></Anchor>
+                    <Anchor point="TOP"><Offset><AbsDimension x="0" y="-32"/></Offset></Anchor>
                 </Anchors>
                 <Scripts>
                     <OnClick>
@@ -288,21 +297,15 @@
                 </Scripts>
             </Button>
 
-            <Button name="GameMenuButtonEditMode" inherits="GameMenuButtonTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="GameMenuButtonOptions" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-20"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>GameMenuButton_Pending(self, HUD_EDIT_MODE_MENU)</OnLoad></Scripts>
-            </Button>
-            <Button name="GameMenuButtonSupport" inherits="GameMenuButtonTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="GameMenuButtonEditMode" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="0"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>GameMenuButton_Pending(self, GAMEMENU_SUPPORT)</OnLoad></Scripts>
-            </Button>
+            <!-- Edit Mode and Support are NOT on the ladder for now: nothing is behind either, and
+                 two greyed rungs read as a broken menu once a skin restyles the live ones around
+                 them. To bring one back, add a `GameMenuButtonTemplate` button here whose OnLoad
+                 calls `GameMenuButton_Pending(self, HUD_EDIT_MODE_MENU)` (or GAMEMENU_SUPPORT) and
+                 re-grow the frame by 21 per rung; when it has behaviour, replace that call with an
+                 OnClick. -->
             <Button name="GameMenuButtonMacros" inherits="GameMenuButtonTemplate" text="MACROS">
                 <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="GameMenuButtonSupport" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="0"/></Offset></Anchor>
+                    <Anchor point="TOPLEFT" relativeTo="GameMenuButtonOptions" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-20"/></Offset></Anchor>
                 </Anchors>
                 <!-- LIVE since decision 0983 (MacroFrame.xml). The ref's own body
                      (GameMenuFrame.xml l.118-122): hide the menu, then ShowMacroFrame(). -->

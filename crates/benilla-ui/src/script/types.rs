@@ -115,6 +115,11 @@ pub enum QuadContent {
         /// host's tile renderer draws (decision 2013), the map arrow's `crate::script::ARROW_MODEL`
         /// among them since 2015.
         model: Option<String>,
+        /// The unit token `PlayerModel:SetUnit` last bound the pane to (`None` for a file pane or
+        /// an empty one). The app joins a pane no window claims by NAME to that unit's own portrait
+        /// bake when it has one — pfUI's unit-frame portraits are anonymous-window `PlayerModel`s
+        /// driven by `SetUnit("player")`/`("target")`/…, and this is what lets them draw.
+        unit: Option<String>,
         /// `SetFacing`'s radians (0 default).
         facing: f32,
         /// `SetModelScale`'s factor (1 default).
@@ -544,6 +549,9 @@ pub(crate) struct RegionData {
     pub(crate) fill: Option<[f32; 4]>,
     /// `SetGradientAlpha(orientation, r1,g1,b1,a1, r2,g2,b2,a2)` / `SetGradient(...)` — the two-stop
     /// linear gradient the client generates into the same texture slot the colour form fills.
+    ///
+    /// **A gradient MODULATES a solid `fill` (`fill × gradient`), it does not replace it** — the
+    /// vertex-colour reading `script::extract`'s `fold_fill_and_gradient` paints.
     ///
     /// **Stored in full, painted as its midpoint, and that gap is stated rather than implied.** The
     /// UI renderer has one tint per quad (a colour region is the shared 1x1 white image tinted), so

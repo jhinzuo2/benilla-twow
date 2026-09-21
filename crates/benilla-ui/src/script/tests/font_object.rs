@@ -1170,3 +1170,33 @@ fn msbt_paints_its_own_face_size_outline_and_fade_over_the_font_object_it_inheri
         )
     );
 }
+
+/// **A non-string `flags` argument to `SetFont` is "no flags", never a raise** — on all three
+/// widgets that carry the verb (a Font object, a FontString, a Button).
+///
+/// The reference reads the slot behind a `lua_isstring` gate, so a boolean is simply absent. pfUI's
+/// `UpdateFonts` does `ChatFontNormal:SetFont(default, 13, outline == "1" and "OUTLINE")`, which is
+/// the boolean `false` whenever the chat-outline option is off — and loading a profile re-runs it.
+/// mlua's own `String` converter made that a `bad argument #4: error converting Lua boolean to
+/// String` and killed the whole font pass half way.
+#[test]
+fn set_font_takes_a_non_string_flags_argument_as_no_flags() {
+    let s = script();
+    s.run(
+        r#"
+        local face = "Fonts\\FRIZQT__.TTF"
+        F = CreateFrame("Frame", "FlagsProbe")
+        FS = F:CreateFontString(nil, "ARTWORK")
+        B = CreateFrame("Button", "FlagsProbeButton", F)
+        Fo = CreateFont("FlagsProbeFont")
+        Fo:SetFont(face, 13, false)
+        FS:SetFont(face, 13, false)
+        B:SetFont(face, 13, false)
+        Fo:SetFont(face, 13, nil)
+        Fo:SetFont(face, 13, "OUTLINE")
+        local _, _, flags = Fo:GetFont()
+        assert(flags == "OUTLINE", "a real flags string still lands, got " .. tostring(flags))
+        "#,
+    )
+    .expect("a boolean flags argument must not raise");
+}

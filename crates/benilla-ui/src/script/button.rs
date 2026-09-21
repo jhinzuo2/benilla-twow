@@ -894,7 +894,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "SetFont",
         lua.create_function(
-            |lua, (this, file, height, flags): (Table, Value, Value, Option<String>)| {
+            |lua, (this, file, height, flags): (Table, Value, Value, Value)| {
+                // Flags: a string/number is flags, anything else (pfUI passes `false`) is none.
+                let flags = super::binding_abi::optional_string(lua, &flags);
                 let usage = || {
                     mlua::Error::runtime(
                         "Usage: <Button>:SetFont(\"font\", fontHeight [, flags])".to_string(),

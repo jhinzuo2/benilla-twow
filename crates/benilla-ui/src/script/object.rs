@@ -385,10 +385,16 @@ fn frame_kind_from_str(s: &str) -> Option<FrameKind> {
 }
 
 /// A Lua number-ish → f32 (nil/other → 0.0), for offset/color args.
+///
+/// A **numeric string is a number**, exactly as `lua_tonumber` reads one: `"0.6"` is 0.6, and only
+/// a string that is not a number (`"abc"`) is 0.0. pfUI depends on it — `GetStringColor(".6,.6,.6,1")`
+/// hands back four STRINGS from `strsplit`, and its gryphon module passes them straight to
+/// `SetVertexColor`; reading them as 0.0 tinted the action-bar gryphons black.
 pub(super) fn as_f32(v: &Value) -> f32 {
     match v {
         Value::Number(n) => *n as f32,
         Value::Integer(i) => *i as f32,
+        Value::String(_) => as_f64(v) as f32,
         _ => 0.0,
     }
 }
@@ -400,6 +406,12 @@ pub(super) fn as_f64(v: &Value) -> f64 {
     match v {
         Value::Number(n) => *n,
         Value::Integer(i) => *i as f64,
+        // `lua_tonumber` converts a numeric string; anything else it cannot read is 0.0.
+        Value::String(s) => s
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(0.0),
         _ => 0.0,
     }
 }

@@ -865,6 +865,40 @@ fn a_gradient_is_stored_whole_and_painted_as_its_midpoint() {
     );
 }
 
+/// **A gradient MODULATES a solid colour texel — the fill must not win outright.**
+///
+/// pfUI's config window marks the selected tab with `SetTexture(1, 1, 1, 1)` followed by
+/// `SetGradientAlpha("HORIZONTAL", 0,0,0,0, 1,1,1,.05)`: a faint fade over a white texel. The gradient
+/// is the texture's vertex colour, so the drawn colour is `fill × gradient` (folded to the midpoint
+/// here, `(.5,.5,.5,.025)`), not the opaque white fill that used to beat it and paint a solid slab.
+#[test]
+fn a_gradient_modulates_a_solid_fill_instead_of_losing_to_it() {
+    let mut s = script();
+    s.run(
+        r#"
+        f = CreateFrame("Frame", "GradFillProbe")
+        f:SetWidth(100) f:SetHeight(20)
+        f:SetPoint("TOPLEFT", 0, 0)
+        t = f:CreateTexture(nil, "BACKGROUND")
+        t:SetAllPoints(f)
+        t:SetTexture(1, 1, 1, 1)
+        t:SetGradientAlpha("HORIZONTAL", 0, 0, 0, 0, 1, 1, 1, 0.05)
+    "#,
+    )
+    .expect("a solid fill followed by a gradient is ordinary addon code");
+
+    s.resolve();
+    let drawn = s.extract().iter().find_map(|q| match &q.content {
+        crate::script::QuadContent::Texture { color: Some(c), .. } => Some(*c),
+        _ => None,
+    });
+    let c = drawn.expect("the region paints");
+    assert!(
+        (c[0] - 0.5).abs() < 1e-6 && (c[3] - 0.025).abs() < 1e-6,
+        "fill x gradient midpoint = (.5,.5,.5,.025), not the opaque white fill; got {c:?}"
+    );
+}
+
 /// **The split itself: a Texture answers texture verbs and NOT text ones, and vice versa.**
 ///
 /// Until this landed, one shared table meant a Texture answered `SetText` and a FontString answered

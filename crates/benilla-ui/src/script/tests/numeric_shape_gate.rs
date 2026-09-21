@@ -92,3 +92,27 @@ fn every_shape_c_colour_position_takes_nil_as_zero_and_never_raises() {
     s.run("FS:SetTextColor(nil, nil, nil)")
         .expect("the sibling 1973 already fixed");
 }
+
+/// **A NUMERIC STRING is its number at a shape-C position** — `lua_tonumber` converts one, and only
+/// a string that is not a number reads as 0.0 (the `"abc"` row above).
+///
+/// The live case is pfUI's gryphon module: `GetStringColor(".6,.6,.6,1")` returns four STRINGS out of
+/// `strsplit`, and `SetVertexColor(r, g, b, a)` was reading the three colour channels as 0.0 — the
+/// action-bar gryphons drew black.
+#[test]
+fn a_numeric_string_at_a_shape_c_position_is_its_number() {
+    let s = script();
+    s.run(
+        r#"
+        F = CreateFrame("Frame", "NumStrF")
+        T = F:CreateTexture(nil, "ARTWORK")
+        T:SetVertexColor(".6", "0.5", " 1 ", 1)
+        local r, g, b, a = T:GetVertexColor()
+        assert(math.abs(r - 0.6) < 1e-6, "'.6' is 0.6, got " .. tostring(r))
+        assert(math.abs(g - 0.5) < 1e-6, "'0.5' is 0.5, got " .. tostring(g))
+        assert(b == 1, "' 1 ' is 1, got " .. tostring(b))
+        assert(a == 1, "the alpha slot is untouched")
+        "#,
+    )
+    .expect("numeric strings are numbers");
+}

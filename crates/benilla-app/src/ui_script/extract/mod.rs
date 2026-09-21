@@ -1449,6 +1449,7 @@ fn convert_entry(
             handle,
             name,
             model,
+            unit,
             facing,
             model_scale,
             position,
@@ -1526,7 +1527,14 @@ fn convert_entry(
                 }
                 return;
             }
-            let Some(slot) = name.as_deref().and_then(crate::portrait::model_pane_booth) else {
+            // A pane a window claims by name samples that window's booth. One nobody claims can
+            // still be bound to a unit (`SetUnit`) — pfUI's unit-frame portraits — and then shows
+            // that unit's own portrait bake; with no such bake it draws nothing.
+            let Some(slot) = name
+                .as_deref()
+                .and_then(crate::portrait::model_pane_booth)
+                .or_else(|| unit.as_deref().and_then(crate::portrait::unit_portrait_slot))
+            else {
                 return;
             };
             // The aspect the bake must render at, and the fact that it is on screen at all
@@ -2576,6 +2584,45 @@ mod extract_gate_tests {
         assert!(
             (aspect - 233.0 / 224.0).abs() < 0.01,
             "the pane's own rect is the aspect, got {aspect}"
+        );
+    }
+
+    /// **An unclaimed `<PlayerModel>` bound to a unit draws THAT UNIT's portrait bake** — pfUI's
+    /// unit-frame portraits (`CreateFrame("PlayerModel", "pfPortraitModelplayer1", …)` +
+    /// `SetUnit("player")`) belong to no stock window, so the name table cannot reach them; the
+    /// unit's own bake is what they show. A unit with no slot (`raid7`) still draws nothing.
+    #[test]
+    fn an_unclaimed_unit_pane_draws_its_units_own_portrait_bake() {
+        let mut app = app_from_script(
+            r#"
+            local mine = CreateFrame("PlayerModel", "pfPortraitModelplayer1")
+            mine:SetPoint("TOPLEFT", 0, 0)
+            mine:SetWidth(64); mine:SetHeight(64)
+            mine:SetUnit("player")
+            local far = CreateFrame("PlayerModel", "pfPortraitModelraid7")
+            far:SetPoint("TOPLEFT", 300, 0)
+            far:SetWidth(64); far:SetHeight(64)
+            far:SetUnit("raid7")
+        "#,
+        );
+        let bake = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+        app.world_mut().resource_mut::<PortraitImages>().0.insert(
+            "player".to_string(),
+            crate::portrait::PortraitSource::Live(bake.clone()),
+        );
+        app.update();
+
+        let quads = &app.world().resource::<UiQuads>().quads;
+        let panes = quads
+            .iter()
+            .filter(|q| q.texture.as_ref() == Some(&bake))
+            .count();
+        assert_eq!(
+            panes, 1,
+            "the pane bound to \"player\" draws the player's bake; the raid7 pane draws nothing"
         );
     }
 

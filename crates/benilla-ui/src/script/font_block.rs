@@ -238,7 +238,9 @@ pub(super) fn install(
     m.set(
         "SetFont",
         lua.create_function(
-            move |lua, (this, file, height, flags): (Table, Value, Value, Option<String>)| {
+            move |lua, (this, file, height, flags): (Table, Value, Value, Value)| {
+                // Flags: a string/number is flags, anything else (pfUI passes `false`) is none.
+                let flags = super::binding_abi::optional_string(lua, &flags);
                 let (path, height) = set_font_args(&file, &height, widget)?;
                 let rh = resolve(lua, &this)?;
                 let mut model = lua.app_data_mut::<Model>().expect("model");

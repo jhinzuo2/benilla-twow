@@ -198,6 +198,23 @@ pub(crate) fn model_pane_booth(name: &str) -> Option<&'static str> {
         .map(|(_, slot)| *slot)
 }
 
+/// The round-portrait slot a **unit-bound model pane** draws, for a pane no window claims by name
+/// ([`model_pane_booth`]): the pane's own `SetUnit` token, when that unit has a portrait bake.
+///
+/// pfUI's unit frames build their 3-D portraits as anonymous `PlayerModel`s and drive them with
+/// `SetUnit("player")`, `("target")`, `("party1")` … — no stock window owns those panes, so the
+/// name table above can never reach them. The unit's OWN bake is the honest content for such a
+/// pane (it is the same face `SetPortraitTexture` shows), not somebody else's. The token is
+/// matched case-insensitively against the round slots; `"npc"` is a dialog booth, not a unit a
+/// pane binds, and a token with no slot (`raid7`, `focus`) draws nothing, as before.
+pub(crate) fn unit_portrait_slot(unit: &str) -> Option<&'static str> {
+    SLOTS
+        .iter()
+        .copied()
+        .filter(|slot| *slot != "npc")
+        .find(|slot| slot.eq_ignore_ascii_case(unit))
+}
+
 /// World is layer 0, the UI quad pass layer 1; portraits sit on their own high layers so nothing in the
 /// world leaks into a booth and vice-versa (one layer per slot: base, base+1, …).
 const PORTRAIT_LAYER_BASE: usize = 2;

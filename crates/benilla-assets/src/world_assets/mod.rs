@@ -223,6 +223,12 @@ fn decode_sprite(
     loose_root: Option<&Path>,
     path: &str,
 ) -> Option<(u32, u32, Vec<u8>)> {
+    // `SetTexture("")` is how an addon CLEARS a texture (pfUI's video-options skin does it to the
+    // window header). An empty path is "no art", not a missing file: nothing to resolve, so no
+    // read and no `texture miss` report.
+    if path.trim().is_empty() {
+        return None;
+    }
     let candidates = sprite_candidates(path);
     let mut chain = chain.lock_recover();
     for candidate in &candidates {

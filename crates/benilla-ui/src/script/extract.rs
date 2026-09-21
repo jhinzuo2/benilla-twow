@@ -122,6 +122,7 @@ impl UiScript {
                             handle: fh,
                             name: frame.and_then(|f| f.name.clone()),
                             model: m.path.clone(),
+                            unit: m.unit.clone(),
                             facing: m.facing,
                             model_scale: m.scale,
                             position: m.position,
@@ -493,7 +494,7 @@ impl UiScript {
                         // (`RegionData::gradient`) so a renderer that grows a second stop needs no
                         // API change. The approximation is visible, and it is stated there and here
                         // rather than discovered later.
-                        let fill = data.fill.or_else(|| data.gradient.map(|g| g.midpoint()));
+                        let fill = fold_fill_and_gradient(data.fill, data.gradient);
                         let has_path = data.texture.is_some();
                         let has_texture = has_path || fill.is_some();
                         QuadContent::Texture {
@@ -602,6 +603,32 @@ fn texture_color(fill: Option<[f32; 4]>, vertex: Option<[f32; 4]>) -> Option<[f3
     match (fill, vertex) {
         (Some(f), Some(v)) => Some([f[0] * v[0], f[1] * v[1], f[2] * v[2], f[3] * v[3]]),
         (Some(c), None) | (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// The one tint a Texture region's colour texel and its two-stop gradient fold to.
+///
+/// `SetGradient`/`SetGradientAlpha` write the texture's per-vertex colours, which **modulate** the
+/// texel — they do not replace it. So a solid `SetTexture(r, g, b, a)` fill followed by a gradient
+/// draws `fill × gradient`, and the fill must not win outright. pfUI's config window does exactly
+/// this on the selected tab: `SetTexture(1,1,1,1)` then `SetGradientAlpha("HORIZONTAL",
+/// 0,0,0,0, 1,1,1,.05)`, meant as a faint fade — with the fill winning it painted a solid white
+/// slab. A gradient with no fill still paints on its own (the FuBar case), and a fill with no
+/// gradient is the fill.
+///
+/// Like every gradient here it is folded to its midpoint, because a quad carries one tint.
+fn fold_fill_and_gradient(
+    fill: Option<[f32; 4]>,
+    gradient: Option<crate::script::Gradient>,
+) -> Option<[f32; 4]> {
+    match (fill, gradient) {
+        (Some(f), Some(g)) => {
+            let m = g.midpoint();
+            Some([f[0] * m[0], f[1] * m[1], f[2] * m[2], f[3] * m[3]])
+        }
+        (Some(f), None) => Some(f),
+        (None, Some(g)) => Some(g.midpoint()),
         (None, None) => None,
     }
 }
