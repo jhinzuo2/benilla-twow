@@ -665,7 +665,27 @@ fn drive_vplates(
         else {
             continue;
         };
-        cands.push((
+        // **No plate until the unit's name is known.** `NameCache::resolve` answers `None` on a
+        // miss and fires the name query as a side effect, so a plate built this frame would carry
+        // an EMPTY name — and `FontString:GetText()` collapses `""` to nil (the 1.12 getter's own
+        // law, `region/text.rs`). Every nameplate addon reads that text on the plate's very first
+        // update: pfUI's `OnDataChanged` does `GetUnitData(plate.original.name:GetText(), true)`,
+        // whose `queue[name] = true` then raised `table index is nil`
+        // (`libunitscan.lua:43`) once for each plate born before its name arrived, i.e. every plate
+        // in the first second after world entry.
+        //
+        // Skipping is self-healing: the same gate runs again next frame, and the plate appears the
+        // frame after the answer lands, one round-trip late, with its name already in place. The
+        // query has been sent by the call itself, so nothing waits on anything else.
+        //
+        // NOT YET CHECKED against the reference: whether it plates a unit whose name query is
+        // still in flight (its plate is bound to the unit's cached name, so it likely never does).
+        // If it turns out to, this becomes a visible divergence and should be reverted in favour
+        // of seeding the name text before the plate is first shown.
+        if names.resolve(guid.0, &net_commands).is_none() {
+            continue;
+        }
+        cands.push(
             screen.distance_squared(sort_pt),
             screen,
             anchor,

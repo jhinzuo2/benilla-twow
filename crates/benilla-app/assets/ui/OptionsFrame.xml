@@ -1216,6 +1216,30 @@
             [6] = { -0.5, 0.5, 0.05 },
             [9] = { 0, 3, 1 },
         }
+        --
+        -- **Publish the table when the chain does not carry it.** The vendored bounds above only
+        -- cover benilla's OWN reads; a THIRD-PARTY write still indexes the global directly. pfUI's
+        -- `hdgraphic` module opens with `_G.OptionsFrameSliders[3].maxValue = 15`, and on the TWoW
+        -- chain (whose replacement `OptionsFrame.lua` defines no such table) that line died with
+        -- `attempt to index field 'OptionsFrameSliders' (a nil value)` and took the whole module
+        -- down with it, including its `SetWorldDetail` hook.
+        --
+        -- Guarded on `== nil`, so a stock 1.12 chain keeps the reference's own nine rows untouched
+        -- (this file loads AFTER the video window, and an unconditional assignment would REPLACE
+        -- them — see the 2177 note above). Only rows 1-3 are published, with the reference's field
+        -- names (`minValue`/`maxValue`/`valueStep`) that `BenillaGraphicsSliderBounds` and pfUI
+        -- both read. Rows 6 and 9 stay in the vendored table only: they are benilla's own knobs,
+        -- and a row in the published table with no `func` string would be a lie about the
+        -- reference's shape. Being the live table, it is then the PREFERRED source for
+        -- `BenillaGraphicsSliderBounds`, which is what lets pfUI's `maxValue = 15` reach the
+        -- OnShow re-apply loop, the conduit the note above calls load-bearing.
+        if ( OptionsFrameSliders == nil ) then
+            OptionsFrameSliders = {}
+            for i = 1, 3 do
+                local b = BENILLA_GRAPHICS_SLIDER_BOUNDS[i]
+                OptionsFrameSliders[i] = { minValue = b[1], maxValue = b[2], valueStep = b[3] }
+            end
+        end
         -- Row i's bounds, one door for all five OnLoads and the OnShow re-apply alike: the
         -- reference's table when the chain carries it, the vendored row above when it does not.
         -- It returns THREE values, so the call-site law matters: a multiple-return call expands
