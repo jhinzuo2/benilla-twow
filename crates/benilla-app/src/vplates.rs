@@ -685,7 +685,7 @@ fn drive_vplates(
         if names.resolve(guid.0, &net_commands).is_none() {
             continue;
         }
-        cands.push(
+        cands.push((
             screen.distance_squared(sort_pt),
             screen,
             anchor,
