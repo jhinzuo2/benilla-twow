@@ -19,24 +19,12 @@
 //! answering `nil` would make that a `table index is nil` error one call deeper — the failure mode
 //! we have been paying for all arc.
 //!
-//! ## `getfenv`/`setfenv` (TWoW gap fix)
+//! ## `getfenv`/`setfenv` — native, not stubbed
 //!
-//! Neither was registered at all before this fix — not stubbed, not wrong, simply absent, so any
-//! chunk that opened with `getfenv(...)` died on `attempt to call global 'getfenv' (a nil value)`
-//! before its own first real statement ran. Turtle WoW's `FrameXML/Globals.lua` is exactly that
-//! chunk: its very first executable line is `_G = getfenv(0)`, so the absence did not degrade
-//! `Globals.lua` — it killed the whole file at line 1, silently taking every later definition in
-//! it down too (`wipe`, `trim`, `explode`, `sizeof`, `print`), which is why `UIParent.lua`'s calls
-//! to `wipe(...)` faulted on a nil global hundreds of lines downstream with no error anywhere near
-//! the real cause.
-//!
-//! Both are collapsed to the one shape this host actually has: a single shared global
-//! environment, no per-chunk or per-function sandboxing (`RunScript`'s own comment below says the
-//! same thing for the chunk loader — "no `setfenv` here and none in the reference either"). So
-//! every `getfenv` argument (`0`, `1`, a function value, absent) answers the same table — the real
-//! `Lua::globals()` — and `setfenv` is a deliberate no-op rather than a raise: it does not attempt
-//! to isolate a chunk into a fresh environment, but it does not break a caller that only ever
-//! wanted `_G` back either.
+//! Both come from the VM's own base library and are intentionally left alone; see the comment at
+//! the end of [`install`]. A previous revision replaced them with a stub (`getfenv` always
+//! answering `_G`, `setfenv` a no-op), which fixed `Globals.lua`'s `_G = getfenv(0)` but broke
+//! per-addon environments (`setfenv(1, env)`), the mechanism pfUI is built on.
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -281,25 +269,25 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // `getfenv`/`setfenv` — 5.0/5.1 environment introspection. See the module-level doc comment
-    // above ("TWoW gap fix") for the full story: neither was registered at all before this, and
-    // Turtle WoW's `FrameXML/Globals.lua` opens with `_G = getfenv(0)`, so the absence silently
-    // killed that whole file at line 1 — taking `wipe`, `trim`, `explode`, `sizeof`, and `print`
-    // down with it, hundreds of lines before `UIParent.lua`'s `wipe(...)` calls ever faulted.
+    // `getfenv`/`setfenv` are deliberately NOT registered here.
     //
-    // This host runs one shared global environment with no per-chunk sandboxing (`RunScript`
-    // above already says as much), so every `getfenv` argument answers the same table — the real
-    // `Lua::globals()`, by identity, not a snapshot/copy — and `setfenv` is a deliberate no-op: it
-    // does not raise, and it does not attempt an isolation this host does not otherwise have.
-    let genv = g.clone();
-    g.set(
-        "getfenv",
-        lua.create_function(move |_, _level: Option<Value>| Ok(genv.clone()))?,
-    )?;
-    g.set(
-        "setfenv",
-        lua.create_function(|_, (_level, _env): (Value, mlua::Table)| Ok(()))?,
-    )?;
+    // The VM is stock 5.1 (`mlua` `lua51`), and `Lua::new()` opens the base library, which already
+    // contains the real pair with the reference's semantics: level 0 = the globals table, level 1 =
+    // the running function, level N = its N-th caller, or a function value.
+    //
+    // An earlier "TWoW gap fix" registered a stub pair here (`getfenv` -> always `_G`, `setfenv` ->
+    // no-op) on the belief that the functions were absent. They were present all along; the stub
+    // OVERWROTE them. It happened to satisfy `Globals.lua`'s `_G = getfenv(0)`, but it broke every
+    // addon that namespaces itself. pfUI runs `setfenv(1, pfUI:GetEnvironment())` on line 2 of every
+    // file and `setfenv(module_fn, env)` in `LoadModule`; with a no-op the chunk stays in `_G`, so
+    // names that live in `pfUI.env` (`libtipscan`, `checkversion`, `pfUI.api.*`) resolve to nil, and
+    // pfUI's compat `GetItemInfo` (which calls `_G.GetItemInfo`) recurses into itself until the
+    // stack overflows.
+    //
+    // Do NOT wrap the natives in a Rust `create_function` either: that adds a C-function frame and
+    // shifts what "level 1" means, so `setfenv(1, env)` would hit the wrong function.
+    //
+    // The natives survive `stdlib::sandbox` (its removal list does not name them) and `lua50::install`.
 
     Ok(())
 }
@@ -505,9 +493,7 @@ mod tests {
     }
 
     /// `getfenv(0)` answers the real global table, **by identity** — not a snapshot, not a copy.
-    /// Turtle WoW's `FrameXML/Globals.lua` opens with `_G = getfenv(0)`; if this ever answered a
-    /// different table than the one global writes actually land in, that line would silently
-    /// detach `_G` from the real environment on every future read through it.
+    /// Turtle WoW's `FrameXML/Globals.lua` opens with `_G = getfenv(0)`.
     #[test]
     fn getfenv_zero_answers_the_real_global_table_by_identity() {
         let s = UiScript::new().unwrap();
@@ -516,20 +502,15 @@ mod tests {
                 .unwrap(),
             "getfenv(0) must be _G itself, not a copy"
         );
-        // And a global written before the call is visible through the table getfenv(0) returns —
-        // proof it is the live environment, not a fresh table pre-seeded with a snapshot.
         assert!(
             s.eval::<bool>(
                 "PreExisting = 'here' local e = getfenv(0) return e.PreExisting == 'here'"
             )
             .unwrap(),
-            "getfenv(0) must see globals that already existed, not just ones set after the call"
+            "getfenv(0) must see globals that already existed"
         );
     }
 
-    /// The exact TWoW failure this fix closes: `Globals.lua`'s own first line, followed by its
-    /// `wipe` definition — both used to die together, silently, because `getfenv` did not exist as
-    /// a callable global at all.
     #[test]
     fn a_chunk_opening_with_getfenv_zero_no_longer_aborts_at_line_one() {
         let mut s = UiScript::new().unwrap();
@@ -546,17 +527,75 @@ mod tests {
         assert!(
             s.eval::<bool>("local t = {1,2,3} wipe(t) return next(t) == nil")
                 .unwrap(),
-            "wipe must have actually been defined — the whole point of the fix"
+            "wipe must have actually been defined"
         );
     }
 
-    /// `setfenv` is a no-op, not a raise — this host has no per-chunk sandboxing to give it, and a
-    /// caller that only ever wanted `_G` back (the common `setfenv(1, getfenv(0))` idiom some
-    /// libraries use defensively) must not fault on the call.
+    /// pfUI's whole idiom: `setfenv(1, env)` at the top of a chunk, `env` falling back to `_G`
+    /// through `__index`. Names defined in `env` must be visible to the rest of the chunk, and
+    /// names the chunk defines must land in `env`, not in `_G`.
     #[test]
-    fn setfenv_is_a_harmless_no_op() {
+    fn setfenv_one_inside_a_chunk_switches_that_chunks_environment() {
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            r#"
+            PFENV = setmetatable({}, { __index = getfenv(0) })
+            PFENV.libtipscan = { tag = "scanner" }
+            "#,
+        )
+        .unwrap();
+        let f = s
+            .eval::<bool>(
+                r#"
+                local chunk = loadstring([[
+                    setfenv(1, PFENV)
+                    seen = libtipscan and libtipscan.tag   -- resolved via PFENV
+                    defined_in_env = 42                     -- must land in PFENV
+                    return seen == "scanner"
+                ]])
+                return chunk()
+                "#,
+            )
+            .unwrap();
+        assert!(f, "the chunk must see names from the environment it switched to");
+        assert!(
+            s.eval::<bool>("return PFENV.defined_in_env == 42 and rawget(_G, 'defined_in_env') == nil")
+                .unwrap(),
+            "globals written after setfenv(1, env) must land in env, not _G"
+        );
+    }
+
+    /// `pfUI:LoadModule`: `setfenv(fn, env)` on a closure, then call it.
+    #[test]
+    fn setfenv_on_a_function_value_takes_effect_on_its_next_call() {
         let s = UiScript::new().unwrap();
-        s.eval::<()>("setfenv(1, getfenv(0))")
-            .expect("setfenv must not raise");
+        assert!(
+            s.eval::<bool>(
+                r#"
+                local env = setmetatable({ marker = "in-env" }, { __index = getfenv(0) })
+                local fn = loadstring("return marker")
+                setfenv(fn, env)
+                return fn() == "in-env" and marker == nil
+                "#
+            )
+            .unwrap()
+        );
+    }
+
+    /// `getfenv(fn)` reads back what `setfenv(fn, env)` wrote.
+    #[test]
+    fn getfenv_reads_back_what_setfenv_wrote() {
+        let s = UiScript::new().unwrap();
+        assert!(
+            s.eval::<bool>(
+                r#"
+                local env = {}
+                local fn = loadstring("return 1")
+                setfenv(fn, env)
+                return getfenv(fn) == env
+                "#
+            )
+            .unwrap()
+        );
     }
 }
