@@ -1,23 +1,8 @@
-// The glue screens' Bevy-UI node shader, on the UI **gamma composite lane** (decision 0254).
-//
-// VENDORED from `bevy_ui_render` 0.18.1 `src/ui.wgsl`. Everything below is that file verbatim —
-// the rounded-box SDF, the border/AA math, the vertex stage — EXCEPT the fragment's colour
-// computation, which is moved into the client's byte space (marked THE ONE CHANGE below). Bevy UI
-// exposes no colour-space hook, and its pipeline takes one shader handle for both stages, so the
-// whole file has to come along. Re-diff against upstream on every Bevy upgrade: a structural change
-// (vertex attributes, bind groups) fails loudly at pipeline validation, but a fragment-side tweak
-// would drift silently. `bevy = "0.18.1"` is pinned in Cargo.toml.
-//
-// Why: the reference draws its glue screens through a fixed-function device into an 8-bit
-// backbuffer, so every UI multiply AND every UI blend is arithmetic on GAMMA BYTES. Bevy UI
-// composites in linear, which over the login scene's bright sky washed the edit boxes from the
-// reference's byte ~77 to ~138 — the director's "input and button are too faint", measured. This
-// fragment hands the pipeline a RAW GAMMA value; the target is `Rgba8UnormSrgb`, so the hardware
-// blend reads back exactly what was written and the `(SrcAlpha, OneMinusSrcAlpha)` blend runs on
-// gamma values — the reference's byte arithmetic. `ui_gamma.wgsl` then owns the frame's ONE decode.
-//
-// The `#define_import_path` line of the original is deliberately dropped: two modules claiming
-// `bevy_ui::ui_node` would collide.
+// The glue screens' Bevy UI node shader, vendored from `bevy_ui_render` 0.18.1 `src/ui.wgsl`,
+// verbatim except `linear_to_srgb`, the fragment's colour and the dropped `#define_import_path`
+// (two `bevy_ui::ui_node` modules would collide). Re-diff on every Bevy upgrade: a fragment-side
+// change drifts silently. The fragment outputs raw gamma, as the reference blends on 8-bit bytes;
+// `ui_gamma.wgsl` decodes once.
 
 #import bevy_render::view::View
 
@@ -35,9 +20,8 @@ fn enabled(flags: u32, mask: u32) -> bool {
     return (flags & mask) != 0u;
 }
 
-// Linear → sRGB (the exact IEC 61966-2-1 curve the hardware's sRGB store uses, so this inverts the
-// sampler's decode bit-for-bit in f32). Alpha carries no gamma and never passes through here.
-// Identical to `ui_quad.wgsl`'s — the player-UI lane's twin of this conversion.
+// Linear to sRGB (IEC 61966-2-1), the exact inverse of the sampler's decode; keep identical to
+// `ui_quad.wgsl`'s.
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let higher = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
     let lower = c * 12.92;
@@ -242,16 +226,9 @@ fn draw_uinode_background(
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
 
-    // ── THE ONE CHANGE from the vendored original ────────────────────────────────────────────────
-    // Upstream computes `select(in.color, in.color * texture_color, TEXTURED)` — a LINEAR product
-    // handed to a linear blend. Both factors go back to the client's byte space FIRST, and the
-    // multiply happens there: `in.color` is a linearised authored sRGB colour (FrameXML `<Color>`,
-    // the glue palette) and the sampler already decoded the sRGB art, so encoding each factor
-    // recovers exactly the two authored bytes the reference's FFP multiplies. Encoding each factor
-    // separately — rather than the product — matters: sRGB's linear toe makes `encode(a*b)` and
-    // `encode(a)*encode(b)` diverge in the darks, which is precisely where the edit-box fills live
-    // (byte 13 vs byte 7 for the `DEFAULT_TOOLTIP_COLOR` fill).
-    // Alpha is coverage, carries no gamma, and multiplies unchanged.
+    // ── changed from upstream ──
+    // Upstream multiplies in linear; here each factor goes back to its byte and the multiply runs
+    // there, as the reference's fixed-function pipeline does.
     let textured = enabled(in.flags, TEXTURED);
     let tint = linear_to_srgb(in.color.rgb);
     let texel = linear_to_srgb(texture_color.rgb);
@@ -259,7 +236,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         select(tint, tint * texel, textured),
         select(in.color.a, in.color.a * texture_color.a, textured),
     );
-    // ── end of the change; the rest is upstream verbatim ─────────────────────────────────────────
+    // ── end of the change ──
 
     if enabled(in.flags, BORDER_ANY) {
         return draw_uinode_border(color, in.point, in.size, in.radius, in.border, in.flags);

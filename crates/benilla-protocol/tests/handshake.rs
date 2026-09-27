@@ -1,10 +1,6 @@
-//! The world handshake against a fake server, exercising [`WorldSession::connect`] over a real
-//! socket with real header obfuscation.
-//!
-//! What these pin down is the packet *ordering* tolerance the handshake needs. A server does not
-//! promise `SMSG_AUTH_RESPONSE` is the first encrypted packet — it interleaves its own traffic —
-//! and one of those interleaved packets, `SMSG_WARDEN_DATA`, means the server runs an anticheat we
-//! cannot answer and must be refused at login rather than entered and kicked ~30 s later.
+//! The world handshake over a real socket against a fake server: packets may precede
+//! `SMSG_AUTH_RESPONSE`. Deviation: `SMSG_WARDEN_DATA` refuses the login, because benilla cannot
+//! answer Warden and the server kicks a client that stays silent about 30 s later.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,8 +14,8 @@ use benilla_srp::SESSION_KEY_LENGTH;
 const SESSION_KEY: [u8; SESSION_KEY_LENGTH] = [7u8; SESSION_KEY_LENGTH];
 const SERVER_SEED: u32 = 0xDEAD_BEEF;
 
-/// Write one server packet: 2-byte BE size (counts the opcode, not itself) + 2-byte LE opcode,
-/// encrypted once `crypto` is in play, then the plaintext body.
+/// Write one server packet: `u16` BE size (opcode plus body) and `u16` LE opcode, encrypted once
+/// `crypto` is set, then the plaintext body.
 fn send(stream: &mut TcpStream, crypto: Option<&mut HeaderCrypto>, opcode: u16, body: &[u8]) {
     let size = (body.len() + 2) as u16;
     let s = size.to_be_bytes();
@@ -41,8 +37,8 @@ fn read_auth_session(stream: &mut TcpStream) {
     stream.read_exact(&mut body).unwrap();
 }
 
-/// Stand up a fake world server that sends `pre` (opcode, body) pairs — encrypted, in order —
-/// before a successful `SMSG_AUTH_RESPONSE`. Returns the address to point `connect` at.
+/// A fake world server that sends the `pre` packets, encrypted and in order, before a successful
+/// `SMSG_AUTH_RESPONSE`; returns its address.
 fn fake_server(pre: Vec<(u16, Vec<u8>)>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -71,15 +67,13 @@ fn fake_server(pre: Vec<(u16, Vec<u8>)>) -> String {
     addr
 }
 
-/// The plain case: `SMSG_AUTH_RESPONSE` leads, the handshake completes.
 #[test]
 fn auth_response_alone_completes_the_handshake() {
     let addr = fake_server(vec![]);
     assert!(WorldSession::connect(&addr, "one", SESSION_KEY).is_ok());
 }
 
-/// A server interleaving its own traffic ahead of the auth response must not fail the handshake —
-/// the real one does this, and demanding AUTH_RESPONSE lead once broke login outright.
+/// The server interleaves its own packets ahead of the auth response.
 #[test]
 fn packets_ahead_of_the_auth_response_are_skipped() {
     let addr = fake_server(vec![
@@ -89,15 +83,6 @@ fn packets_ahead_of_the_auth_response_are_skipped() {
     assert!(WorldSession::connect(&addr, "one", SESSION_KEY).is_ok());
 }
 
-/// TurtleWoW sends SMSG_WARDEN_DATA but does not enforce/kick on it in practice (confirmed against
-/// real observed server behavior), so it's skipped like any other interleaved packet rather than
-/// treated as fatal. This replaces an earlier assumption — that every server arms an
-/// unconditional response-timeout kick per vmangos' `Warden::BeginTimeoutClock` — which held for a
-/// vmangos-style enforcing config but not for this one. `WardenRequired` (see its own doc comment)
-/// is still benilla's honest answer for a server that DOES enforce Warden; there's just no way to
-/// distinguish "sends the packet" from "will actually kick over it" from the packet alone, so this
-/// project has chosen to trust the specific server it targets over defending against a class of
-/// server it doesn't.
 #[test]
 fn a_warden_data_packet_does_not_end_the_handshake() {
     let addr = fake_server(vec![(opcode::SMSG_WARDEN_DATA, vec![0u8; 16])]);

@@ -1,6 +1,5 @@
-//! `--speed`: the force-speed-change wire. GM `.modify speed 1.5`, require + ack
-//! `SMSG_FORCE_RUN_SPEED_CHANGE`, then `.modify speed 1` and require a SECOND change on a still-live
-//! stream (a malformed ack drops the session, so surviving both round trips is the proof).
+//! `--speed`: ack two `SMSG_FORCE_RUN_SPEED_CHANGE`s from `.modify speed`; a malformed ack drops
+//! the session, so surviving both round trips is the proof.
 
 use anyhow::{ensure, Result};
 use benilla_protocol::{SessionEvent, SpeedKind};
@@ -21,10 +20,8 @@ impl Probe for Speed {
 
     fn on_event(&mut self, ev: &SessionEvent, cx: &mut Ctx) -> Result<()> {
         if let SessionEvent::ForceSpeedChange { guid, .. } = ev {
-            // Fires after World has acked + recorded the change. World acks only when our pose is
-            // known (`tracked.get(guid)` Some, else it skips the arm entirely and never records) —
-            // mirror that guard (self + tracked-present) here so the second `.modify` is suppressed
-            // in exactly the same pose-missing case the old in-arm `continue` suppressed it.
+            // Runs after World's ack, which World sends only with our pose tracked; the same
+            // guard holds the second `.modify` back when there was no ack.
             if *guid == cx.world.self_guid
                 && cx.world.tracked.contains_key(guid)
                 && !self.second_sent
@@ -38,13 +35,12 @@ impl Probe for Speed {
     }
 
     fn verify(&mut self, cx: &mut Ctx) -> Result<()> {
-        // --speed verdict: two changes, both Run, the flat speeds the GM rates imply (1.5×7.0 then
-        // 1.0×7.0), and an incremented counter — proof both acks were parsed (a malformed body drops
-        // the session before the second round trip could complete).
+        // Base run speed is 7.0 yd/s, so the rates 1.5 and 1 give 10.5 then 7.0.
         let speed_changes_seen = &cx.world.speed_changes_seen;
         ensure!(
             speed_changes_seen.len() >= 2,
-            "--speed: expected 2 force-speed changes (got {}) — did the first ack drop the session,              or is the account not GM?",
+            "--speed: expected 2 force-speed changes (got {}) — did the first ack drop the \
+             session, or is the account not GM?",
             speed_changes_seen.len()
         );
         let (k1, c1, s1) = speed_changes_seen[0];
@@ -62,7 +58,8 @@ impl Probe for Speed {
             "--speed: movement counter must increment across changes (got {c1} then {c2})"
         );
         println!(
-            "\n--speed PASS: {k1:?} 7.0->10.5->7.0 yd/s, counters {c1}->{c2}, both acks accepted              (stream survived)"
+            "\n--speed PASS: {k1:?} 7.0->10.5->7.0 yd/s, counters {c1}->{c2}, both acks accepted \
+             (stream survived)"
         );
         Ok(())
     }
