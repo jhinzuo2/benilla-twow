@@ -178,7 +178,7 @@ pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
         let mut dialed = None;
         for _ in 0..MAX_CHALLENGE_DIALS {
             let mut stream = dial(host, port)?;
-            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), REALMD_CLIENT_BUILD)
+            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), CLIENT_BUILD)
                 .context("sending logon challenge")?;
             let reply =
                 auth::read_challenge_reply(&mut stream).context("reading logon challenge reply")?;
