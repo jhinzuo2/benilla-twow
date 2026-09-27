@@ -1,0 +1,360 @@
+name: CI ( Build without Test blockage) + Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Manual, on-demand only (workflow_dispatch) -- never runs on push/PR, so it can never race the
+  # `build`/`android` jobs' own checkouts or silently rewrite history on every push. Exists purely
+  # because there's no local Rust toolchain to run `cargo build` (no --locked) and commit the
+  # result the normal way -- this is that same one-time operation, done in CI instead of a laptop.
+  #
+  # Run this ONCE after adding a dependency (like benilla-android's bevy/android_logger/log, or
+  # the android-native-activity feature on benilla-app), from the Actions tab -> this workflow ->
+  # "Run workflow". Once Cargo.lock is committed and up to date, the `build`/`android` jobs' own
+  # `--locked` builds stop needing this -- it is not meant to run on every push.
+  update-lockfile:
+    name: regenerate Cargo.lock
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # So the commit step below can push to the branch this ran on.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # A real branch ref, not the detached-HEAD commit workflow_dispatch normally checks
+          # out -- `git push` below needs a branch to push TO, not a bare commit SHA.
+          ref: ${{ github.ref_name }}
+
+      # Same apt packages the desktop Linux job installs -- see that job's own comment. Needed
+      # here too since resolving the dependency graph runs build scripts/proc macros that link
+      # against these, same as an actual build would.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `cargo generate-lockfile` alone resolves versions but does NOT verify the graph actually
+      # compiles -- `cargo check` (workspace-wide, not just `-p benilla`) both updates the lockfile
+      # AND catches a resolution that's version-compatible but doesn't actually build, in one step.
+      # Slower than `generate-lockfile` alone; worth it for a step that runs rarely and whose whole
+      # job is to produce a lockfile the OTHER jobs can then trust under `--locked`.
+      - name: cargo check --workspace (updates Cargo.lock)
+        run: cargo check --workspace
+
+      # Only commits if Cargo.lock actually changed -- makes this safe to re-run even when nothing
+      # was out of date (a no-op, not an empty commit that clutters history).
+      - name: Commit updated Cargo.lock if changed
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already up to date -- nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "ci: regenerate Cargo.lock"
+          git push
+
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: benilla
+            asset_name: benilla-linux-x86_64
+          - os: windows-latest
+            artifact_name: benilla.exe
+            asset_name: benilla-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: benilla
+            asset_name: benilla-macos-x86_64
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # bevy_audio pulls alsa on Linux and gilrs (gamepad support) pulls udev -- both link against
+      # system libs rather than vendoring them, so the dev headers have to exist before `cargo
+      # build` touches those crates. x11/xkbcommon/wayland are all dlopen'd at runtime by winit
+      # (x11-dl / xkbcommon-dl / smithay-client-toolkit), so no dev headers are needed for those.
+      # Windows and macOS need nothing extra: cpal/gilrs link against SDK and framework libs the
+      # runner images already ship with.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      # Reads channel/components straight from the repo's rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Only the player-facing binary (`-p benilla`), not `--workspace --all-targets`. Building
+      # every crate's test binaries too would relink a full Bevy executable per test target --
+      # multi-GB of debug output that has actually blown through the windows-latest runner's free
+      # disk before now. This also happens to be the only artifact worth downloading and running.
+      #
+      # This is the DEV build: `benilla-app`'s `default = ["dev"]` is on, so the binary carries
+      # bevy_egui, the debug panel, the perf HUD, the inspector, the capture harness and the probe
+      # fleet. That is deliberate for the everyday artifact -- it is the one you want when a bug
+      # report needs a debug panel. The `perf` job below is the one to benchmark.
+      - name: cargo build --release -p benilla
+        run: cargo build --release --locked -p benilla
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: target/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # THE MEASURABLE BUILD. Separate job rather than a fourth matrix dimension on `build`, because
+  # it differs in both of the two things that decide frame cost, and the reasons are worth stating
+  # where they are read:
+  #
+  #   1. `--profile ship` -- `lto = "fat"` + `codegen-units = 1`, graded in-tree (decision 0736) at
+  #      -1.0 cpu_ms (-5 %) against default `release`. Cargo.toml's own comment says `ship` is what
+  #      an actual release is built with; nothing in CI was building it before this job.
+  #   2. `--no-default-features` -- the dev/player seam (decisions 0026 + 1173). This compiles the
+  #      instruments physically OUT rather than leaving them dormant behind a runtime flag. It is
+  #      also the exact invocation `scripts/gates.sh` uses to enforce "dev may see anything;
+  #      nothing may depend on dev", so this job doubles as that gate: if someone lands a coupling
+  #      from a non-dev module into a dev-only one, this goes red and the `build` job does not.
+  #
+  # NOT set here: `RUSTFLAGS=-Ctarget-cpu=native`. A runner's CPU is not the player's, and a
+  # native-tuned binary can fault outright on an older machine. Build with it locally for your own
+  # numbers; an uploaded artifact has to be portable.
+  #
+  # Cost note: fat LTO + one codegen unit means the link step is long and single-threaded, so this
+  # job runs well behind `build` on the same push. That is the trade the profile exists to make.
+  perf:
+    name: perf build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: benilla
+            asset_name: benilla-perf-linux-x86_64
+          - os: windows-latest
+            artifact_name: benilla.exe
+            asset_name: benilla-perf-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: benilla
+            asset_name: benilla-perf-macos-x86_64
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Same headers as the `build` job's Linux leg, same reasons -- a player build still links
+      # alsa and udev; the `dev` feature governs the instruments, not the audio/input backends.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own cache key: `ship` artifacts are LTO'd, single-codegen-unit objects built from a
+          # different feature set -- they share nothing with the `build` job's `release` ones, and
+          # a shared key would make one cache entry ping-pong between two incompatible artifact
+          # sets. Same rationale as the android job's key below.
+          key: ship
+          cache-on-failure: true
+
+      - name: cargo build --profile ship --no-default-features -p benilla
+        run: cargo build --profile ship --locked --no-default-features -p benilla
+
+      # `--profile ship` lands in `target/ship/`, not `target/release/` -- cargo names the output
+      # directory after the profile for any profile that is not the two built-in ones.
+      - name: Upload perf build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: target/ship/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # Separate job, not a fourth matrix row: the desktop three share one toolchain shape (rustup +
+  # apt/nothing + `cargo build`), Android needs the NDK, a second Rust target, and `cargo-apk`
+  # instead of a plain `cargo build` -- different enough that folding it into the matrix would mean
+  # `if: runner.os == ...` branches on nearly every step rather than the one Linux-only step above.
+  #
+  # Compile-and-link is proven (min_sdk_version 26 fixed the -laaudio failure; the
+  # game-activity/native-activity bevy feature conflict and the arboard-on-android build error are
+  # both fixed upstream of this job too). Packaging as a debug apk was proven first; a signed
+  # `--release` apk is proven as of this job's last green run, once the ANDROID_RELEASE_KEYSTORE /
+  # ANDROID_RELEASE_KEYSTORE_PASSWORD repo secrets existed (the `Decode release keystore` step's
+  # own comment has the wiring). Still open: actually installing/running the apk on a device or
+  # emulator, which this job doesn't do, and building with the `dev` feature off (see the `perf`
+  # job's own reasoning for why that matters) -- untried on Android so far.
+  android:
+    name: build (android)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Same rationale as the desktop Linux job's apt step -- alsa/udev headers for the same two
+      # crates (bevy_audio's alsa backend, gilrs' udev backend), which link against system libs on
+      # every Linux-hosted build regardless of the final target triple. Android's OWN audio/input
+      # stacks are separate (cpal's Oboe/AAudio backend, no gilrs on Android), but the BUILD
+      # machine is still Ubuntu here, so its own linker still wants these for the host-side parts
+      # of the build graph (build scripts, proc macros) the same way the desktop Linux job does.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # aarch64 covers effectively every real Android device from the last several years.
+          # armv7 (32-bit) is left out for now -- add it back here AND to the `cargo apk build`
+          # step's implicit target list (cargo-apk builds every target you've added unless told
+          # otherwise) once aarch64-only is confirmed working; building two ABIs before the first
+          # one has even been proven out just doubles the surface for an unrelated failure to hide
+          # in.
+          targets: aarch64-linux-android
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own cache key: this job's target dir holds aarch64-linux-android artifacts, which
+          # share nothing with the desktop jobs' host-triple ones. Sharing a key would mean one
+          # cache entry ping-pongs between two incompatible artifact sets on every run, evicting
+          # useful cached objects from both sides instead of caching either.
+          key: android
+          cache-on-failure: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # `packages: ''` IS THE FIX, and it is not optional. The action's own `packages` input
+      # defaults to `tools platform-tools`; Google removed the legacy standalone `tools` package
+      # from the SDK repository index in mid-September 2026, so that default now dies at
+      #
+      #     Warning: Failed to find package 'tools'
+      #     Error: The process '.../cmdline-tools/<v>/bin/sdkmanager' failed with exit code 1
+      #
+      # before a single compile step runs. Upstream: android-actions/setup-android#537, still
+      # open; v4 has the same default, so there is no version to bump to. An empty string makes
+      # the action skip its package install entirely (it filters empty entries out of the parsed
+      # list) while still standing up ANDROID_HOME/ANDROID_SDK_ROOT, putting cmdline-tools on
+      # PATH, and pre-accepting the SDK licenses -- which is all this job ever wanted from it.
+      #
+      # `platform-tools` is NOT a rename of `tools`. The old package's contents split three ways:
+      # adb/fastboot to platform-tools, sdkmanager/avdmanager to cmdline-tools/latest/bin, and
+      # aapt/zipalign/apksigner to build-tools/<version>. Only the third group matters to
+      # cargo-apk, and none of them were ever in `tools`, so nothing below asks for it.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      # What cargo-apk actually resolves, installed explicitly rather than inherited from an
+      # action default that can change under us again:
+      #   * build-tools -- aapt, zipalign and apksigner. cargo-apk 0.10 still shells out to aapt
+      #     (v1, not aapt2), which Google dropped from the build-tools line after 34.x, so this is
+      #     pinned at 34.0.0 rather than tracking latest. If you ever move to a cargo-apk that
+      #     speaks aapt2, this pin is what to revisit.
+      #   * platforms;android-31 -- must MATCH `target_sdk_version = 31` in benilla-android's
+      #     [package.metadata.android.sdk]; cargo-apk resolves android.jar out of this exact
+      #     directory. Raise the two together or not at all.
+      #   * platform-tools -- adb. Not needed to build an APK; kept so the job can grow an
+      #     install/instrumentation step later without another SDK round trip.
+      - name: Install pinned SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-31" "build-tools;34.0.0"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          # r26 is the last NDK line with broad, well-tested cargo-ndk/cargo-apk compatibility as
+          # of this workflow's writing. Bump deliberately, not opportunistically -- an NDK bump is
+          # exactly the kind of change that wants its own isolated CI run to read, given this job
+          # is unverified end-to-end already.
+          ndk-version: r26d
+          add-to-path: true
+
+      # cargo-apk drives `AndroidManifest.xml` generation (from `[package.metadata.android]` in
+      # benilla-android's Cargo.toml -- see the scaffold README for what still needs adding there),
+      # APK packaging, and debug signing in one command, so no separate Gradle project is needed for
+      # this first pass. `cargo-ndk` (used by some setups instead) skips the manifest/packaging
+      # step and expects you to drive Gradle yourself -- more control, more moving parts; not
+      # needed yet for "does it open a window".
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+
+      # `CARGO_APK_RELEASE_KEYSTORE`/`CARGO_APK_RELEASE_KEYSTORE_PASSWORD` are cargo-apk's own env
+      # override for `[package.metadata.android.signing.release]` -- present, they win over
+      # anything in Cargo.toml, so nothing in benilla-android/Cargo.toml needs to change at all.
+      # The keystore itself is never committed: it's base64 in the `ANDROID_RELEASE_KEYSTORE`
+      # repo secret, decoded to a runner-local temp file this step alone knows the path to. That
+      # path is intentionally NOT `$GITHUB_WORKSPACE` -- writing the decoded keystore inside the
+      # checkout risks it ending up in a build artifact or a stray `git add .`; the runner's own
+      # temp dir is cleaned up with the VM after the job regardless.
+      - name: Decode release keystore
+        env:
+          ANDROID_RELEASE_KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE }}
+        run: |
+          if [ -z "$ANDROID_RELEASE_KEYSTORE" ]; then
+            echo "::error::ANDROID_RELEASE_KEYSTORE secret is not set -- see the keystore setup notes."
+            exit 1
+          fi
+          echo "$ANDROID_RELEASE_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "ANDROID_RELEASE_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+
+      # `--release` now signs successfully: the two env vars above satisfy cargo-apk's signing
+      # requirement for a `--release` APK (see the `Decode release keystore` step's own comment),
+      # so this is no longer the debug-keystore fallback the previous version of this job used.
+      - name: cargo apk build --release -p benilla-android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CARGO_APK_RELEASE_KEYSTORE: ${{ env.ANDROID_RELEASE_KEYSTORE_PATH }}
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+        run: cargo apk build --release -p benilla-android
+
+      # Back to cargo-apk's release output path now that the job builds `--release` again.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benilla-android-aarch64.apk
+          path: target/release/apk/*.apk
+          if-no-files-found: error
