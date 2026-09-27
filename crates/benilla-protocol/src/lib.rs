@@ -32,6 +32,18 @@ use benilla_srp::{NormalizedString, PublicKey, SrpClientChallenge, SESSION_KEY_L
 pub const AUTH_PORT: u16 = 3724;
 /// The 1.12.1 client build we present to the **world server** (mangosd).
 pub const CLIENT_BUILD: u16 = 5875;
+/// The build we present to **realmd** — Turtle-WoW's 1.18.1 build, not our own 5875.
+///
+/// The mangos-family realmd gates the *proof* stage on the build (`AuthSocket::_HandleLogonProof`
+/// → `FindBuildInfo`), and Turtle-derived realmd only accepts builds ≥ its own (this fork: 7272).
+/// A 5875-presenting client is answered with a challenge-shaped reject — `0x00, 0x00,
+/// WOW_FAIL_VERSION_INVALID` — which is exactly the "got 0x0" the proof reader used to choke on
+/// (now surfaced as an [`AuthReject`] there). A stock vanilla realmd accepts any build ≥ 5875
+/// through the same `FindBuildInfo`, and its strict-version hash keys on the entry the build maps
+/// to — the 5875 one — so presenting 7272 still verifies against the hashes we hold. The world hop
+/// keeps [`CLIENT_BUILD`]: mangosd accepts exactly 5875 (`IsAcceptableClientBuild`), Turtle's
+/// included.
+pub const REALMD_CLIENT_BUILD: u16 = 7272;
 /// Challenges [`logon`] draws for an unambiguous `B`; one in ~137 is not, so all 8 fail ~10⁻¹⁷.
 const MAX_CHALLENGE_DIALS: u32 = 8;
 
@@ -178,7 +190,7 @@ pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
         let mut dialed = None;
         for _ in 0..MAX_CHALLENGE_DIALS {
             let mut stream = dial(host, port)?;
-            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), CLIENT_BUILD)
+            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), REALMD_CLIENT_BUILD)
                 .context("sending logon challenge")?;
             let reply =
                 auth::read_challenge_reply(&mut stream).context("reading logon challenge reply")?;
