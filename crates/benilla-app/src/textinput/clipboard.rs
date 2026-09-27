@@ -46,6 +46,30 @@ impl Pasteboard for arboard::Clipboard {
     }
 }
 
+/// Android has no OS-pasteboard backend wired up yet: arboard ships no backend at all for this
+/// target (its own `src/platform/mod.rs` gates the Linux module `not(target_os = "android")` and
+/// has no android module to fall back to), and there is no JNI `ClipboardManager` shim in the tree
+/// to replace it. Unlike the Wayland/X11 split above, this isn't "no session, fall through to
+/// arboard" — there is no other backend on this platform to fall to — so it is its own unit-struct
+/// [`Pasteboard`] that reports itself unavailable, kept entirely out of the `arboard::` name on
+/// Android so the crate is never referenced on a target it can't build for.
+#[cfg(target_os = "android")]
+struct NoClipboard;
+
+#[cfg(target_os = "android")]
+impl Pasteboard for NoClipboard {
+    fn read_text(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    fn write_text(&mut self, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "none/android"
+    }
+}
 /// The Wayland half; the gate must match `smithay-clipboard`'s target in `Cargo.toml`.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wl {

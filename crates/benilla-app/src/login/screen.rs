@@ -55,6 +55,10 @@ pub(super) struct PasswordText;
 /// The checkbox's checked overlay, shown while the form's save flag is set.
 #[derive(Component)]
 pub(super) struct CheckMark;
+/// Rides on the [`CheckMark`] of the **Remember Password** box, so [`refresh_checkbox`] can tell
+/// the two overlays apart: without it every mark followed `form.save`.
+#[derive(Component)]
+pub(super) struct PasswordCheck;
 /// The checkbox's hover highlight, driven by [`refresh_checkbox`].
 #[derive(Component)]
 pub(super) struct CheckHilight;
@@ -729,6 +733,19 @@ pub(super) fn refresh_checkbox(
                 }
             }
         }
+    }
+}
+
+/// Show or hide one checkbox's checked overlay — written only on an actual change, so an unchanged
+/// box does not flag `Visibility` as changed every frame.
+fn set_checked(mut vis: Mut<Visibility>, checked: bool) {
+    let want = if checked {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    if *vis != want {
+        *vis = want;
     }
 }
 

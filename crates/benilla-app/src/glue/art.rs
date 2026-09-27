@@ -559,6 +559,64 @@ fn add_overlay(
 
 // ── The icon-cell tables (CharacterCreate.lua's *_ICON_TCOORDS, verbatim) ────────────────────────
 
+/// ChrRaces client fileStrings for races 1–10 — the vanilla eight plus Turtle's two additions. Used
+/// only to key the client-authored icon cells back to race ids (`parse_race_icon_tcoords`); the
+/// playable set itself is the catalog's.
+const RACE_FILES: [(u8, &str); 10] = [
+    (1, "Human"),
+    (2, "Orc"),
+    (3, "Dwarf"),
+    (4, "NightElf"),
+    (5, "Scourge"),
+    (6, "Tauren"),
+    (7, "Gnome"),
+    (8, "Troll"),
+    (9, "Goblin"),
+    (10, "BloodElf"),
+];
+
+/// Parse the client's `RACE_ICON_TCOORDS` table out of its own `CharacterCreate.lua` — the
+/// 4-column vanilla table, or the Turtle extension that appends a fifth column (Goblin, BloodElf).
+/// Entries are the fixed shape `["NAME_MALE"] = {a, b, c, d},`; unknown names are skipped (the
+/// file is the player's, not ours), and `None` when no entry parses.
+fn parse_race_icon_tcoords(text: &str) -> Option<HashMap<u8, [[f32; 4]; 2]>> {
+    let block = text.find("RACE_ICON_TCOORDS")?;
+    let block = &text[block..];
+    let end = block.find("};")?;
+    let mut cells: HashMap<u8, [[f32; 4]; 2]> = HashMap::new();
+    for line in block[..end].lines() {
+        let Some(eq) = line.find('=') else { continue };
+        let Some(key_end) = line[..eq].find("\"]") else { continue };
+        let key = &line[..key_end + 1];
+        let Some(key_start) = key.find("[\"") else { continue };
+        let key = &key[key_start + 2..key.len() - 1];
+        let Some((name, sex)) = key.rsplit_once('_') else { continue };
+        let (Some(race), Some(sex_idx)) = (
+            RACE_FILES
+                .iter()
+                .find(|(_, n)| n.eq_ignore_ascii_case(name))
+                .map(|(r, _)| *r),
+            match sex {
+                "MALE" => Some(0usize),
+                "FEMALE" => Some(1),
+                _ => None,
+            },
+        ) else {
+            continue;
+        };
+        let Some(open) = line.find('{') else { continue };
+        let Some(close) = line.find('}') else { continue };
+        let nums: Option<Vec<f32>> = line[open + 1..close]
+            .split(',')
+            .map(|p| p.trim().parse::<f32>().ok())
+            .collect();
+        let Some(nums) = nums else { continue };
+        let rect: [f32; 4] = nums[..4].try_into().ok()?;
+        cells.entry(race).or_insert([[0.0; 4]; 2])[sex_idx] = rect;
+    }
+    if cells.is_empty() { None } else { Some(cells) }
+}
+
 /// A race's cell in `UI-CharacterCreate-Races` (col, row; female is row + 2), `RACE_ICON_TCOORDS`.
 fn race_cell(race: u8) -> Option<(f32, f32)> {
     Some(match race {

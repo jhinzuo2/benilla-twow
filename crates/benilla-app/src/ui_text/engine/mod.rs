@@ -631,6 +631,110 @@ fn read_font_bytes(source: &FontSource, path: &str) -> Option<Vec<u8>> {
     benilla_assets::read_chain_or_loose(&source.chain, source.loose_root.as_deref(), path)
 }
 
+/// A player-supplied face from `benilla-config/Fonts/`, matched on `path`'s basename.
+///
+/// Returns `None` in a hermetic run (no config home), when the folder does not exist, or when the
+/// basename is not present — every one of which simply falls through to the chain, so adding the
+/// folder is purely additive and its absence changes nothing.
+fn read_user_font(path: &str) -> Option<Vec<u8>> {
+    // Both separators: the engine speaks `Fonts\X.ttf`, addon tables sometimes use `/`.
+    let base = path.rsplit(['\\', '/']).next()?;
+    if base.is_empty() || base.contains("..") {
+        return None;
+    }
+    let dir = user_font_dir()?;
+    // Exact hit first — one `read` and no directory walk in the common case.
+    if let Ok(bytes) = std::fs::read(dir.join(base)) {
+        return Some(bytes);
+    }
+    let want = base.to_ascii_lowercase();
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(&want))
+        {
+            return std::fs::read(entry.path()).ok();
+        }
+    }
+    None
+}
+
+/// The player's font folder under the config home, found **case-insensitively**.
+///
+/// `Fonts` is what this project writes and documents, but issue #4 and every report since spell it
+/// `fonts`, and on Linux and Android — the two platforms the whole CJK request comes from — those
+/// are different directories. `join("Fonts")` alone silently found nothing there, which reads to a
+/// player exactly like the override being ignored. Windows and macOS were never affected, which is
+/// why this survived: the exact-case `join` below still answers first on both.
+fn user_font_dir() -> Option<std::path::PathBuf> {
+    let home = crate::local_state::home()?;
+    let exact = home.join("Fonts");
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    std::fs::read_dir(&home)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case("fonts"))
+                && e.path().is_dir()
+        })
+        .map(|e| e.path())
+}
+
+/// Register every face in the player's font folder that did **not** already replace a client font,
+/// as an unnamed coverage face. Returns how many were added.
+///
+/// Unnamed on purpose: nothing is inserted into `path_to_face`, so no `SetFont` path can ever
+/// resolve to one of these and no measurement changes for a string the client faces can already
+/// draw. They are reachable only through `cosmic-text`'s own per-character fallback — which is the
+/// single thing that was missing for CJK and Cyrillic.
+fn register_coverage_faces(
+    font_system: &mut FontSystem,
+    path_to_face: &HashMap<String, usize>,
+) -> usize {
+    let Some(dir) = user_font_dir() else {
+        return 0;
+    };
+    // The basenames the four client paths answer to — a file matching one of these was already
+    // read as an override above, and registering it a second time would put two copies of the same
+    // face in the ordering.
+    let replaced: HashSet<String> = path_to_face
+        .keys()
+        .filter_map(|p| p.rsplit(['\\', '/']).next())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut added = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".ttc")) {
+            continue;
+        }
+        if replaced.contains(&lower) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        match register_font(font_system, bytes) {
+            Ok(r) => {
+                info!("ui_text: coverage face {name} ({}) registered", r.family);
+                added += 1;
+            }
+            Err(e) => warn!("ui_text: {name} in the Fonts folder is not a usable face: {e:#}"),
+        }
+    }
+    added
+}
+
 /// A real-font engine for a test, the client faces off the patch chain; `None` without an install
 /// or when the chain or a face will not open, and every caller then skips.
 #[cfg(test)]
