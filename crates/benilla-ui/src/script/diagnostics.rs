@@ -64,7 +64,7 @@ pub(crate) struct DiagnosticLog {
 
 impl DiagnosticLog {
     /// Record one failure, or bump the count of its identical row.
-    pub(crate) fn record(&mut self, kind: DiagnosticKind, message: &str) {
+    pub(crate) fn record(&mut self, kind: DiagnosticKind, message: &str) -> bool {
         if let Some(row) = self
             .rows
             .iter_mut()

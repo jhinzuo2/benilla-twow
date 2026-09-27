@@ -968,7 +968,9 @@ impl Model {
         let new = self
             .diagnostics
             .record(super::diagnostics::DiagnosticKind::Warning, &msg);
-        self.warnings.push(msg);
+        if new {
+            self.warnings.push(msg);
+        }
     }
 
     /// A warning for the host's terminal only, for a message already retained under another kind.
