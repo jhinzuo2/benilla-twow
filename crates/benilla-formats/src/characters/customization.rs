@@ -201,7 +201,7 @@ impl CharCreateCatalog {
         Ok(catalog)
     }
 
-    fn self_check(&self) -> Result<()> {
+    fn self_check(&mut self) -> Result<()> {
         for (race, classes) in KNOWN_COMBOS {
             let got = self.classes_for_race(race);
             if got != classes {
