@@ -97,6 +97,9 @@ struct UnitFeedMemo {
     guild_generation: gate::Watch,
     /// Whether `PLAYER_ENTERING_WORLD` has fired for this world entry.
     entered_world: bool,
+    /// Whose avatar the player-global memories are of: a different self guid is a different
+    /// character entered, not a change of this one's (its level 1 is a first sighting, not a ding).
+    self_guid: Option<u64>,
     /// Per token, the last snapshot pushed.
     last: HashMap<String, UnitState>,
     target_guid: Option<u64>,
@@ -116,6 +119,35 @@ struct UnitFeedMemo {
     worn_hidden: Option<(bool, bool)>,
     /// `PLAYER_FIELD_BYTES` byte 2 (`GetActionBarToggles`, `0x4e7660`); no field watch, no event.
     action_bar_toggles: Option<u8>,
+}
+
+impl UnitFeedMemo {
+    /// The player-global memories forgotten, at a world exit and when the self avatar is another
+    /// character's: every next sighting re-seeds silently, as a fresh login's does.
+    fn forget_the_player(&mut self) {
+        self.entered_world = false;
+        self.last_xp = None;
+        self.last_rest = None;
+        self.last_level = None;
+        self.last_combo = None;
+        self.in_combat = None;
+        self.pvp_desired = None;
+        // Edge-only pushes: a stale memo would skip a new character whose values match it.
+        self.worn_hidden = None;
+        self.action_bar_toggles = None;
+    }
+
+    /// A self avatar seen: a different guid than the memories are of is a different character
+    /// entered, forgotten and entered again (`PLAYER_ENTERING_WORLD`), as a login is. Whether it
+    /// was.
+    fn see_self(&mut self, guid: u64) -> bool {
+        let another = self.self_guid.is_some_and(|was| was != guid);
+        if another {
+            self.forget_the_player();
+        }
+        self.self_guid = Some(guid);
+        another
+    }
 }
 
 /// Adds the per-frame unit feed; the `Unit*` bindings live in `benilla-ui`.
@@ -1170,6 +1202,11 @@ fn feed_units(
 
     // A missing unit is `None`, which `set_unit` clears; a name miss lands on a later frame.
     let self_pair = self_q.iter().next();
+    if let Some((_, guid)) = self_pair {
+        if memo.see_self(guid.0) {
+            gate.audit("feed_units", "another self avatar");
+        }
+    }
     let player = self_pair.map(|(store, guid)| {
         let name = names
             .resolve_unit(guid.0, Some(store), &commands)
@@ -1482,16 +1519,7 @@ fn feed_units(
         }
     } else if memo.entered_world {
         gate.audit("feed_units", "the world-exit disarm");
-        memo.entered_world = false;
-        memo.last_xp = None;
-        memo.last_rest = None;
-        memo.last_level = None;
-        memo.last_combo = None;
-        memo.in_combat = None;
-        memo.pvp_desired = None;
-        // Edge-only pushes: a stale memo would skip a new character whose values match it.
-        memo.worn_hidden = None;
-        memo.action_bar_toggles = None;
+        memo.forget_the_player();
     }
 
     for (token, snap) in [
@@ -1615,6 +1643,25 @@ fn combo_edge(last: Option<(u8, u64)>, now: (u8, u64)) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another self avatar is another character entered, not a level-up: a level-60 player and a
+    /// level-1 one shown one after the other in one run printed "Congratulations, you have reached
+    /// level 1! ... 60!" at every switch. The player-global memories are of one guid; another
+    /// forgets them, as a world exit does.
+    #[test]
+    fn another_self_avatar_forgets_the_players_memories() {
+        let mut memo = UnitFeedMemo::default();
+        assert!(!memo.see_self(1), "the first sighting is an entry, nothing to forget");
+        memo.entered_world = true;
+        memo.last_level = Some(60);
+        memo.last_xp = Some((1, 2));
+        assert!(!memo.see_self(1), "the same avatar again");
+        assert_eq!(memo.last_level, Some(60));
+        assert!(memo.see_self(7), "another avatar");
+        assert_eq!(memo.last_level, None, "its level is a first sighting, not a ding");
+        assert_eq!(memo.last_xp, None);
+        assert!(!memo.entered_world, "and it enters the world again");
+    }
 
     /// The team digit comes off the race byte, whatever template sits beside it (a GM's 35).
     #[test]
