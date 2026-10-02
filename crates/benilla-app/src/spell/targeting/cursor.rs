@@ -302,7 +302,7 @@ mod tests {
             world.init_resource::<crate::go_templates::GameObjectTemplates>();
             world.init_resource::<crate::items::Items>();
             world.init_resource::<crate::net::GuidIndex>();
-            world.insert_resource(crate::net::Reputations(Vec::new()));
+            world.insert_resource(crate::net::Reputations(Vec::new(), Vec::new()));
             world.insert_resource(PickOcclusion {
                 distance: 10.0,
                 point,
@@ -374,7 +374,7 @@ mod tests {
             world.init_resource::<crate::go_templates::GameObjectTemplates>();
             world.init_resource::<crate::items::Items>();
             world.init_resource::<crate::net::GuidIndex>();
-            world.insert_resource(crate::net::Reputations(Vec::new()));
+            world.insert_resource(crate::net::Reputations(Vec::new(), Vec::new()));
             world.init_resource::<PickOcclusion>();
             let display = |range_index| benilla_formats::SpellDisplay {
                 range_index,
@@ -457,7 +457,7 @@ mod tests {
             world.init_resource::<crate::go_templates::GameObjectTemplates>();
             world.init_resource::<crate::items::Items>();
             world.init_resource::<crate::net::GuidIndex>();
-            world.insert_resource(crate::net::Reputations(Vec::new()));
+            world.insert_resource(crate::net::Reputations(Vec::new(), Vec::new()));
             world.init_resource::<PickOcclusion>();
             world.insert_resource(fx::spells());
             world.insert_resource(fx::factions());

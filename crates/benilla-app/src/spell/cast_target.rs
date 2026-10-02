@@ -489,7 +489,7 @@ mod tests {
             target_owner_store: None,
             self_store: Some(&me),
             factions: None,
-            reputations: &Reputations(Vec::new()),
+            reputations: &Reputations(Vec::new(), Vec::new()),
         };
         let ice_armor = spell(0, 1);
         assert_eq!(
@@ -553,7 +553,7 @@ mod tests {
         let me = ObjectStore(ObjectFields::from_pairs(&[(35, 1), (46, 0x8)]));
         let quiet = ObjectStore(ObjectFields::from_pairs(&[(35, 35), (46, 0)]));
         let pvp = ObjectStore(ObjectFields::from_pairs(&[(35, 35), (46, 0x1000)]));
-        let reputations = Reputations(Vec::new());
+        let reputations = Reputations(Vec::new(), Vec::new());
         let rel = |target| TargetRelations {
             target_store: Some(target),
             target_owner_store: None,
@@ -739,7 +739,7 @@ mod tests {
     }
 
     fn rel_none() -> TargetRelations<'static> {
-        static EMPTY: Reputations = Reputations(Vec::new());
+        static EMPTY: Reputations = Reputations(Vec::new(), Vec::new());
         TargetRelations {
             target_store: None,
             target_owner_store: None,
