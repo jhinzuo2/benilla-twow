@@ -394,12 +394,13 @@ fn shortcut_rows(channels: &super::edit::ChannelState) -> Vec<(u32, String)> {
 /// (`ChatFrame.lua:1357-1365`), whose `.id` is 0, and `UpdateColorByID(0, …)` recolours every line
 /// printed with no explicit colour, an addon's login `Print` among them.
 pub(crate) fn restore_chat_looks(world: &mut World, script: &mut UiScript) {
-    let Some(id) = world
+    // Which character's settings, or none: a session with no character select has no file to
+    // read, but the loader's two events are not about a character and fire either way. Without
+    // them no window is registered for any `CHAT_MSG_*`, so every line printed is lost, and the
+    // stock look never reaches the frame: `ChatFrameBackground` draws as an untinted white slab.
+    let id = world
         .get_resource::<crate::char_select::Roster>()
-        .and_then(crate::ui_macro::identity)
-    else {
-        return;
-    };
+        .and_then(crate::ui_macro::identity);
     // Owned rows up front: `ChatWindowFile` is borrowed mutably below.
     let Some(channels) = world.get_resource::<super::edit::ChannelState>() else {
         return;
@@ -415,6 +416,15 @@ pub(crate) fn restore_chat_looks(world: &mut World, script: &mut UiScript) {
     let seed_mask = auto_rows.iter().fold(0, |m, (_, id)| m | zone_bit(*id));
     // Scoped, so `ChannelState` can take the mask afterwards.
     let mut parsed;
+    let Some(id) = id else {
+        // No character: the no-file path, as the file half takes it below, then the events.
+        parsed = Parsed::default();
+        let mut general = ChatWindowLook::stock(0);
+        general.channels = auto_rows.clone();
+        parsed.looks.push((0, general));
+        finish_chat_restore(world, script, parsed, seed_mask, commands);
+        return;
+    };
     {
         let Some(mut file) = world.get_resource_mut::<ChatWindowFile>() else {
             return;
@@ -479,6 +489,19 @@ pub(crate) fn restore_chat_looks(world: &mut World, script: &mut UiScript) {
             info!("chat cache: repaired an unmarked file's zone channels for {who}");
         }
     }
+    finish_chat_restore(world, script, parsed, seed_mask, commands);
+}
+
+/// The half of [`restore_chat_looks`] that is not about a character: the durable zone mask, the
+/// looks and colours into the VM, and the loader's two events. Shared by the file path and the
+/// no-character path, so the two cannot drift.
+fn finish_chat_restore(
+    world: &mut World,
+    script: &mut UiScript,
+    parsed: Parsed,
+    seed_mask: u32,
+    commands: Option<crossbeam_channel::Sender<ClientCommand>>,
+) {
     // The durable mask: the file's word, else the DBC seed; confirmed joins OR into it after.
     let mask = parsed.zone_mask.unwrap_or(seed_mask);
     if let Some(mut channels) = world.get_resource_mut::<super::edit::ChannelState>() {
