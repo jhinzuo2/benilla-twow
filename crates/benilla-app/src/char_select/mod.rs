@@ -414,12 +414,20 @@ fn apply_roster_policy(
 }
 
 /// `Connected` ([`EnteredWorldMessage`]): the world owns the session.
+///
+/// `set_if_neq`, not `set`: Bevy's `set` runs `OnExit`/`OnEnter` even when the target is the state
+/// already current, and an app started `InWorld` that then announces its session with `Connected`
+/// would take the whole logout tail (saved variables written, the VM torn down) and load the
+/// in-game UI a second time. A real session is untouched: `Connected` only arrives from
+/// `CharSelect` or `Login`, since a lost session goes back to `Login` first.
 fn enter_on_connected(
     mut msgs: MessageReader<EnteredWorldMessage>,
     mut next: ResMut<NextState<ClientState>>,
 ) {
     if msgs.read().next().is_some() {
-        next.set(ClientState::InWorld);
+        // Spelled out: `next.set_if_neq` resolves to `ResMut`'s change-detection method of the
+        // same name, which compares the whole `NextState` rather than the state.
+        NextState::set_if_neq(&mut *next, ClientState::InWorld);
     }
 }
 
@@ -935,6 +943,38 @@ mod tests {
     use super::*;
 
     use super::test_character as character;
+
+    /// An app already in the world is not logged out and in again by its own `Connected`: a plain
+    /// `set` made that an identity transition and every `OnExit(InWorld)` ran.
+    #[test]
+    fn connected_while_already_in_world_is_not_a_second_entry() {
+        #[derive(Resource, Default)]
+        struct Left(u32);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
+            .insert_state(ClientState::InWorld)
+            .init_resource::<Left>()
+            .add_message::<EnteredWorldMessage>()
+            .add_systems(Update, enter_on_connected)
+            .add_systems(OnExit(ClientState::InWorld), |mut left: ResMut<Left>| {
+                left.0 += 1;
+            });
+        app.world_mut().write_message(EnteredWorldMessage {
+            billing_time_rested: 0,
+            tutorial_flags: None,
+        });
+        app.update();
+        app.update();
+        assert_eq!(
+            *app.world().resource::<State<ClientState>>().get(),
+            ClientState::InWorld
+        );
+        assert_eq!(
+            app.world().resource::<Left>().0,
+            0,
+            "no logout tail for a world that was never left"
+        );
+    }
 
     /// A socket dying mid-entry (a displacement kick) drains `Connected` and `Disconnected` in one
     /// frame; the ordering alone makes the disconnect win.
