@@ -56,7 +56,7 @@ fn bag_harness_with(before: &[&str], after: &[&str]) -> UiScript {
 
 /// Top to bottom. Deviation: the 1.15 era client's ESC ladder, because its settings screens
 /// replace 1.12's; without the AddOns rung, as the character-select screen is the only addon UI.
-const LADDER: [&str; 7] = [
+const LADDER: [&str; 5] = [
     "GameMenuButtonOptions",
     "GameMenuButtonMacros",
     "GameMenuButtonLogout",
