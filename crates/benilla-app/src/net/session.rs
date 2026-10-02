@@ -46,6 +46,7 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::ServerUnixTime, on_clock)
         .net_handler(K::Reputations, on_reputations)
         .net_handler(K::ReputationDelta, on_reputation_delta)
+        .net_handler(K::ForcedReactions, on_reputations)
         .net_handler(K::ReputationVisible, on_reputations)
         .net_handler(K::BindPoint, on_player_store)
         .net_handler(K::Proficiency, on_player_store)
@@ -162,12 +163,16 @@ fn on_logged_out(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
             &mut b.self_guid,
             &mut e.logged_out,
         );
+        // The forced-reaction table is the character's: the core sends it only on an aura
+        // change, never at login, so one left here would colour the next character's world.
+        b.reputations.1.clear();
     }
 }
 
 /// The bridge's half of the session end; each window's own listener runs after it.
 fn on_disconnected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
     if let SessionEvent::Disconnected { reason, end } = ev {
+        b.reputations.1.clear();
         disconnected(
             reason,
             end,
@@ -272,6 +277,9 @@ fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge) {
 fn on_reputations(In(ev): In<SessionEvent>, mut b: Bridge) {
     match ev {
         SessionEvent::Reputations { standings } => reputations(standings, &mut b.reputations),
+        SessionEvent::ForcedReactions { reactions } => {
+            forced_reactions(reactions, &mut b.reputations)
+        }
         SessionEvent::ReputationVisible { list_id } => {
             reputation_visible(list_id, &mut b.reputations)
         }
@@ -626,6 +634,13 @@ fn server_unix_time(unix_time: u32, clock: &mut ServerWallClock) {
 fn reputations(standings: Vec<(u8, i32)>, reputations: &mut Reputations) {
     info!("net: reputation store ({} slots)", standings.len());
     reputations.0 = standings;
+}
+
+/// `SMSG_SET_FORCED_REACTIONS`: the server resends the table whole on every change, so it
+/// replaces the last one.
+fn forced_reactions(reactions: Vec<(u32, u32)>, reputations: &mut Reputations) {
+    info!("net: forced reactions ({} factions)", reactions.len());
+    reputations.1 = reactions;
 }
 
 /// `SMSG_SET_FACTION_STANDING`: overwrites the changed slots, growing the store with flags 0,
