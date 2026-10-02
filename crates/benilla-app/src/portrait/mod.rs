@@ -524,10 +524,13 @@ fn booth_log() -> bool {
     *LOG.get_or_init(|| std::env::var_os("WOW_BOOTH_LOG").is_some())
 }
 
-/// `WOW_BOOTH_LOG=1`: one line per bake decision, with the counts and attach ids it saw.
+/// `WOW_BOOTH_LOG=1`: one line per bake decision, with the display id, the counts and the attach
+/// ids it saw. The counts alone cannot say whose model a bake is of: "parts=3 riders=0" reads the
+/// same for a human and for a crow. `None` where the caller has no unit to read one from.
 fn log_bake(
     token: &str,
     verb: &str,
+    display: Option<u32>,
     parts: &[&PortraitPart],
     riders: &[&PortraitRider],
     billboards: &[&PortraitBillboard],
@@ -544,7 +547,7 @@ fn log_bake(
         at.sort_unstable();
         at.dedup();
         eprintln!(
-            "[booth] {token} {verb} parts={} riders={} billboards={} fx={}/{} at={at:?} grip={:?}",
+            "[booth] {token} {verb} display={display:?} parts={} riders={} billboards={} fx={}/{} at={at:?} grip={:?}",
             parts.len(),
             riders.len(),
             billboards.len(),
@@ -1435,6 +1438,7 @@ fn sync_portraits(
                 log_bake(
                     token,
                     "wait-anchors",
+                    display_id,
                     &parts,
                     &riders,
                     &billboards,
@@ -1513,7 +1517,7 @@ fn sync_portraits(
             // and a fresh particle pool contributes nothing to one frame.
             log_frame(token, &anchors, &frame(&anchors).0);
             aim(&mut cams, token, &frame(&anchors));
-            log_bake(token, "bake", &parts, &riders, &billboards, &effects);
+            log_bake(token, "bake", display_id, &parts, &riders, &billboards, &effects);
             wake_booth(
                 booth,
                 &wow_mats,
@@ -1855,7 +1859,7 @@ fn sync_body_booth(
         booth.aspect = aspect;
         let Some(anchors) = anchors_now else {
             booth.wake = booth.wake.max(BOOTH_SETTLE_FRAMES);
-            log_bake(slot, "wait-anchors", &parts, &riders, &billboards, &effects);
+            log_bake(slot, "wait-anchors", display_id, &parts, &riders, &billboards, &effects);
             return;
         };
         let rig = creatures
@@ -1944,7 +1948,7 @@ fn sync_body_booth(
         booth.parked = false;
         log_frame(slot, &anchors, &body_frame(&anchors, aspect).0);
         aim(cams, slot, &body_frame(&anchors, aspect));
-        log_bake(slot, "bake", &parts, &riders, &billboards, &effects);
+        log_bake(slot, "bake", display_id, &parts, &riders, &billboards, &effects);
         wake_booth(
             booth,
             wow_mats,

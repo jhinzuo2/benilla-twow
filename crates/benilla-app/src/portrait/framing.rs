@@ -671,7 +671,7 @@ mod tests {
                 );
                 assert!(glue_box_aspect(a).is_none(), "fov {fov} a{a} got bars");
                 // …and the vertical closes monotonically as the panel widens: a cover fit.
-                assert!(vert <= glue_scene_framing(fov, REFERENCE_PANEL) + 1e-6);
+                assert!(vert <= glue_scene_framing(fov, REFERENCE_PANEL, None) + 1e-6);
             }
             // The wide leg ignores the art; only the narrow leg reads `half_h`.
             for art in [

@@ -313,6 +313,41 @@ pub(super) fn attach_entity_visuals(
         // An empty `parts` list is either a model that draws nothing (an answer) or no model at
         // all (a gap of ours, which the cube shows).
         let named_a_model = dm.is_some_and(DisplayModel::names_a_model);
+        // Say when a body does not get built, once per display. A display in no cache, a model
+        // still loading and a display that named no model all produce no visual, and from outside
+        // they are one symptom: a unit the client holds, indexes and targets, with nothing standing
+        // where it is. A process-global rather than a `Local`: this system is at Bevy's parameter
+        // ceiling, and a diagnostic should not cost a body build.
+        static SAID_ABOUT: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+            std::sync::Mutex::new(None);
+        let mut said = SAID_ABOUT.lock().unwrap_or_else(|e| e.into_inner());
+        let said_about = said.get_or_insert_with(Default::default);
+        if let Some(disp) = net.display_id.filter(|d| !said_about.contains(d)) {
+            match dm {
+                None => {
+                    said_about.insert(disp);
+                    info!(
+                        "attach: display {disp} ({:?}) is in no model cache, nothing to build",
+                        net.kind
+                    );
+                }
+                Some(d) if d.parts.is_none() => {
+                    info!("attach: display {disp} ({:?}) still loading", net.kind);
+                }
+                Some(_) if !named_a_model => {
+                    said_about.insert(disp);
+                    info!(
+                        "attach: display {disp} ({:?}) named no model file: a gap, not an invisible body",
+                        net.kind
+                    );
+                }
+                Some(_) => {
+                    said_about.insert(disp);
+                    info!("attach: display {disp} ({:?}) building now", net.kind);
+                }
+            }
+        }
+        drop(said);
         // A loading model (`parts == None`) retries next frame. A model that built no batch is
         // still a loaded instance, as in the reference: its skeleton, attachment points, clock,
         // name anchor and emitters all come from it.
