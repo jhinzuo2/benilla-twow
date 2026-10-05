@@ -269,6 +269,7 @@ pub(super) fn feed_party(
                 &group,
                 own_group.clone(),
                 chr,
+                names.player_traits(m.guid).map(|(_, class, _)| class),
             )
         });
         if fed.units[i] != snap {
@@ -336,6 +337,7 @@ pub(super) fn feed_party(
                     &group,
                     own_group.clone(),
                     chr,
+                    names.player_traits(m.guid).map(|(_, class, _)| class),
                 ))
             }
         });
@@ -642,7 +644,10 @@ fn member_unit_state(
     // `ChrClasses.dbc`, for the relic slot alone: only the live leg has a class byte to key it
     // by, so an unstreamed paladin reads no relic slot.
     classes: Option<&benilla_formats::ChrClasses>,
+    // The name cache's class byte, the one `GetRaidRosterInfo` reads, for a member with no object.
+    class_byte: Option<u8>,
 ) -> UnitState {
+    let class = class_byte.and_then(crate::ui_unit::class_names);
     let mut s = match store {
         Some(store) => crate::ui_unit::snapshot(store, Some(m.name.clone()), 0, classes),
         // Unstreamed: the roster record, snapshotted from the descriptor at despawn (`0x5f0880`),
@@ -666,6 +671,8 @@ fn member_unit_state(
             // untraced, and `UnitIsAFK`/`UnitIsDND` are not 1.12 bindings.
             dead: stats.is_some_and(|s| s.status.unwrap_or(0) & member_status::DEAD != 0),
             ghost: stats.is_some_and(|s| s.status.unwrap_or(0) & member_status::GHOST != 0),
+            class: class.map(|(n, _)| n.to_string()),
+            class_file: class.map(|(_, f)| f.to_string()),
             ..Default::default()
         },
     };
@@ -1342,7 +1349,15 @@ mod tests {
             max_power: Some(1000),
             ..PartyMemberStatsInfo::default()
         };
-        let s = member_unit_state(&m, Some(&record), None, &GroupState::default(), None, None);
+        let s = member_unit_state(
+            &m,
+            Some(&record),
+            None,
+            &GroupState::default(),
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             (s.health, s.max_health),
             (2400, 3000),
@@ -1357,9 +1372,27 @@ mod tests {
         assert!(s.exists && s.is_player && s.is_connected);
 
         // No record at all (a real roster always seats one): an existing player with empty bars.
-        let bare = member_unit_state(&m, None, None, &GroupState::default(), None, None);
+        let bare = member_unit_state(&m, None, None, &GroupState::default(), None, None, None);
         assert_eq!((bare.health, bare.max_health, bare.power), (0, 0, 0));
         assert!(bare.exists);
+    }
+
+    #[test]
+    fn an_out_of_range_member_reports_the_class_in_the_name_cache() {
+        let m = GroupMemberEntry {
+            name: "Brisca".into(),
+            guid: 0x1234,
+            status: member_status::ONLINE,
+            flags: 0,
+        };
+        let group = GroupState::default();
+        let s = member_unit_state(&m, None, None, &group, None, None, Some(1));
+        assert_eq!(
+            (s.class.as_deref(), s.class_file.as_deref()),
+            (Some("Warrior"), Some("WARRIOR"))
+        );
+        let s = member_unit_state(&m, None, None, &group, None, None, None);
+        assert_eq!((s.class, s.class_file), (None, None));
     }
 
     /// vmangos re-sends a member's status on join, login and the AFK, DND, PvP, FFA and ghost
@@ -1377,7 +1410,15 @@ mod tests {
             status: Some(member_status::ONLINE | member_status::DEAD),
             ..PartyMemberStatsInfo::default()
         };
-        let s = member_unit_state(&m, Some(&dead), None, &GroupState::default(), None, None);
+        let s = member_unit_state(
+            &m,
+            Some(&dead),
+            None,
+            &GroupState::default(),
+            None,
+            None,
+            None,
+        );
         assert!(
             s.dead,
             "the record says dead even though the roster echo does not"
@@ -1388,7 +1429,15 @@ mod tests {
             status: Some(member_status::ONLINE | member_status::GHOST),
             ..PartyMemberStatsInfo::default()
         };
-        let s = member_unit_state(&m, Some(&ghost), None, &GroupState::default(), None, None);
+        let s = member_unit_state(
+            &m,
+            Some(&ghost),
+            None,
+            &GroupState::default(),
+            None,
+            None,
+            None,
+        );
         assert!(s.ghost);
         assert!(!s.dead, "a released ghost is not `dead` — only a ghost");
 
@@ -1402,6 +1451,7 @@ mod tests {
             Some(&PartyMemberStatsInfo::placeholder(true)),
             None,
             &GroupState::default(),
+            None,
             None,
             None,
         );
