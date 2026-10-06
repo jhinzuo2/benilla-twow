@@ -30,6 +30,16 @@ pub struct BattlefieldQueueSlot {
     pub time_waited_ms: u32,
 }
 
+impl BattlefieldQueueSlot {
+    /// A zeroed slot (`0xb6e9d0`): `"none"`, every number 0, a name only the app's push can fill.
+    pub fn idle() -> Self {
+        Self {
+            map_name: Some(String::new()),
+            ..Self::default()
+        }
+    }
+}
+
 /// The Map.dbc half of `GetBattlefieldInfo` (`0x4ab0b0`), resolved by the app for the listed map.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct BattlefieldMapInfo {
@@ -493,6 +503,20 @@ mod tests {
         let err = s.run("JoinBattlefield()").unwrap_err().to_string();
         assert!(err.contains("Usage: JoinBattlefield(index)"), "{err}");
         s.run("CloseBattlefield()").unwrap();
+    }
+
+    #[test]
+    fn a_fresh_model_answers_none_for_all_three_slots() {
+        let s = UiScript::new().unwrap();
+        for i in 1..=3 {
+            let got = s
+                .eval::<String>(&format!(
+                    "local st, name, id, lo, hi = GetBattlefieldStatus({i}) \
+                     return st .. '|' .. name .. '|' .. id .. '|' .. lo .. '|' .. hi"
+                ))
+                .unwrap();
+            assert_eq!(got, "none||0|0|0", "slot {i}");
+        }
     }
 
     #[test]
