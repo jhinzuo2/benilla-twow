@@ -105,6 +105,21 @@ pub struct FootprintParams {
     pub width: f32,
 }
 
+/// One scale factor with a zero, negative or non-finite value read as the default `1.0`.
+fn valid_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// `CreatureModelData.modelScale × CreatureDisplayInfo.creatureModelScale`, each read through
+/// [`valid_scale`] first.
+fn spawned_scale(model_scale: f32, display_scale: f32) -> f32 {
+    valid_scale(model_scale) * valid_scale(display_scale)
+}
+
 /// The creature display tables; `Default` is empty, which consumers treat as a failed load.
 #[derive(Default)]
 pub struct CreatureCatalog {
@@ -179,7 +194,7 @@ impl CreatureCatalog {
     pub fn model_scale(&self, display_id: u32) -> Option<f32> {
         let row = self.display.get(&display_id)?;
         let model = self.models.get(&row.model_id)?;
-        Some(model.scale * row.scale)
+        Some(spawned_scale(model.scale, row.scale))
     }
 
     /// `CreatureModelAlpha / 255`, the first factor of the unit alpha product.
@@ -239,7 +254,7 @@ impl CreatureCatalog {
             .flatten();
         Some(CreatureModel {
             model_path: model.path.clone(),
-            scale: model.scale * row.scale,
+            scale: spawned_scale(model.scale, row.scale),
             textures: row.textures.clone(),
             npc_appearance,
             blood_display: row.blood_level as i32,
@@ -443,6 +458,66 @@ fn load_creature_display_info_extra(chain: &mut Chain) -> Result<HashMap<u32, Np
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_row(scale: f32) -> ModelRow {
+        ModelRow {
+            path: String::new(),
+            scale,
+            flags: 0,
+            size_class: 0,
+            blood: -1,
+            footprint_texture: -1,
+            footprint_length: 0.0,
+            footprint_width: 0.0,
+            collision_height: 0.0,
+            foley_material: 0,
+            footstep_shake: 0,
+            death_thud_shake: 0,
+        }
+    }
+
+    fn display_row(scale: f32) -> DisplayRow {
+        DisplayRow {
+            model_id: 1,
+            extended_id: 0,
+            scale,
+            textures: [None, None, None],
+            blood_level: 0,
+            size_class: -1,
+            model_alpha: 255,
+        }
+    }
+
+    /// The resolved scale of a display of `display_scale` over a model of `model_scale`.
+    fn resolved_scale(model_scale: f32, display_scale: f32) -> (f32, Option<f32>) {
+        let mut cat = CreatureCatalog::default();
+        cat.models.insert(1, model_row(model_scale));
+        cat.display.insert(1, display_row(display_scale));
+        (cat.model(1).unwrap().scale, cat.model_scale(1))
+    }
+
+    #[test]
+    fn a_zero_display_scale_reads_as_one_beside_the_model_scale() {
+        assert_eq!(resolved_scale(2.0, 0.0), (2.0, Some(2.0)));
+    }
+
+    #[test]
+    fn a_zero_model_scale_reads_as_one_beside_the_display_scale() {
+        assert_eq!(resolved_scale(0.0, 1.5), (1.5, Some(1.5)));
+    }
+
+    #[test]
+    fn zero_in_both_scales_reads_as_one() {
+        assert_eq!(resolved_scale(0.0, 0.0), (1.0, Some(1.0)));
+        assert_eq!(resolved_scale(2.0, -1.0), (2.0, Some(2.0)));
+        assert_eq!(resolved_scale(2.0, f32::NAN), (2.0, Some(2.0)));
+    }
+
+    #[test]
+    fn nonzero_scales_multiply_unchanged() {
+        assert_eq!(resolved_scale(2.0, 1.5), (3.0, Some(3.0)));
+        assert_eq!(resolved_scale(1.0, 1.0), (1.0, Some(1.0)));
+    }
 
     /// `BloodID = −1` is a tier-2 miss, so 595 displays reach tier 3 and bleed red.
     #[test]
