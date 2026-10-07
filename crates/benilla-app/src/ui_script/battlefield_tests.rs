@@ -71,6 +71,20 @@ fn visible(s: &UiScript, frame: &str) -> bool {
         .unwrap()
 }
 
+/// `PARTY_LEADER_CHANGED` runs `BattlefieldFrame_Update` before any push and must find idle slots.
+#[test]
+fn party_leader_changed_before_any_queue_push_raises_nothing() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = session();
+    s.fire_event("PARTY_LEADER_CHANGED", vec![]);
+    assert_eq!(s.take_errors(), Vec::<String>::new());
+    assert_eq!(
+        s.eval::<String>("return (GetBattlefieldStatus(1))")
+            .unwrap(),
+        "none"
+    );
+}
+
 #[test]
 fn the_queue_icon_follows_the_slots_across_update_battlefield_status() {
     let _data = benilla_formats::wow_data_or_skip!();

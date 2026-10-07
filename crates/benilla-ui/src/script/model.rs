@@ -1173,7 +1173,8 @@ impl Model {
             battlefield_leave_requests: 0,
             battlefield_list: Default::default(),
             battlefield_selected: 0,
-            battlefield_slots: Vec::new(),
+            // The reference's slot array is static, so three idle slots from the start.
+            battlefield_slots: vec![super::battlefield_queue::BattlefieldQueueSlot::idle(); 3],
             battlefield_instance_expiration_ms: 0,
             battlefield_join_requests: Vec::new(),
             battlefield_list_requests: Vec::new(),
