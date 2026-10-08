@@ -100,7 +100,7 @@ impl ZoomLimit {
     }
 }
 /// Yards per wheel notch, the stock bindings' `CameraZoomIn(1.0)` (`Bindings.xml:707`).
-const CAM_ZOOM_STEP: f32 = 1.0;
+pub(super) const CAM_ZOOM_STEP: f32 = 1.0;
 /// Zoom speed in yd/s, `cameraDistanceMoveSpeed`'s default: the reference glides the distance to
 /// the wheel target at this constant speed (`0x5112d0`), not an ease.
 const CAM_MOVE_SPEED: f32 = 8.33;

@@ -112,6 +112,8 @@ pub(super) fn move_axes(
     player: &mut Player,
     rig: &CameraControl,
     both_buttons: bool,
+    // The virtual stick (`crate::touch`): extra held sources, never a key-down edge.
+    touch: &crate::touch::TouchMove,
     // The reference's input predicates `0x514560` and `0x5145b0` (`state::may_translate`,
     // `state::may_turn`); death takes both down.
     may_translate: bool,
@@ -174,8 +176,10 @@ pub(super) fn move_axes(
     let mouselook = both_buttons || rig.look == Some(LookButton::Right);
     // The strafe axis nets like `fwd_axis`: vmangos relays no packet carrying both strafe bits,
     // and the reference's 1.12.1 capture sends none.
-    let strafe_left = binds.pressed(crate::bindings::cmd::STRAFE_LEFT);
-    let strafe_right = binds.pressed(crate::bindings::cmd::STRAFE_RIGHT);
+    // The stick's lateral axis enters as Q/E (always-strafe), not A/D: A/D only strafe while
+    // mouse-looking, which is not a state you hold on touch.
+    let strafe_left = binds.pressed(crate::bindings::cmd::STRAFE_LEFT) || touch.strafe_left;
+    let strafe_right = binds.pressed(crate::bindings::cmd::STRAFE_RIGHT) || touch.strafe_right;
     let turn_left = binds.pressed(crate::bindings::cmd::TURN_LEFT);
     let turn_right = binds.pressed(crate::bindings::cmd::TURN_RIGHT);
     let side_axis = i32::from(strafe_right) - i32::from(strafe_left)

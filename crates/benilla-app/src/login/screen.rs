@@ -35,6 +35,8 @@ pub(crate) enum LoginAction {
     Login,
     Quit,
     ToggleSave,
+    /// The Remember Password checkbox — ours; the reference has none.
+    TogglePassword,
     /// Open the realmlist editor, from the button or the address readout under it.
     Realmlist,
 }
@@ -548,43 +550,56 @@ fn spawn_screen(
             s,
         );
 
-        // The Remember Account Name checkbox (20×20 at (17, top 653), resolved from its anchor
-        // under the absent Community button) and its label at LEFT+24.
-        ui.spawn((Node {
-            position_type: PositionType::Absolute,
-            left: px(17.0),
-            top: px(653.0),
-            height: px(20.0),
-            align_items: AlignItems::Center,
-            flex_direction: FlexDirection::Row,
-            ..default()
-        },))
-            .with_children(|row| {
-                let mut b = row.spawn((
-                    LoginAction::ToggleSave,
-                    Button,
-                    Node {
-                        width: px(20.0),
-                        height: px(20.0),
-                        ..default()
-                    },
-                ));
-                match &art.checkbox {
-                    Some(check) => {
-                        b.insert((
-                            ImageNode::new(check.up.clone()),
-                            ArtSwap {
-                                up: check.up.clone(),
-                                down: check.down.clone(),
-                            },
-                        ));
-                        b.with_children(|inner| {
-                            inner.spawn((
-                                CheckMark,
-                                if form.save {
-                                    Visibility::Inherited
-                                } else {
-                                    Visibility::Hidden
+        // The two checkboxes (20×20 each, 10 px shadowed gold label at LEFT+24), stacked at LEFT 17:
+        //  · Remember Account Name — the resolved absolute top 653 (the ref anchors it under the
+        //    Community button we cut; the spot is the same);
+        //  · Remember Password — ours, one 24-unit row under it at top 677. The bottom-left corner
+        //    is clear there (the version block starts ~40 units lower), and the row is the same
+        //    widget on the same art, so it reads as part of the original screen.
+        // Data rows rather than two copies of an 80-line spawn: the checked state, the action and
+        // the label are the only things that differ, and a fix to one must reach both.
+        for (action, checked, top, label, is_password) in [
+            (
+                LoginAction::ToggleSave,
+                form.save,
+                653.0,
+                strings.text("SAVE_ACCOUNT_NAME", "Remember Account Name"),
+                false,
+            ),
+            (
+                LoginAction::TogglePassword,
+                form.save_password,
+                677.0,
+                strings.text("BENILLA_SAVE_PASSWORD", "Remember Password"),
+                true,
+            ),
+        ] {
+            ui.spawn((Node {
+                position_type: PositionType::Absolute,
+                left: px(17.0),
+                top: px(top),
+                height: px(20.0),
+                align_items: AlignItems::Center,
+                flex_direction: FlexDirection::Row,
+                ..default()
+            },))
+                .with_children(|row| {
+                    let mut b = row.spawn((
+                        action,
+                        Button,
+                        Node {
+                            width: px(20.0),
+                            height: px(20.0),
+                            ..default()
+                        },
+                    ));
+                    match &art.checkbox {
+                        Some(check) => {
+                            b.insert((
+                                ImageNode::new(check.up.clone()),
+                                ArtSwap {
+                                    up: check.up.clone(),
+                                    down: check.down.clone(),
                                 },
                             ));
                             b.with_children(|inner| {

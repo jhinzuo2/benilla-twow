@@ -75,7 +75,8 @@ impl GlueClicks {
 /// fires nothing a glue screen registers); the button must be pushed
 /// (`[+0x328] == 2`) and the release must hit-test inside the frame (`0x76b020`). In Bevy's
 /// [`Interaction`], `Pressed → Hovered` is released inside and `Pressed → None` released outside
-/// or hidden mid-press; `pushed` is the reference's state byte.
+/// or hidden mid-press; `pushed` is the reference's state byte. A lifted finger reads `None`
+/// (nothing left to hover), so a touch release is hit-tested against the widget directly.
 pub(crate) fn glue_clicks(
     interactions: Query<(Entity, &Interaction, &ComputedNode, &UiGlobalTransform)>,
     mut pushed: Local<EntityHashSet>,
@@ -84,20 +85,48 @@ pub(crate) fn glue_clicks(
     window: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     clicks.0.clear();
-    pushed.retain(|&e| match interactions.get(e) {
-        Ok((_, Interaction::Pressed)) => true, // still held
-        Ok((_, Interaction::Hovered)) => {
-            clicks.0.insert(e); // released inside: the click
-            false
+    let scale = window.single().map(Window::scale_factor).unwrap_or(1.0);
+    // `Some` only on the frame the UI finger lifted: `pos` and `just_released` land together.
+    let touch_release_at = touch_pointer
+        .just_released
+        .then_some(touch_pointer.pos)
+        .flatten();
+    pushed.retain(|&e| {
+        let Ok((_, interaction, node, transform)) = interactions.get(e) else {
+            return false; // despawned mid-press
+        };
+        match interaction {
+            Interaction::Pressed => true, // still held
+            Interaction::Hovered => {
+                clicks.0.insert(e); // released inside: the click
+                false
+            }
+            Interaction::None => {
+                // Released outside, hidden mid-press, or a lifted finger: Bevy has no pointer
+                // left to raise `Hovered` with, so hit-test the release position directly.
+                if let Some(pos) = touch_release_at {
+                    if node_hit_test(node, transform, scale, pos) {
+                        clicks.0.insert(e);
+                    }
+                }
+                false
+            }
         }
-        // Released outside, hidden mid-press, or despawned: the press is dropped.
-        _ => false,
     });
     for (e, interaction, ..) in &interactions {
         if *interaction == Interaction::Pressed {
             pushed.insert(e);
         }
     }
+}
+
+/// Is `pos` (logical px, y-down, [`crate::touch::TouchPointer`]'s space) inside `node`'s rect?
+/// [`ComputedNode::size`] and the [`UiGlobalTransform`] translation are physical px and the
+/// translation is the node's centre, so both take `/ scale` first.
+fn node_hit_test(node: &ComputedNode, transform: &UiGlobalTransform, scale: f32, pos: Vec2) -> bool {
+    let half = node.size() / scale * 0.5;
+    let center = transform.translation / scale;
+    (center - half).cmple(pos).all() && pos.cmple(center + half).all()
 }
 
 /// Seat every outline copy at exactly ONE device pixel from its real string (`dir / scale_factor`

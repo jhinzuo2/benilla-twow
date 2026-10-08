@@ -122,6 +122,8 @@ impl PluginGroup for GamePlugins {
             .add(FootprintsPlugin)
             .add(crate::go_anim::plugin)
             .add(crate::doodad_events::plugin)
+            // Owns the touch resources the player, glue and UI passes read.
+            .add(crate::touch::TouchPlugin)
             .add(PlayerPlugin)
             .add(crate::screen_fade::ScreenFadePlugin)
             // After PlayerPlugin, whose `control` it overrides in the same stage.

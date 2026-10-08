@@ -271,6 +271,12 @@ fn drain_view_requests(
                 // and Always.
                 cam.yaw = wrap_pi(cam.yaw + degrees.to_radians());
             }
+            CameraViewRequest::ZoomIn(amount) => {
+                zoom_step(&mut targets.rig, &targets.limit, -amount);
+            }
+            CameraViewRequest::ZoomOut(amount) => {
+                zoom_step(&mut targets.rig, &targets.limit, amount);
+            }
         }
     }
 

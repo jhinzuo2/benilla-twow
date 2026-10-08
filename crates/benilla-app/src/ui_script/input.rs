@@ -30,6 +30,8 @@ pub(super) struct PointerFeed<'w> {
     synthetic: Res<'w, super::SyntheticPointer>,
     /// A capture owns the pointer ([`super::CapturePointerPinned`]): no OS cursor in the shot.
     capture_pinned: Res<'w, super::CapturePointerPinned>,
+    /// The UI finger as `crate::touch` arbitrates it; its release frame still carries `pos`.
+    touch: Res<'w, crate::touch::TouchPointer>,
 }
 
 impl PointerFeed<'_> {
@@ -88,6 +90,7 @@ pub(super) fn feed_ui_input(
     let (keyboard, keys, capture, clipboard) = (&mut kbd.0, &kbd.1, &mut kbd.2, &mut kbd.3);
     let world_pick = pointer.world_pick();
     let ui_hidden = pointer.hidden.0;
+    let touch_pointer = *pointer.touch;
     // The OS pointer is not ours while a probe drives a gesture through the real pointer path or a
     // capture pins it: skip the mouse half whole, else-arm included, whose `pointer_left_window`
     // would disarm the probe's gesture between its press and release.

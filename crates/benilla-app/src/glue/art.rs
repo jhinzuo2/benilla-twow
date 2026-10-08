@@ -2,6 +2,8 @@
 //! `CharacterCreate.lua` and the glue palette. Every piece is optional: with no client data the
 //! screens fall back to plain text buttons.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
 use benilla_assets::{LockRecover, WorldAssets};

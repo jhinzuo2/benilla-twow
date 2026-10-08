@@ -250,6 +250,9 @@ impl Plugin for TouchPlugin {
             // `PreUpdate` system has already finished. That avoids naming an engine set whose
             // name has moved between releases, and costs nothing: the consumers are all in
             // `Update` too, ordered behind `TouchInputSet`.
+            // Before the UI feed, which reads `TouchPointer`, and so before the world input that
+            // runs after the UI pass.
+            .configure_sets(Update, TouchInputSet.before(crate::ui_script::UiInput))
             .add_systems(Update, classify_touches.in_set(TouchInputSet))
             .add_plugins(joystick::JoystickVisualsPlugin);
     }
