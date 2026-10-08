@@ -183,28 +183,6 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // `GetDebugStats()` — the stock debug frame's one host verb (StatsFrame.lua l.20, under the
-    // frame's own 0.5 s OnUpdate throttle) and its whole reason to load: one line of whatever
-    // this client can honestly measure, into the `StatsFrameText` fontstring the stock
-    // `StatsFrame.xml` owns (hidden, DIALOG strata — the stock client shows it from its
-    // console). The reference's own line is an internal debug format nothing parses; ours is
-    // ours — the smoothed FPS off the same push `GetFramerate` reads, plus the diagnostic log's
-    // two counts (every distinct failure this session, and how many rows the cap has not
-    // evicted), so the frame is a working at-a-glance health readout rather than a stub.
-    g.set(
-        "GetDebugStats",
-        lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let d = &model.diagnostics;
-            Ok(format!(
-                "FPS: {:.1} | script issues: {} ({} retained)",
-                model.framerate,
-                d.total(),
-                d.len()
-            ))
-        })?,
-    )?;
-
     // `getfenv`/`setfenv` are deliberately NOT registered here.
     //
     // The VM is stock 5.1 (`mlua` `lua51`), and `Lua::new()` opens the base library, which already
@@ -481,47 +459,6 @@ mod tests {
             )
             .unwrap()
         );
-    }
-
-    /// `IsWindowsClient` (`0x48c960`) pushes 1 and `IsLinuxClient` (`0x48c990`) nil, one value
-    /// each; `GetDebugStats` (`0x488af0`) pushes none.
-    #[test]
-    fn the_platform_queries_and_debug_stats_answer_the_pc_build() {
-        let s = UiScript::new().unwrap();
-        assert_eq!(s.arity("IsWindowsClient()").unwrap(), 1);
-        assert_eq!(s.eval::<f64>("return IsWindowsClient(0)").unwrap(), 1.0);
-        assert_eq!(s.arity("IsLinuxClient()").unwrap(), 1);
-        assert!(s.eval::<bool>("return IsLinuxClient() == nil").unwrap());
-        assert_eq!(s.arity("GetDebugStats()").unwrap(), 0);
-    }
-
-    /// Each `OpeningCinematic()` queues one send and returns nothing.
-    #[test]
-    fn opening_cinematic_queues_one_send_per_call() {
-        let mut s = UiScript::new().unwrap();
-        assert_eq!(s.arity("OpeningCinematic()").unwrap(), 0);
-        s.run("OpeningCinematic(1)").unwrap();
-        assert_eq!(s.take_opening_cinematic_asks(), 2);
-        assert_eq!(
-            s.take_opening_cinematic_asks(),
-            0,
-            "the drain empties the queue"
-        );
-    }
-
-    /// The three setters never raise, whatever they are handed, and return zero values.
-    #[test]
-    fn the_stateless_setters_take_any_argument() {
-        let s = UiScript::new().unwrap();
-        for name in ["SetEuropeanNumbers", "SetLayoutMode", "SetConsoleKey"] {
-            for arg in ["", "nil", "1", "\"x\"", "{}", "\"ESCAPE\""] {
-                assert_eq!(
-                    s.arity(&format!("{name}({arg})")).unwrap(),
-                    0,
-                    "{name}({arg})"
-                );
-            }
-        }
     }
 
     /// `IsWindowsClient` (`0x48c960`) pushes 1 and `IsLinuxClient` (`0x48c990`) nil, one value
