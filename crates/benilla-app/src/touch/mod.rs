@@ -271,7 +271,6 @@ fn classify_touches(
     window: Query<&Window, With<PrimaryWindow>>,
     script: Option<NonSend<benilla_ui::script::UiScript>>,
     ui_scale: Res<crate::ui_script::UiScaleCvar>,
-    ui_hidden: Res<crate::ui_hide::UiHidden>,
     mut fingers: ResMut<Fingers>,
     mut mv: ResMut<TouchMove>,
     mut look: ResMut<TouchLook>,
@@ -314,7 +313,7 @@ fn classify_touches(
             // The stick wins its zone outright — see the module doc on full-screen addon frames.
             anchor.centre = Some(pos);
             Role::Joystick
-        } else if !ui_hidden.0 && hits_ui(script.as_deref(), ui_scale.0, win_h, pos) {
+        } else if hits_ui(script.as_deref(), ui_scale.0, win_h, pos) {
             Role::Ui
         } else {
             Role::Look

@@ -25,10 +25,9 @@ use benilla_world::view::WorldCamera;
 
 use crate::creature_anim::wrap_pi;
 
-use super::camera::{
-    CameraControl, FlyCam, ZoomLimit, CAM_DIST_MAX, CAM_DIST_MIN, CAM_PITCH_LIMIT, CAM_ZOOM_STEP,
-};
+use super::camera::{CameraControl, FlyCam, CAM_PITCH_LIMIT};
 use super::camera_saved::{pitch_from_file, pitch_to_file};
+use super::camera_zoom::{CAM_DIST_MAX, CAM_DIST_MIN};
 use super::Player;
 
 /// The reference's five views, through the UI crate's constant so the Lua range check agrees.
@@ -187,9 +186,6 @@ fn load_saved_views(cvars: Res<crate::cvars::Cvars>, mut views: ResMut<CameraVie
 struct ViewTargets<'w, 's> {
     views: ResMut<'w, CameraViews>,
     rig: ResMut<'w, CameraControl>,
-    /// The zoom ceiling — the same `ZoomLimit::max` the controller's `apply_zoom_scroll` clamps
-    /// to, so a Lua zoom step can never push the target past where a wheel notch can.
-    limit: Res<'w, ZoomLimit>,
     cam: Query<'w, 's, &'static mut FlyCam, With<WorldCamera>>,
     player: Res<'w, Player>,
 }
@@ -271,12 +267,6 @@ fn drain_view_requests(
                 // and Always.
                 cam.yaw = wrap_pi(cam.yaw + degrees.to_radians());
             }
-            CameraViewRequest::ZoomIn(amount) => {
-                zoom_step(&mut targets.rig, &targets.limit, -amount);
-            }
-            CameraViewRequest::ZoomOut(amount) => {
-                zoom_step(&mut targets.rig, &targets.limit, amount);
-            }
         }
     }
 
@@ -312,17 +302,6 @@ fn apply(
     cam.pitch = pose.pitch.clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
     cam.yaw = wrap_pi(face_yaw + pose.yaw);
     moved
-}
-
-/// `CameraZoomIn(amount)` / `CameraZoomOut(amount)` — the same target move a wheel notch makes
-/// (`apply_zoom_scroll`'s `scroll × CAM_ZOOM_STEP`), written straight to the target because the
-/// drain runs once per request rather than per frame. Clamped to the rig's own zoom range
-/// (`[CAM_DIST_MIN, ZoomLimit::max]`); the controller's per-frame glide then walks `distance`
-/// there at `cameraDistanceMoveSpeed`, exactly like a notch. No CVar write: the zoom target is
-/// not one of the five view slots, and the pose file owns the restart default.
-fn zoom_step(rig: &mut CameraControl, limit: &ZoomLimit, delta_yards: f32) {
-    rig.target_distance =
-        (rig.target_distance + delta_yards * CAM_ZOOM_STEP).clamp(CAM_DIST_MIN, limit.max);
 }
 
 pub(super) fn plugin(app: &mut App) {
