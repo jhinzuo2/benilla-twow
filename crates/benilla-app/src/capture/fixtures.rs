@@ -1,6 +1,7 @@
 //! The capture UI fixtures: each arm seeds one window's synthetic but realistic state.
 
 use super::*;
+use benilla_protocol::messages::trainer_spell_state;
 
 /// The `vplates` fixture's wolf, the reference screenshot's subject (vmangos `creature_template`
 /// 69 "Timber Wolf": level 2, faction template 32, display 604), at the scenario's look point.
@@ -23,6 +24,66 @@ const CHEST_GUID: u64 = (0xF110u64 << 48) | 0x744;
 /// 45°), so `front` shows the lit side and `rear` the unlit one.
 const SUBJECT_YAW: f32 = 2.36;
 
+/// One trainer fixture's canned seed: the trainer's identity, its `SMSG_TRAINER_LIST` type, its
+/// greeting, the character's hearthstone bind area, and the wire rows
+/// `(spell, state, copper cost, required level)`.
+struct TrainerSeed {
+    name: &'static str,
+    subname: &'static str,
+    trainer_type: u32,
+    greeting: &'static str,
+    bind: u32,
+    rows: &'static [(u32, u8, u32, u8)],
+}
+
+/// Llane Beshere (entry 911), Northshire's warrior trainer: the rank-1 learn wrappers a vmangos
+/// trainer lists (`1605` teaches Heroic Strike 78 and so on), so each row's name and rank mirror
+/// the ability while its description is the taught spell's own text.
+const TRAINER_WARRIOR: TrainerSeed = TrainerSeed {
+    name: "Llane Beshere",
+    subname: "Warrior Trainer",
+    trainer_type: 0,
+    greeting: "I can train you in the ways of the warrior.",
+    bind: 9, // Northshire Valley, where this character's hearthstone is
+    rows: &[
+        (1605, trainer_spell_state::GREEN, 10, 1), // Heroic Strike Rank 1
+        (1738, trainer_spell_state::GREEN, 100, 4), // Charge Rank 1
+        (1423, trainer_spell_state::GREEN, 100, 4), // Rend Rank 1
+        (6674, trainer_spell_state::GREEN, 200, 6), // Battle Shout Rank 1
+        (1716, trainer_spell_state::GREEN, 300, 8), // Hamstring Rank 1
+        (3128, trainer_spell_state::GREEN, 200, 8), // Parry
+    ],
+};
+
+/// A shaman trainer's Astral Recall (wrapper 1352 teaches 556). One service only: the stock
+/// window's `ClassTrainer_SelectFirstLearnableSkill` selects row 2, so the row the shot is about
+/// must be the first service of the first group.
+const TRAINER_SHAMAN: TrainerSeed = TrainerSeed {
+    name: "Sian'tsu",
+    subname: "Shaman Trainer",
+    trainer_type: 0,
+    greeting: "The spirits are strong within you, shaman.",
+    bind: 362, // Razor Hill, a Durotar hearthstone
+    rows: &[(1352, trainer_spell_state::GREEN, 4000, 30)],
+};
+
+/// Bengus Deepforge, Ironforge's blacksmithing trainer, with the two row shapes a profession
+/// trainer lists: the profession-learn wrapper (2020 teaches 2018, whose own text the row shows)
+/// and a recipe (7820 teaches 7818, whose text is the description of the Silver Rod it makes).
+/// The learn row sorts into group 1 (`Effect` 44 `SKILL_STEP`) ahead of the recipe's group 2
+/// (`0x4d77b6`), so the stock window's row-2 selection lands on it.
+const TRAINER_BLACKSMITH: TrainerSeed = TrainerSeed {
+    name: "Bengus Deepforge",
+    subname: "Blacksmithing Trainer",
+    trainer_type: 2, // a tradeskill trainer
+    greeting: "The forge shapes what the mine provides.",
+    bind: 1537, // Ironforge
+    rows: &[
+        (2020, trainer_spell_state::GREEN, 9, 5), // Apprentice Blacksmith
+        (7820, trainer_spell_state::GREEN, 90, 0), // Silver Rod
+    ],
+};
+
 /// Seeds the fixture window's state once the scene is resident; the real feeds push it into the VM
 /// during the settle window as live wire data would. Icons resolve through the offline
 /// `ItemDisplayCatalog`, and names go straight into the caches.
@@ -35,13 +96,17 @@ pub(super) fn seed_ui_fixture(
     mut quest: ResMut<crate::ui_quest::QuestGiver>,
     mut quest_log: ResMut<crate::ui_quest_log::QuestLog>,
     mut loot: ResMut<crate::ui_loot::LootState>,
+    mut trainer: ResMut<crate::ui_trainer::TrainerOpen>,
     // One param under Bevy's 16-param cap: item objects are entities in the index, spawned as
-    // the wire does.
-    store: (ResMut<crate::items::Items>, ResMut<crate::net::GuidIndex>),
+    // the wire does; the hearthstone bind (`SMSG_BINDPOINTUPDATE`) rides along for the `$z` token.
+    store: (
+        ResMut<crate::items::Items>,
+        ResMut<crate::net::GuidIndex>,
+        ResMut<crate::net::HomeBind>,
+    ),
     mut names: ResMut<crate::names::NameCache>,
     icons: Option<Res<crate::entities::ItemDisplays>>,
     mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    mut vplates: ResMut<crate::vplates::VPlateMode>,
     mut selection: ResMut<crate::target::Selection>,
     mut player: ResMut<crate::player::Player>,
     // A nested tuple, one param under Bevy's 16-param cap.
@@ -52,7 +117,7 @@ pub(super) fn seed_ui_fixture(
         ResMut<crate::loading_screen::LoadingScreen>,
     ),
 ) {
-    let (mut items, mut index) = store;
+    let (mut items, mut index, mut home_bind) = store;
     // A glue-screen capture has no world scenario, and no glue screen opens a UI fixture.
     let Some(scenario) = ctx.scenario else {
         return;
@@ -206,6 +271,62 @@ pub(super) fn seed_ui_fixture(
                     ..Default::default()
                 });
             }
+        }
+        UiFixture::Trainer(list) => {
+            // The seed's rows are the wire list: its copper costs, level gates and the states the
+            // server computed, in wire order.
+            use benilla_protocol::messages::TrainerSpell;
+            let seed = match list {
+                TrainerList::Warrior => &TRAINER_WARRIOR,
+                TrainerList::Shaman => &TRAINER_SHAMAN,
+                TrainerList::Blacksmith => &TRAINER_BLACKSMITH,
+            };
+            names.insert_creature(
+                NPC_ENTRY,
+                Some(crate::names::CreatureRecord {
+                    name: seed.name.into(),
+                    subname: Some(seed.subname.into()),
+                    creature_type: 7,
+                    pet_family: 0,
+                    rank: 0,
+                    type_flags: 0,
+                    civilian: false,
+                    racial_leader: false,
+                    display_id: 0,
+                }),
+            );
+            home_bind.0 = Some(seed.bind);
+            let Some(script) = script.as_mut() else {
+                return;
+            };
+            // The window's title and portrait read `UnitName("npc")`; no session seats it here.
+            script.set_unit(
+                "npc",
+                Some(benilla_ui::script::UnitState {
+                    exists: true,
+                    name: Some(seed.name.into()),
+                    level: 12,
+                    ..Default::default()
+                }),
+            );
+            // A purse large enough for every cost above, so the money frame renders white.
+            script.set_money(10_000);
+            let services: Vec<TrainerSpell> = seed
+                .rows
+                .iter()
+                .map(|&(spell, state, cost, req_level)| TrainerSpell {
+                    spell,
+                    state,
+                    cost,
+                    can_learn_primary_prof: false,
+                    is_primary_prof_first_rank: false,
+                    req_level,
+                    req_skill: 0,
+                    req_skill_value: 0,
+                    req_spells: [0; 3],
+                })
+                .collect();
+            trainer.open(NPC_GUID, seed.trainer_type, services, seed.greeting.into());
         }
         UiFixture::Gossip => {
             names.insert_creature(
@@ -784,6 +905,32 @@ pub(super) fn seed_ui_fixture(
                 warn!("capture: ui-tooltip-world seed failed to open the tooltip");
             }
         }
+        UiFixture::TooltipRank => {
+            let Some(mut script) = script else {
+                return;
+            };
+            // A ranked player under the cursor, pushed as the mouseover feed does, then the call
+            // `drive_mouseover_tooltip` makes: the title is `0x609370`'s rank leg over the name,
+            // "Sergeant Bob".
+            script.set_unit(
+                "mouseover",
+                Some(benilla_ui::script::UnitState {
+                    exists: true,
+                    is_player: true,
+                    name: Some("Bob".into()),
+                    level: 60,
+                    reaction: 5,
+                    pvp: true,
+                    pvp_rank: 7,
+                    pvp_team: 1,
+                    sex: 2,
+                    ..Default::default()
+                }),
+            );
+            if !script.world_tooltip_unit("mouseover") {
+                warn!("capture: ui-tooltip-rank seed failed to open the tooltip");
+            }
+        }
         UiFixture::Character => {
             // A synthetic self player carrying the full stat block, which the `ui_char` feed turns
             // into snapshots and events as live. A level-12 warrior; positive (stamina, fire) and
@@ -944,7 +1091,8 @@ pub(super) fn seed_ui_fixture(
                     Visibility::default(),
                 ))
                 .id();
-            vplates.enemies = true;
+            // As the V binding does, so FrameXML's replay at `PLAYER_ENTERING_WORLD` agrees.
+            set_enemy_plates(script.as_deref(), true);
             // The wolf is the target, so its plate draws lit with the target ring.
             selection.target = Some(wolf);
             selection.guid = Some(WOLF_GUID);
@@ -1026,17 +1174,17 @@ pub(super) fn seed_ui_fixture(
             }
         }
         UiFixture::KeyBindings => {
-            let Some(mut script) = script else {
+            let Some(script) = script else {
                 return;
             };
-            // The Keybindings page: the real command registry and CVar set first, then the live
-            // open path, with Movement expanded to show a header row and the default bindings.
+            // The Keybindings page over the commands the load registered: the real CVar set
+            // first, then the live open path, with Movement expanded to show a header row and the
+            // default bindings.
             script.register_cvars(crate::cvars::registered_pairs());
-            script.register_bindings(&crate::bindings::registry_commands());
             if let Err(e) = script.run(
                 "ShowUIPanel(BenillaOptionsFrame); \
                  BenillaOptionsFrameCategoryListRowKeybindings:Click(); \
-                 KeyBindings_ExpandSection(1, true); KeyBindingsPage_Update()",
+                 BenillaKeyBindings_ExpandSection(1, true); BenillaKeyBindingsPage_Update()",
             ) {
                 warn!("capture: ui-keybindings seed failed: {e}");
             }
@@ -1295,7 +1443,51 @@ pub(super) fn seed_ui_fixture(
                 Visibility::default(),
             ));
             // A plated unit draws no floating name, so enemy plates go off.
-            vplates.enemies = false;
+            set_enemy_plates(script.as_deref(), false);
+        }
+        UiFixture::NameRank => {
+            use benilla_protocol::messages::ObjectFields;
+            // The self player at the eye, as `name-water`; the subject is the other player's name.
+            const SELF_GUID: u64 = 0x51;
+            names.insert_player(SELF_GUID, "Benilla".into(), None);
+            commands.spawn((
+                crate::net::ObjectStore(ObjectFields::from_pairs(&[
+                    (34, 2),      // UNIT_FIELD_LEVEL
+                    (35, 1),      // UNIT_FIELD_FACTIONTEMPLATE: human
+                    (36, 0x0101), // UNIT_FIELD_BYTES_0: race human, class warrior
+                ])),
+                crate::net::SelfPlayer,
+                crate::net::Guid(SELF_GUID),
+                Transform::from_translation(wow_to_bevy(scenario.eye)),
+            ));
+            // The subject at the `vplates` wolf's dry spot: a human player holding rank,
+            // `PLAYER_BYTES_3` byte 3 (`PLAYER_BYTES_3_OFFSET_HONOR_RANK`, vmangos
+            // `HonorMgr.cpp:900`) at internal 7: the visual rank 3, "Sergeant" (team 1 off race
+            // 1's `ChrRaces` row).
+            const RANKED_GUID: u64 = 0x52;
+            names.insert_player(RANKED_GUID, "Bob".into(), None);
+            commands.spawn((
+                crate::net::Guid(RANKED_GUID),
+                crate::net::NetEntity {
+                    kind: benilla_protocol::EntityKind::Player,
+                    // HumanMale, the body a human `UNIT_FIELD_DISPLAYID` carries.
+                    display_id: Some(49),
+                    scale: 1.0,
+                },
+                crate::net::ObjectStore(ObjectFields::from_pairs(&[
+                    (34, 60),       // UNIT_FIELD_LEVEL
+                    (35, 1),        // UNIT_FIELD_FACTIONTEMPLATE: human
+                    (36, 0x0101),   // UNIT_FIELD_BYTES_0: race human, class warrior, male
+                    (195, 7 << 24), // PLAYER_BYTES_3 byte 3: the current honor rank, internal 7
+                ])),
+                Transform {
+                    translation: wow_to_bevy(WOLF_POS),
+                    ..default()
+                },
+                Visibility::default(),
+            ));
+            // A plated unit draws no floating name, so enemy plates go off.
+            set_enemy_plates(script.as_deref(), false);
         }
         // The lighting matrix: one spawn with a streamed entity's component set, anonymous and
         // with plates off, so no glyph rides over the body.
@@ -1339,7 +1531,7 @@ pub(super) fn seed_ui_fixture(
                     ));
                 }
             }
-            vplates.enemies = false;
+            set_enemy_plates(script.as_deref(), false);
         }
     }
 }
@@ -1360,9 +1552,7 @@ fn seed_cooldown_filmstrip(
 ) {
     // The clock first: `set_container` stores each triple against it, and
     // `GetContainerItemCooldown`'s expiry guard reads it.
-    if let Err(e) = script.run(&format!("__benilla_now = {COOLDOWN_NOW_S}")) {
-        warn!("capture: ui-cooldown failed to pin the session clock: {e}");
-    }
+    script.set_now(COOLDOWN_NOW_S);
     const DISP_STONE: u32 = 6418;
     let texture = icons
         .and_then(|i| i.catalog.get(DISP_STONE))
@@ -1603,5 +1793,18 @@ fn seed_equipped_bags(
         if let Err(e) = script.run(&format!("OpenBag({bag_id})")) {
             warn!("capture: equipped bag {bag_id} seed failed: {e}");
         }
+    }
+}
+
+/// Turn enemy plates on or off as the V binding does, the verb and FrameXML's global together,
+/// so FrameXML's own replay agrees.
+fn set_enemy_plates(script: Option<&benilla_ui::script::UiScript>, on: bool) {
+    let lua = if on {
+        "NAMEPLATES_ON = 1; ShowNameplates()"
+    } else {
+        "NAMEPLATES_ON = nil; HideNameplates()"
+    };
+    if let Some(Err(e)) = script.map(|s| s.run(lua)) {
+        warn!("nameplates: {e}");
     }
 }

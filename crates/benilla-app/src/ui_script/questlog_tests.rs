@@ -82,25 +82,24 @@ const HAMMER_LINK: &str = "|cffffffff|Hitem:2024:0:0:0|h[Militia Hammer]|h|r";
 fn shipped_questlog_frame_loads_clean() {
     let _data = benilla_formats::wow_data_or_skip!();
     let s = UiScript::new().unwrap();
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 }
 
 /// Open, read the list and the detail, wheel the list, abandon through the confirm, close.
@@ -109,25 +108,24 @@ fn shipped_questlog_frame_drives_end_to_end() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(eight_entries());
 
@@ -288,32 +286,29 @@ fn shift_click_toggles_the_watch_checkbox_and_the_tracker_hud() {
     s.set_screen_size(1024.0, 768.0);
     // The check seats off measured widths during the update (`QuestLogFrame.lua:224-233`).
     s.set_text_measurer(Box::new(super::FixedWidthFont(6.0)));
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
-    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
-    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
+    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml");
     // A shift-click reads `ChatFrameEditBox:IsVisible()` unguarded (`QuestLogFrame.lua:478`).
     load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ChatFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.lua");
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\FloatingChatFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(eight_entries());
     // The app fires QUEST_LOG_UPDATE when the log lands; its `QuestWatch_Update` hides an empty
@@ -416,33 +411,30 @@ fn watch_guards_no_op_without_erroring() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
-    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIErrorsFrame.xml"); // the guards' red-line surface
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
-    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
+    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml");
     // A shift-click reads `ChatFrameEditBox:IsVisible()` unguarded (`QuestLogFrame.lua:478`).
     load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\UIErrorsFrame.xml"); // the guards' red-line surface
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ChatFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.lua");
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\FloatingChatFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(eight_entries());
     s.run("ToggleQuestLog()").unwrap();
@@ -517,29 +509,28 @@ fn progress_auto_watches_for_five_minutes() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
-    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     // The options window sets `AUTO_QUEST_WATCH`, as the reference's `UIOptionsFrame_Init` does.
     load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "KeyBindingsPage.xml");
-    load_xml(&s, "OptionsFrame.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
+    load_xml(&s, "KeyBindingsPage.xml");
+    load_xml(&s, "OptionsFrame.xml");
     s.set_quest_log(eight_entries());
 
     // The app fires this with the quest's log row, as the 1.12 client does: `0x4df880` searches
@@ -592,30 +583,28 @@ fn the_auto_watch_flag_is_the_references_uvar_and_gates_the_watch() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     // The options window sets `AUTO_QUEST_WATCH`, as the reference's `UIOptionsFrame_Init` does.
     load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
     load_xml(&s, "ScrollTemplates.xml");
     load_xml(&s, "KeyBindingsPage.xml");
     load_xml(&s, "OptionsFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "ScrollTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
-    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
     s.set_quest_log(eight_entries());
     assert_eq!(s.eval::<String>("return AUTO_QUEST_WATCH").unwrap(), "1");
 
@@ -645,26 +634,25 @@ fn the_row_tag_is_its_own_right_flush_string_and_the_state_word_wins() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     // The state words are the GlobalStrings `COMPLETE` and `FAILED`.
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     let mut state = eight_entries();
     // Row 1 tagged, row 2 tagged and complete, row 3 failed, row 4 a header.
@@ -727,25 +715,24 @@ fn empty_quest_log_hides_rows_and_disables_abandon() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(QuestLogState::default());
     s.run("ToggleQuestLog()").unwrap();
@@ -785,25 +772,24 @@ fn reward_rows_follow_the_refs_two_per_row_layout() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     let mut state = eight_entries();
     // Every row carries the detail, and the window paints the auto-selected one.
@@ -972,25 +958,24 @@ fn overflowing_detail_content_clips_to_the_scrollframe_rect() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(overflowing_entry());
     s.run("ToggleQuestLog()").unwrap();
@@ -1041,25 +1026,24 @@ fn wheel_over_the_detail_pane_changes_vertical_scroll() {
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
     s.set_text_measurer(Box::new(super::FixedWidthFont(6.0)));
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(overflowing_entry());
     s.run("ToggleQuestLog()").unwrap();
@@ -1099,25 +1083,24 @@ fn selection_change_resets_detail_scroll_but_a_quest_log_update_refresh_does_not
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
     s.set_text_measurer(Box::new(super::FixedWidthFont(6.0)));
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(overflowing_entry());
     s.run("ToggleQuestLog()").unwrap();
@@ -1166,26 +1149,25 @@ fn reward_row_hover_serves_the_shared_item_tooltip() {
 
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(eight_entries());
     s.run("ToggleQuestLog()").unwrap();
@@ -1257,17 +1239,17 @@ fn popup_children_inherit_the_dialog_stratum() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
     load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     s.run(
         "StaticPopupDialogs[\"TEST_STRATUM\"] = { text = \"Abandon?\", button1 = \"Yes\", \
          button2 = \"No\", timeout = 0 }\n\
@@ -1308,33 +1290,30 @@ fn reward_rows_preview_and_post_and_a_plain_click_stays_inert() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
+    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml"); // the kit its menus build from
+    load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
-    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
     load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     // A shift-click reads `ChatFrameEditBox:IsVisible()` unguarded (`QuestLogFrame.lua:548`).
-    load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\DressUpFrame.xml"); // DressUpItemLink lives here
-    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml"); // the kit its menus build from
     load_xml(&s, "Interface\\FrameXML\\ChatFrame.xml"); // ChatFrameEditBox lives here
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.lua");
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\FloatingChatFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\DressUpFrame.xml"); // DressUpItemLink lives here
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(eight_entries());
     s.run("ToggleQuestLog()").unwrap();
@@ -1396,32 +1375,29 @@ fn shift_click_on_a_title_posts_the_quest_name_with_chat_open_and_watches_with_i
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
-    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
-    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
     load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
+    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml"); // the kit its menus build from
+    load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
-    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
     load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     // A shift-click reads `ChatFrameEditBox:IsVisible()` unguarded (`QuestLogFrame.lua:478`).
-    load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIMenu.xml"); // the kit its menus build from
     load_xml(&s, "Interface\\FrameXML\\ChatFrame.xml"); // ChatFrameEditBox lives here
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.lua");
-    load_xml(&s, "Interface\\FrameXML\\UIPanelTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\FloatingChatFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(eight_entries());
     s.run("ToggleQuestLog()").unwrap();
@@ -1494,25 +1470,24 @@ fn share_quest_needs_both_a_sharable_selection_and_a_party() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(entries_sharable(&[1]));
     s.set_party(PartyState::default());
@@ -1571,25 +1546,24 @@ fn share_quest_is_dark_on_an_empty_log_even_in_a_party() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(QuestLogState::default());
     s.set_party(party(4));
@@ -1606,25 +1580,24 @@ fn share_quest_click_queues_the_selected_quests_id() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     s.set_quest_log(entries_sharable(&[1, 5]));
     s.set_party(party(1));
@@ -1648,25 +1621,24 @@ fn the_stock_title_width_cap_bites_and_is_sticky_per_row_button() {
     s.set_screen_size(1024.0, 768.0);
     // The cap reads `questTitleTag:GetWidth()` inside the update, so the harness needs a measurer.
     s.set_text_measurer(Box::new(super::FixedWidthFont(6.0)));
-    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
     load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
     load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
-    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
-    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
     load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
-    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
-    load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
-    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
     load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 
     // A long Dungeon-tagged title.
     const LONG: &str = "The Left Piece of Lord Valthalak's Amulet";
@@ -1720,4 +1692,116 @@ fn the_stock_title_width_cap_bites_and_is_sticky_per_row_button() {
         (width(&mut s, "QuestLogTitle1NormalText") - capped).abs() < 0.5,
         "the capped box survives the row going untagged (the ref's own 275 reset never fires)"
     );
+}
+
+// ── The group-mates count ──
+
+/// A party member held with `ids` in their quest-log window, named `name`.
+fn mate_on(guid: u64, name: &str, ids: &[u32]) -> benilla_ui::script::UnitState {
+    let mut quest_log = [[0; 3]; 20];
+    for (slot, &id) in quest_log.iter_mut().zip(ids) {
+        *slot = [id, 0, 0];
+    }
+    benilla_ui::script::UnitState {
+        exists: true,
+        has_object: true,
+        is_player: true,
+        guid,
+        name: Some(name.into()),
+        quest_log,
+        ..Default::default()
+    }
+}
+
+/// Each quest row counts the party members on it as `[n]` (`QuestLogFrame.lua:168-183`), through
+/// `IsUnitOnQuest(questIndex, "partyN")`; the row tooltip names them (`:515-541`), and a mate's
+/// `UNIT_QUEST_LOG_CHANGED` recounts (`:69-72`).
+#[test]
+fn quest_rows_count_the_party_members_on_each_quest() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
+
+    s.set_quest_log(eight_entries());
+    s.set_party(party(2));
+    s.set_unit("party1", Some(mate_on(0x300, "Mate0", &[1, 3])));
+    s.set_unit("party2", Some(mate_on(0x301, "Mate1", &[1])));
+    s.run("ToggleQuestLog()").unwrap();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+
+    let mates = |s: &mut UiScript, row: u32| {
+        s.eval::<String>(&format!(
+            "return QuestLogTitle{row}GroupMates:GetText() or ''"
+        ))
+        .unwrap()
+    };
+    assert_eq!(mates(&mut s, 1), "[2]", "both mates are on quest 1");
+    assert_eq!(mates(&mut s, 2), "", "nobody is on quest 2");
+    assert_eq!(mates(&mut s, 3), "[1]", "party1 is on quest 3");
+
+    // The row tooltip, as `QuestLogTitleButton_OnEnter` builds it for row 1, then row 2.
+    let line = |s: &mut UiScript, n: u32| {
+        s.eval::<String>(&format!("return GameTooltipTextLeft{n}:GetText() or ''"))
+            .unwrap()
+    };
+    s.run("this = QuestLogTitle1 QuestLog_UpdatePartyInfoTooltip()")
+        .unwrap();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    assert_eq!(line(&mut s, 1), "Quest 1");
+    assert!(s
+        .eval::<bool>(
+            "return GameTooltipTextLeft2:GetText() == \
+             HIGHLIGHT_FONT_COLOR_CODE..PARTY_QUEST_STATUS_ON..FONT_COLOR_CODE_CLOSE"
+        )
+        .unwrap());
+    assert!(line(&mut s, 3).contains("Mate0"), "{}", line(&mut s, 3));
+    assert!(line(&mut s, 4).contains("Mate1"), "{}", line(&mut s, 4));
+    s.run("this = QuestLogTitle2 QuestLog_UpdatePartyInfoTooltip()")
+        .unwrap();
+    assert!(s
+        .eval::<bool>(
+            "return GameTooltipTextLeft2:GetText() == \
+             HIGHLIGHT_FONT_COLOR_CODE..PARTY_QUEST_STATUS_NONE..FONT_COLOR_CODE_CLOSE"
+        )
+        .unwrap());
+
+    // party2 takes quest 3: their quest-log event recounts the open log.
+    s.set_unit("party2", Some(mate_on(0x301, "Mate1", &[1, 3])));
+    s.fire_event(
+        "UNIT_QUEST_LOG_CHANGED",
+        vec![benilla_ui::script::ScriptValue::Str("party2".into())],
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    assert_eq!(mates(&mut s, 3), "[2]");
+
+    // Out of range, a mate counts for nothing, whatever their last window held (`0x468460` finds
+    // no object).
+    s.set_unit(
+        "party1",
+        Some(benilla_ui::script::UnitState {
+            has_object: false,
+            ..mate_on(0x300, "Mate0", &[1, 3])
+        }),
+    );
+    s.run("QuestLog_Update()").unwrap();
+    assert_eq!(mates(&mut s, 1), "[1]");
+    assert_eq!(mates(&mut s, 3), "[1]");
 }

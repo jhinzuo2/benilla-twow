@@ -24,7 +24,7 @@ pub(super) fn look_input(
 ) -> LookInput {
     // Both buttons held run forward and steer with the mouse, whichever went down first.
     // MOVEANDSTEER is the same state: its 1.12 body runs CameraOrSelectOrMove and TurnOrAction.
-    let steer_held = binds.pressed(crate::bindings::cmd::MOVE_AND_STEER);
+    let steer_held = binds.steering();
     let both_buttons = rig.world_mouse.both() || steer_held;
 
     // 1.12's `[InputControl+0x4]`, bit for bit: the camera's auto-follow arms on its edges.
@@ -36,37 +36,34 @@ pub(super) fn look_input(
                 w |= b;
             }
         };
-        set(
-            rig.world_mouse.held(LookButton::Right) || steer_held,
-            bit::RIGHT_MOUSE,
-        );
+        set(rig.world_mouse.turn() || steer_held, bit::RIGHT_MOUSE);
         set(
             rig.world_mouse.held(LookButton::Left) || steer_held,
             bit::LEFT_MOUSE,
         );
-        // `/follow` sets the forward bit through W's own setter, so it arms the camera like W.
+        // The auto-move sets the forward bit through W's own setter, so it arms the camera like W.
         set(
-            binds.pressed(crate::bindings::cmd::MOVE_FORWARD) || player.follow_forward,
+            binds.pressed(crate::bindings::Input::MoveForward) || player.auto_forward,
             bit::FORWARD,
         );
         set(
-            binds.pressed(crate::bindings::cmd::MOVE_BACKWARD),
+            binds.pressed(crate::bindings::Input::MoveBackward),
             bit::BACKWARD,
         );
         set(
-            binds.pressed(crate::bindings::cmd::STRAFE_LEFT),
+            binds.pressed(crate::bindings::Input::StrafeLeft),
             bit::STRAFE_LEFT,
         );
         set(
-            binds.pressed(crate::bindings::cmd::STRAFE_RIGHT),
+            binds.pressed(crate::bindings::Input::StrafeRight),
             bit::STRAFE_RIGHT,
         );
         set(
-            binds.pressed(crate::bindings::cmd::TURN_LEFT),
+            binds.pressed(crate::bindings::Input::TurnLeft),
             bit::TURN_LEFT,
         );
         set(
-            binds.pressed(crate::bindings::cmd::TURN_RIGHT),
+            binds.pressed(crate::bindings::Input::TurnRight),
             bit::TURN_RIGHT,
         );
         set(player.autorun, bit::AUTORUN);
@@ -123,7 +120,7 @@ pub(super) fn move_axes(
     // `Forward`). The reference's window-deactivate handler (`0x514490`, called only from the
     // WM_ACTIVATE slot at `0x493058`) releases every direction bit and keeps `0x1000`.
     let mut autorun_armed = false;
-    if binds.fired(crate::bindings::cmd::TOGGLE_AUTORUN) {
+    if binds.fired(crate::bindings::Input::ToggleAutoRun) {
         player.autorun = !player.autorun;
         autorun_armed = player.autorun;
     }
@@ -145,12 +142,10 @@ pub(super) fn move_axes(
     //   emit; ours is `state::may_translate`. The server-ride term is benilla's own.
     // A jump, a chat EditBox taking focus and a zone change leave it set; mounting is untraced and
     // leaves it set here. A focused chat box releases nothing, so W held through ENTER still runs.
-    let both_buttons_engaged = (both_buttons
-        && (rig.world_mouse.down(LookButton::Left) || rig.world_mouse.down(LookButton::Right)))
-        || binds.just_pressed(crate::bindings::cmd::MOVE_AND_STEER);
+    let both_buttons_engaged = (both_buttons && rig.world_mouse.rose()) || binds.steering_began();
     if state::autorun_cancelled(
-        binds.just_pressed(crate::bindings::cmd::MOVE_FORWARD),
-        binds.just_pressed(crate::bindings::cmd::MOVE_BACKWARD),
+        binds.just_pressed(crate::bindings::Input::MoveForward),
+        binds.just_pressed(crate::bindings::Input::MoveBackward),
         both_buttons_engaged,
         !may_translate || player.server_riding,
     ) {
@@ -160,13 +155,14 @@ pub(super) fn move_axes(
     // ── The forward/back axis ── The order of S and autorun decides: S held, then autorun
     // toggled, keeps both (the toggle pushes `0x1000`, so `test cl,0x30` misses) and the
     // reference sends MSG_MOVE_STOP with S held; autorun, then S, clears the bit at key-down and
-    // walks you backward. `/follow` is a held forward, W's own bit `0x100000` through W's setter,
-    // so it nets against S like W and never trips the cancel set, which fires on key-down edges.
+    // walks you backward. The auto-move is a held forward, W's own bit `0x100000` through W's
+    // setter, so it nets against S like W and never trips the cancel set, which fires on key-down
+    // edges.
     let fwd_axis = state::forward_axis(
-        binds.pressed(crate::bindings::cmd::MOVE_FORWARD)
-            || player.follow_forward
+        binds.pressed(crate::bindings::Input::MoveForward)
+            || player.auto_forward
             || touch.forward,
-        binds.pressed(crate::bindings::cmd::MOVE_BACKWARD) || touch.backward,
+        binds.pressed(crate::bindings::Input::MoveBackward) || touch.backward,
         both_buttons,
         autorun,
     );
@@ -178,10 +174,10 @@ pub(super) fn move_axes(
     // and the reference's 1.12.1 capture sends none.
     // The stick's lateral axis enters as Q/E (always-strafe), not A/D: A/D only strafe while
     // mouse-looking, which is not a state you hold on touch.
-    let strafe_left = binds.pressed(crate::bindings::cmd::STRAFE_LEFT) || touch.strafe_left;
-    let strafe_right = binds.pressed(crate::bindings::cmd::STRAFE_RIGHT) || touch.strafe_right;
-    let turn_left = binds.pressed(crate::bindings::cmd::TURN_LEFT);
-    let turn_right = binds.pressed(crate::bindings::cmd::TURN_RIGHT);
+    let strafe_left = binds.pressed(crate::bindings::Input::StrafeLeft) || touch.strafe_left;
+    let strafe_right = binds.pressed(crate::bindings::Input::StrafeRight) || touch.strafe_right;
+    let turn_left = binds.pressed(crate::bindings::Input::TurnLeft);
+    let turn_right = binds.pressed(crate::bindings::Input::TurnRight);
     let side_axis = i32::from(strafe_right) - i32::from(strafe_left)
         + if mouselook {
             i32::from(turn_right) - i32::from(turn_left)

@@ -1,7 +1,8 @@
-//! The engine unit tooltip, in `0x529fe0`'s line order: the name (gold; FrameXML recolours it by
-//! reaction), the creature subtitle, the level line, the faction name, then "PvP", "Skinnable",
-//! "Civilian" and "Leader", with health on the `<name>StatusBar` child. The world mouseover drives
-//! it through [`super::UiScript::world_tooltip_unit`]; unit-frame hovers call `SetUnit` from Lua.
+//! The engine unit tooltip, in `0x529fe0`'s line order: the name (gold, decorated by `0x609370`
+//! as `UnitPVPName`'s is; FrameXML recolours it by reaction), the creature subtitle, the level
+//! line, the faction name, then "PvP", "Skinnable", "Civilian" and "Leader", with health on the
+//! `<name>StatusBar` child. The world mouseover drives it through
+//! [`super::UiScript::world_tooltip_unit`]; unit-frame hovers call `SetUnit` from Lua.
 
 use mlua::{Lua, Table};
 
@@ -113,15 +114,17 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
     }
     fire_cleared(lua, h);
     let Some(u) = unit else {
-        set_live_token(lua, h, None);
+        set_subject(lua, h, None);
         show_or_hide_empty(lua, h);
         return Ok(false);
     };
     // The name: `CGUnit_C::GetUnitName` `0x609210` (`0x52a187`), whose every miss falls to
-    // `UNKNOWNOBJECT`, as `UnitName`'s does. A token with no object never reaches the builder
+    // `UNKNOWNOBJECT`, as `UnitName`'s does, then decorated by `0x609370` with the flag a literal
+    // `1` (`0x52a19b`), as `UnitPVPName` does, so no CVar gates it: a ranked player's rank and
+    // medal line, a civilian kill's prefix. A token with no object never reaches the builder
     // (`0x468460`): no plate, and `SetUnit` answers nil.
     let title = match &u.name {
-        Some(n) => n.clone(),
+        Some(name) => super::pvp::pvp_name(lua, &u, name, player_level),
         None => unknownobject(lua)?.to_str()?.to_string(),
     };
     append_line(lua, this, (title, GOLD), None, false)?;
@@ -149,7 +152,8 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
     if u.racial_leader && u.pvp {
         append_line(lua, this, ("Leader".into(), WHITE), None, false)?;
     }
-    set_live_token(lua, h, Some(token.to_string()));
+    // An unresolved guid (0) is no subject: nothing can push for it.
+    set_subject(lua, h, Some(u.guid).filter(|&g| g != 0));
     update_bar(lua, h, Some(&u));
     show_or_hide_empty(lua, h);
     Ok(true)
@@ -165,12 +169,12 @@ fn set_world_owned(lua: &Lua, h: FrameHandle) {
     }
 }
 
-/// Remember (or drop) the tooltip's live unit token, the health watcher's key.
-fn set_live_token(lua: &Lua, h: FrameHandle, token: Option<String>) {
+/// Remember (or drop) the guid of the unit the tooltip shows, the health watcher's key.
+fn set_subject(lua: &Lua, h: FrameHandle, guid: Option<u64>) {
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
     if let Some(f) = model.arena.frame_mut(h) {
         if let KindState::Tooltip(t) = &mut f.kind_state {
-            t.unit_token = token;
+            t.unit_guid = guid;
         }
     }
 }
@@ -227,13 +231,18 @@ fn update_bar(lua: &Lua, h: FrameHandle, unit: Option<&UnitState>) {
     }
 }
 
-/// A `set_unit` push for a tooltip's live token updates its health bar without rebuilding the
-/// lines, as the reference's HEALTH field watcher does.
+/// A `set_unit` push of the unit a tooltip shows updates its health bar without rebuilding the
+/// lines, as the reference's HEALTH field watcher does: it is keyed on the unit's guid (`0x52a0a8`
+/// registers `0x529560` on `+0x368`/`+0x36c`), so a token that stops naming the unit, as
+/// `"mouseover"` does when the hover ends, leaves a fading plate's bar standing.
 pub(super) fn on_unit_push(lua: &Lua, token: &str) {
-    let hits: Vec<FrameHandle> = {
+    let (unit, hits): (UnitState, Vec<FrameHandle>) = {
         let model = lua.app_data_mut::<Model>().expect("model app_data");
+        let Some(unit) = model.pushed_unit(token).filter(|u| u.exists && u.guid != 0) else {
+            return;
+        };
         // Registered frames only, as `update_bar` writes layout.
-        model
+        let hits: Vec<FrameHandle> = model
             .arena
             .tooltip_kinds()
             .iter()
@@ -242,17 +251,17 @@ pub(super) fn on_unit_push(lua: &Lua, token: &str) {
                 model.frame_to_id.contains_key(&h)
                     && matches!(
                         model.arena.frame(h).map(|f| &f.kind_state),
-                        Some(KindState::Tooltip(t)) if t.unit_token.as_deref() == Some(token)
+                        Some(KindState::Tooltip(t)) if t.unit_guid == Some(unit.guid)
                     )
             })
-            .collect()
+            .collect();
+        if hits.is_empty() {
+            return;
+        }
+        (unit.clone(), hits)
     };
     for h in hits {
-        let unit = {
-            let model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.unit(token).cloned().filter(|u| u.exists)
-        };
-        update_bar(lua, h, unit.as_ref());
+        update_bar(lua, h, Some(&unit));
     }
 }
 
