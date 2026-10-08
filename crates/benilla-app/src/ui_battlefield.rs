@@ -16,7 +16,7 @@ use benilla_protocol::messages::{BattlefieldList, BattlefieldStatus};
 use benilla_ui::script::{BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot, UiScript};
 
 use crate::names::NameCache;
-use crate::net::{ClientCommand, EnteredWorldMessage, NetCommands};
+use crate::net::{ClientCommand, NetCommands, WorldEnterCascadeMessage};
 use crate::player::Player;
 use crate::ui_dialog_verbs::BattlefieldQueue;
 use crate::ui_party::GroupState;
@@ -153,11 +153,12 @@ fn slot_view(
         let deadline = *at + std::time::Duration::from_millis(u64::from(delta));
         view.port_expiration_ms = ms(deadline.saturating_duration_since(now));
     }
-    // Status 1: the raw estimate, and `[slot+0x1c] = now − Δ` read back as `now − stamp`.
+    // Status 1: the raw estimate, and `[slot+0x1c] = now − Δ` read back as `now − stamp`, which is
+    // the time since the status plus Δ, taken forwards so no `Instant` precedes the clock's origin.
     if let Some((estimate, waited)) = status.queued {
         view.estimated_wait_ms = estimate;
-        let stamp = *at - std::time::Duration::from_millis(u64::from(waited));
-        view.time_waited_ms = ms(now.saturating_duration_since(stamp));
+        let since = now.saturating_duration_since(*at);
+        view.time_waited_ms = ms(since + std::time::Duration::from_millis(u64::from(waited)));
     }
     view
 }
@@ -211,9 +212,8 @@ fn feed_battlefield(
 
     let slots = queue
         .slots()
-        .iter()
-        .map(|s| slot_view(s.as_ref(), catalog, now))
-        .collect();
+        .each_ref()
+        .map(|s| slot_view(s.as_ref(), catalog, now));
     script.set_battlefield_queue(slots, queue.instance_expiration_ms(now));
 
     if std::mem::take(&mut state.show) {
@@ -307,15 +307,16 @@ fn drain_battlefield(
     }
 }
 
-/// World enter (`0x4a9db0`): the list, the selection and the anchor clear, the queue slots stay,
-/// and the bodyless `CMSG_BATTLEFIELD_STATUS` goes out, answered slot by slot.
-fn reset_on_world_enter(
-    mut entered: MessageReader<EnteredWorldMessage>,
+/// The world-enter cascade's battlefield init (`0x4909fb` → `0x4a9db0`), after the mail query: the
+/// list, the selection and the anchor clear, the queue slots stay, and the bodyless
+/// `CMSG_BATTLEFIELD_STATUS` goes out, answered slot by slot.
+pub(crate) fn reset_on_world_enter(
+    mut cascades: MessageReader<WorldEnterCascadeMessage>,
     mut state: ResMut<Battlefield>,
     script: Option<NonSendMut<UiScript>>,
     commands: Res<NetCommands>,
 ) {
-    if entered.read().next().is_none() {
+    if cascades.read().next().is_none() {
         return;
     }
     state.clear_session();
@@ -362,6 +363,7 @@ impl Plugin for BattlefieldPlugin {
             (
                 reset_on_world_enter
                     .in_set(crate::ui_script::UiFeed)
+                    .after(crate::ui_mail::send_query_next_mail_time_on_enter)
                     .before(feed_battlefield),
                 feed_battlefield
                     .before(crate::ui_battlefield_score::feed_battlefield_score)
@@ -388,6 +390,26 @@ mod tests {
             in_progress: None,
             queued: None,
         }
+    }
+
+    #[test]
+    fn a_waited_span_longer_than_any_uptime_reads_forwards() {
+        let at = Instant::now();
+        let mut queued = status(0, 489, 1);
+        queued.queued = Some((0, u32::MAX));
+        let v = slot_view(Some(&(queued.clone(), at)), None, at);
+        assert_eq!(
+            v.time_waited_ms,
+            u32::MAX,
+            "49.7 days waited, no stamp needed"
+        );
+        let later = at + std::time::Duration::from_secs(9);
+        let v = slot_view(Some(&(queued, at)), None, later);
+        assert_eq!(
+            v.time_waited_ms,
+            u32::MAX,
+            "saturates as the getter's u32 does"
+        );
     }
 
     #[test]

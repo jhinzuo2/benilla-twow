@@ -19,7 +19,7 @@ use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{
-    ClientCommand, EnteredWorldMessage, NetCommands, ObjectStore, Objects, SelfPlayer,
+    ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer, WorldEnterCascadeMessage,
 };
 use crate::query_cache::QueryCache;
 use crate::ui_script::{UiFeed, UiInput};
@@ -50,6 +50,21 @@ const STATIONERY_ICON_GM: &str = "Interface\\Icons\\Mail_GMIcon";
 /// The `Stationery.dbc` catalog; without it every mail gets the default backdrop.
 #[derive(Resource)]
 pub(crate) struct Stationery(pub(crate) benilla_formats::StationeryCatalog);
+
+/// `Package.dbc`'s rows, in file order; without them `GetNumPackages()` answers 0.
+#[derive(Resource)]
+pub(crate) struct Packages(pub(crate) Vec<benilla_formats::PackageRow>);
+
+/// A package row as the engine answers it: the icon under `StringLookups.dbc` row 3's folder
+/// (`0x4ae4ab`, the `"%s%s"` of folder and `\`, then the basename appended).
+fn package_view(row: &benilla_formats::PackageRow) -> benilla_ui::script::PackageView {
+    benilla_ui::script::PackageView {
+        id: row.id,
+        name: row.name.clone(),
+        icon: format!("Interface\\Icons\\{}", row.icon),
+        cost: row.cost,
+    }
+}
 
 /// A `SEND` result queued for [`feed_mail`]. `MAIL_FAILED` fires on every one, success included:
 /// the reference uses it as "the send resolved" (`0x4ad15f`), and the stock handler only
@@ -160,21 +175,22 @@ impl Plugin for UiMailPlugin {
                     close_npc_session_out_of_range::<MailOpen>.before(feed_mail),
                     feed_mail.after(crate::ui_unit::UnitFeed).in_set(UiFeed),
                     drain_mail.after(UiInput),
-                    send_query_next_mail_time_on_enter,
+                    // The cascade's order: the time query, this, then the battlefield status.
+                    send_query_next_mail_time_on_enter.after(crate::net::send_query_time),
                 ),
             );
     }
 }
 
-/// `MSG_QUERY_NEXT_MAIL_TIME` at every world enter, from the mail module's init in the world-enter
-/// cascade (`0x4908c0`). The init stamps "no mail" first, so the icon goes dark across a loading
-/// screen until the reply.
-fn send_query_next_mail_time_on_enter(
-    mut entered: MessageReader<EnteredWorldMessage>,
+/// `MSG_QUERY_NEXT_MAIL_TIME` at each world-enter cascade, from the mail init (`0x4acb10`, called
+/// at `0x4909f6`), after the time query and before the battlefield status. The init stamps "no
+/// mail" first (`0x4acb87`).
+pub(crate) fn send_query_next_mail_time_on_enter(
+    mut cascades: MessageReader<WorldEnterCascadeMessage>,
     commands: Res<NetCommands>,
     mut pending: ResMut<MailPending>,
 ) {
-    if entered.read().next().is_some() {
+    if cascades.read().next().is_some() {
         pending.on_query_sent();
         let _ = commands.0.send(ClientCommand::QueryNextMailTime);
     }
@@ -422,6 +438,9 @@ struct MailFeedExtras<'w, 's> {
     enchants: Option<Res<'w, crate::items::Enchants>>,
     sink: crate::ui_action::MessageSink<'w>,
     stationeries: Local<'s, crate::ui_script::VmMemo<Vec<StationeryView>>>,
+    packages: Option<Res<'w, Packages>>,
+    /// The package rows went to this VM.
+    packages_pushed: Local<'s, crate::ui_script::VmMemo<bool>>,
 }
 
 fn feed_mail(
@@ -451,7 +470,16 @@ fn feed_mail(
         enchants,
         mut sink,
         stationeries: mut last_stationeries,
+        packages,
+        mut packages_pushed,
     } = extras;
+    if let Some(packages) = packages.as_deref() {
+        let pushed = packages_pushed.get(&script);
+        if !*pushed {
+            *pushed = true;
+            script.set_mail_packages(packages.0.iter().map(package_view).collect());
+        }
+    }
     let rolls = crate::items::RollCatalogs {
         props: props.as_deref(),
         enchants: enchants.as_deref(),
@@ -538,14 +566,14 @@ fn feed_mail(
         script.set_mail_stationeries(usable);
     }
     if opened {
-        // The selection clears on open and close (`0x4ace07`); `MAIL_SHOW`'s reset picks row 1.
-        script.clear_stationery();
-        // The open core (`0x4acd10`) resets the compose tab before `MAIL_SHOW`; the reset's
+        // The open core (`0x4acd10`) resets the compose tab before `MAIL_SHOW`, the stationery
+        // selection with it (`0x4ace07`), which `MAIL_SHOW`'s reset re-picks as row 1; the reset's
         // `MAIL_SEND_SUCCESS`, page-turn sound and all, is the reference's too.
         script.reset_compose_tab();
         script.fire_event("MAIL_SHOW", vec![]);
     } else if closed {
-        script.clear_stationery();
+        // The close core's silent reset (`0x4acd50` → `0x4acdc0(0)`).
+        script.reset_compose_tab_silently();
         script.fire_event("MAIL_CLOSED", vec![]);
         // The close core's tail (`0x4acdad`, `0x4acdb1`): after a read, or an arrival while open,
         // re-ask the server, stamping "no mail". `CloseMail` and the range close both land here.
@@ -699,6 +727,8 @@ fn drain_mail(
                 item_guid: item_guid.unwrap_or(0),
                 money: req.money,
                 cod: req.cod,
+                // The package id rides only with an item (`0x4ae8f3`).
+                package: if item_guid.is_some() { req.package } else { 0 },
             });
         }
     }
@@ -712,6 +742,22 @@ fn drain_mail(
 mod tests {
     use super::*;
     use benilla_protocol::messages::MailAttachment;
+
+    /// `GetPackageInfo`'s icon is the basename under `Interface\Icons` (`0x4ae4c6`, `0x4ae4eb`).
+    #[test]
+    fn a_package_row_answers_its_icon_under_the_icon_folder() {
+        let view = package_view(&benilla_formats::PackageRow {
+            id: 2,
+            icon: "INV_BOX_04".into(),
+            cost: 10,
+            name: "Test Package".into(),
+        });
+        assert_eq!(view.icon, "Interface\\Icons\\INV_BOX_04");
+        assert_eq!(
+            (view.id, view.cost, view.name.as_str()),
+            (2, 10, "Test Package")
+        );
+    }
 
     /// The result table at `0x4ad17c` (indexed at `0x4ad1a0`), asserted as the message ids its
     /// arms push.

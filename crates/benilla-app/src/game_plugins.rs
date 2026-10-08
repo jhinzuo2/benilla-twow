@@ -228,8 +228,6 @@ impl PluginGroup for GamePlugins {
             .add(crate::raid_marks::RaidMarksPlugin)
             .add(crate::vplates::VPlatesPlugin)
             .add(crate::chat_bubble::ChatBubblePlugin)
-            // TOGGLEUI (`ALT-Z`): the whole quad layer goes dark, leaving the world and the cursor.
-            .add(crate::ui_hide::UiHidePlugin)
             .add(UiItemsPlugin)
             .add(UiGossipPlugin)
             .add(UiMerchantPlugin)
@@ -665,16 +663,37 @@ pub(crate) mod schedule_tests {
     /// - `ui_quest::lines::feed_quest_lines` against `ui_items::feed_item_stats` and
     ///   `ui_tooltip::feed_spell_tooltips` over `Items` and the VM: it only reads templates, which
     ///   those two do not write, and a chat line commutes with their pushes;
-    /// - `spell::targeting::drain_spell_target_unit` against the lone `.after(UiInput)` cast
-    ///   drains over the `CastLadder`, and the party, pet-book and chat drains over the unit-token
-    ///   resolver: the class `drop_item_on_unit` and the world click's legs already carry, as none
-    ///   of those drains orders against the target chain. A cast press and a unit-frame bind in one
-    ///   frame take either order until the cast drains share a set that does.
+    /// - `script_calls::apply_script_calls`, in the target chain, against the `.after(UiInput)`
+    ///   drains of gestures that are not such script calls (the ATTACKTARGET binding, the
+    ///   item-pick commit, the GameObject openers, the chat, party, duel, trade and death drains)
+    ///   over the `CastLadder`, the selection and the unit-token resolver: the class
+    ///   `drop_item_on_unit` and the world click's legs already carry, as none of those drains
+    ///   orders against the target chain. Such a gesture and a script call in one frame take
+    ///   either order;
+    /// - the range compare's readers (`ui_action::state::feed_action_state`,
+    ///   `ui_tooltip::spell_feed::feed_spell_tooltips`, `spell::targeting::feed_targeting_to_vm`,
+    ///   the targeting cursor and the object-click commit) against the writers of `Player` and
+    ///   `RemoteMotion` (`camera_saved::load_camera_pose`, `world_focus`'s focus publish and settle
+    ///   release, `transport::compose_riders` and `ground_deck_riders`): the readers take the
+    ///   movement flags of the caster (`Player::move_flags`) and its target
+    ///   (`RemoteMotion::flags`), and those writers touch `login_pitch`, the settle fields and a
+    ///   rider's pose, never the flags;
+    /// - Click to Move's steer and arrival (`player::approach::steer_approach`,
+    ///   `target::click::act_on_arrival`) against what `steer_follow` and `act_on_right_click`
+    ///   already pair with: the steer is chained after follow's and writes the same `Player`
+    ///   fields, the arrival runs the click's dispatchers, and their `Transform` reads are the
+    ///   disjoint-lane kind. The dispatchers also carry the walk's start (`Player`,
+    ///   `FollowState`, `Approach`, the stand request), which only a click, an arrival or a
+    ///   crate's interaction writes;
+    /// - a crate's interaction (`target::click::act_on_interact`) against what
+    ///   `act_on_right_click` and the cursor classifier already pair with: it runs the click's
+    ///   dispatchers over the classifier's reading of its object, and its attack leg
+    ///   selects as the click does, so it writes `Selection` where the click's drain does.
     ///
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
     /// that commutes by construction belongs in [`Classes`].
-    const UPDATE_ACTIONABLE_CEILING: usize = 5_481;
+    const UPDATE_ACTIONABLE_CEILING: usize = 4_980;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1103,7 +1122,7 @@ pub(crate) mod schedule_tests {
         ("ui_bank/mod.rs", "feed_bank", Because::PlayerRoundTrip,
          "`BankErrors` answers a `BuyBankSlot` click; the OPENED edge rides `VmMemo`s"),
         ("ui_battlefield.rs", "feed_battlefield", Because::SelfHealing,
-         "`reset_on_world_enter` runs before it, clears the session and re-sends `BattlefieldStatusRequest`"),
+         "`reset_on_world_enter` runs before it at each world-enter cascade, clears the session and re-sends `BattlefieldStatusRequest`"),
         ("ui_binder.rs", "feed_binder", Because::PlayerRoundTrip,
          "`SMSG_BINDER_CONFIRM` only answers the innkeeper's gossip line"),
         ("ui_char.rs", "feed_char", Because::MemoLatched,
@@ -1111,7 +1130,7 @@ pub(crate) mod schedule_tests {
         ("ui_chat/recruitment.rs", "guild_recruitment_cascade", Because::SelfHealing,
          "`pending` is held until the zone mask and zone id are settled, which happens on the entry VM"),
         ("ui_dialog_verbs.rs", "feed_meeting_stone", Because::SelfHealing,
-         "the query is sent once per VM (`asked: VmMemo<bool>`), so the entry VM re-asks and the reply lands after the UI is up"),
+         "the query waits for the world-enter cascade (`meeting_stone_enter_world`), our own create a server round trip past the login edge, and every `/reload` re-asks onto its new VM"),
         ("ui_duel.rs", "feed_duel", Because::PlayerRoundTrip,
          "a duel exists only after someone's Duel cast, and the server ends any duel at logout; FINISHED/bounds ride `VmMemo<FedDuel>` (another player's act: coincidence-only residual)"),
         ("ui_follow.rs", "feed_follow", Because::MemoLatched,
@@ -1128,12 +1147,12 @@ pub(crate) mod schedule_tests {
          "`told` is a `VmMemo` inside the session (a fresh VM re-begins), and the open is a player click"),
         ("ui_items/drain.rs", "drain_container_destroys", Because::FilledByVm,
          "`take_container_destroys` is a VM-owned queue filled by Lua's `DeleteCursorItem`"),
-        ("ui_items/drain.rs", "drain_container_uses", Because::FilledByVm,
-         "`take_container_uses` and `take_container_repairs` are Lua intents held by the VM"),
         ("ui_logout.rs", "feed_logout", Because::PlayerRoundTrip,
          "both packets answer the `CMSG_LOGOUT_REQUEST`/cancel the game menu sent"),
         ("ui_loot/mod.rs", "drain_loot", Because::Deliberate,
          "the pre-VM take of `LootMoveStart` is documented at the line and publishes nothing to the VM; the event-firing takes are Lua's queues"),
+        ("ui_loot/mod.rs", "feed_loot", Because::PlayerRoundTrip,
+         "it takes `LootMoveStart` only on a window it has just opened, which answers a loot click"),
         ("ui_loot_roll.rs", "drain_loot_rolls", Because::FilledByVm,
          "only a Need/Greed/Pass click queues a confirm or vote, held in the VM"),
         ("ui_loot_roll.rs", "feed_loot_rolls", Because::PlayerRoundTrip,

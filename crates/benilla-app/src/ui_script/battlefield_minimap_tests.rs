@@ -4,20 +4,16 @@
 
 use benilla_ui::script::{
     BattlefieldFlagView, BattlefieldPositionView, QuadContent, UiScript, UnitState,
-    WorldMapContinentView, WorldMapLandmarkView, WorldMapOverlayView, WorldMapZoneView,
+    WorldMapContinentView, WorldMapLandmarkSource, WorldMapOverlayView, WorldMapZoneView,
     WorldStateUiView, ARROW_MODEL,
 };
 
-/// The manifest's one warning. Deviation: `gxRefresh`, read at `OptionsFrame.lua:300`, is not
-/// registered, because nothing here can set a refresh rate.
-const MANIFEST_WARNINGS: [&str; 1] = ["unknown CVar 'gxRefresh' (not host-registered) — ignored"];
-
 fn quiet(s: &UiScript) {
     assert!(s.errors().is_empty(), "script errors: {:#?}", s.errors());
-    assert_eq!(
-        s.warnings(),
-        MANIFEST_WARNINGS,
-        "host warnings beyond the manifest's own"
+    assert!(
+        s.warnings().is_empty(),
+        "host warnings: {:#?}",
+        s.warnings()
     );
 }
 
@@ -415,14 +411,17 @@ fn the_poi_pool_grows_from_the_landmarks_and_parks_its_tail() {
     open(&mut s);
     assert_eq!(s.eval::<i64>("return NUM_BATTLEFIELDMAP_POIS").unwrap(), 0);
 
-    let landmark = |name: &str, icon: u32, uv: (f32, f32)| WorldMapLandmarkView {
+    // A world position here is already map UV, so a landmark source sits where it says.
+    s.set_world_loc_projector(Box::new(|_, _, x, y| Some((x, y))));
+    let landmark = |name: &str, icon: u32, uv: (f32, f32)| WorldMapLandmarkSource {
         name: name.into(),
         description: String::new(),
-        texture_index: icon,
-        uv,
+        map: 0,
+        pos: uv,
+        icons: [Some(icon); 3],
     };
     // Icon 6 is `ICON_POI_REDFLAG`, icon 9 the second row's first cell of the 8×8 `POIIcons` atlas.
-    s.set_world_map_landmarks(vec![
+    s.set_world_map_landmark_sources(vec![
         landmark("Silverwing Flag", 6, (0.25, 0.5)),
         landmark("Warsong Flag", 9, (0.75, 0.25)),
     ]);
@@ -470,7 +469,7 @@ fn the_poi_pool_grows_from_the_landmarks_and_parks_its_tail() {
         "DEFAULT_POI_ICON_SIZE × GetBattlefieldMapIconScale()"
     );
 
-    s.set_world_map_landmarks(vec![landmark("Warsong Flag", 9, (0.75, 0.25))]);
+    s.set_world_map_landmark_sources(vec![landmark("Warsong Flag", 9, (0.75, 0.25))]);
     s.tick(0.0);
     assert_eq!(
         s.eval::<i64>("return NUM_BATTLEFIELDMAP_POIS").unwrap(),

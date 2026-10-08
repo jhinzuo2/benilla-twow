@@ -7,8 +7,10 @@ use std::io;
 
 use crate::wire::{read_cstring, read_f32_le, read_i32_le, read_u32_le, read_u64_le, read_u8};
 
-/// One item template, as `SMSG_ITEM_QUERY_SINGLE_RESPONSE` carries it.
-#[derive(Debug, Clone, PartialEq)]
+/// One item template, as `SMSG_ITEM_QUERY_SINGLE_RESPONSE` carries it. `Default` is for a caller
+/// that knows some of these fields and not the rest, such as a look resolved from a reference
+/// table; the wire decoder fills every field and does not use it.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ItemInfo {
     pub class: u32,
     pub subclass: u32,

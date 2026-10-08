@@ -25,7 +25,7 @@ use benilla_protocol::{
 };
 use crossbeam_channel::{Receiver, Sender};
 
-use super::{CharRequest, ChatKind, ClientCommand, RealmRequest};
+use super::{CharRequest, ClientCommand, RealmRequest};
 
 /// The inbound census: every packet off the world socket, and the unix ms of the latest, which
 /// tell a silent server from a dead socket for the runaway watch ([`crate::net::motion`]).
@@ -190,6 +190,10 @@ pub(super) struct NetHandles {
 
 /// Spawns the read thread with its park and cycle loop, and the one long-lived write thread.
 pub(super) fn spawn_net(connect: bool) -> NetHandles {
+    // The outbound opcode trace (tag `out`), armed before any thread can send.
+    if benilla_assets::trace::enabled_for("out") {
+        benilla_protocol::observe_sends(trace_out);
+    }
     let (events_tx, events_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let (pick_tx, pick_rx) = crossbeam_channel::unbounded::<CharRequest>();
@@ -607,8 +611,9 @@ fn run(
             .find(|c| c.guid == guid)
             .map(|c| c.name.clone())
             .unwrap_or_default();
+        // No `CMSG_SET_ACTIVE_MOVER` here: it waits for our own player's create, as the
+        // reference's does (`super::enter_world_on_self_create`); a server may drop it before then.
         session.player_login(refuse_once(guid))?;
-        session.set_active_mover(guid)?;
 
         let billing_time_rested = session.billing_time_rested();
         let tutorial_flags = session.take_tutorial_flags();
@@ -762,18 +767,16 @@ fn refuse_once(guid: u64) -> u64 {
     }
 }
 
-/// Drains the writer's sent-packet log into the trace as `out` lines, one per packet that reached
-/// the socket; a no-op unless the `out` tag armed it.
-fn trace_sends(w: &mut WorldWriter) {
-    w.drain_sent(|opcode, len| {
-        benilla_assets::trace::line(
-            "out",
-            &format!(
-                "{opcode:#06x} {} len={len}",
-                benilla_protocol::messages::opcode_name(opcode).unwrap_or("?")
-            ),
-        );
-    });
+/// One `out` trace line per client packet written to the world socket, whichever session or writer
+/// sent it: the hook [`spawn_net`] installs when the `out` tag is on.
+fn trace_out(opcode: u16, len: usize) {
+    benilla_assets::trace::line(
+        "out",
+        &format!(
+            "{opcode:#06x} {} len={len}",
+            benilla_protocol::messages::opcode_name(opcode).unwrap_or("?")
+        ),
+    );
 }
 
 /// The write thread: app commands, writer swaps and the [`PING_INTERVAL`] keepalive. With no live
@@ -791,11 +794,7 @@ fn writer_loop(
     loop {
         crossbeam_channel::select! {
             recv(writer_rx) -> w => match w {
-                Ok(mut w) => {
-                    // Arm the outbound opcode trace (tag `out`); a fresh socket starts a fresh log.
-                    if benilla_assets::trace::enabled_for("out") {
-                        w.watch_sends();
-                    }
+                Ok(w) => {
                     writer = Some(w);
                     warned = 0;
                     // Sequence 1 is the new socket's first ping, so an old socket's pong cannot
@@ -832,7 +831,6 @@ fn writer_loop(
                             warned += 1;
                         }
                     }
-                    trace_sends(w);
                 }
             },
             recv(cmd_rx) -> cmd => {
@@ -920,27 +918,12 @@ fn writer_loop(
                     ClientCommand::CancelAutoRepeat => w.cancel_auto_repeat(),
                     ClientCommand::CancelCast { spell_id } => w.cancel_cast(spell_id),
                     ClientCommand::CancelChannelling { spell_id } => w.cancel_channelling(spell_id),
-                    ClientCommand::Chat { kind, target, text } => match kind {
-                        ChatKind::Say => w.send_chat(&text),
-                        ChatKind::Yell => w.send_yell(&text),
-                        ChatKind::Emote => w.send_emote_chat(&text),
-                        ChatKind::Whisper => {
-                            w.send_whisper(target.as_deref().unwrap_or_default(), &text)
-                        }
-                        ChatKind::Party => w.send_party(&text),
-                        ChatKind::Raid => w.send_raid(&text),
-                        ChatKind::RaidLeader => w.send_raid_leader(&text),
-                        ChatKind::RaidWarning => w.send_raid_warning(&text),
-                        ChatKind::Guild => w.send_guild(&text),
-                        ChatKind::Officer => w.send_officer(&text),
-                        ChatKind::Battleground => w.send_battleground(&text),
-                        ChatKind::BattlegroundLeader => w.send_battleground_leader(&text),
-                        ChatKind::Afk => w.send_afk(&text),
-                        ChatKind::Dnd => w.send_dnd(&text),
-                        ChatKind::Channel => {
-                            w.send_channel(target.as_deref().unwrap_or_default(), &text)
-                        }
-                    },
+                    ClientCommand::Chat {
+                        kind,
+                        target,
+                        text,
+                        language,
+                    } => w.send_message_chat(kind.chat_type(), language, target.as_deref(), &text),
                     // The distribution is an enum, so its map to a chat type is total.
                     ClientCommand::AddonMessage { distribution, text } => {
                         w.send_addon_message(super::addon_wire_chat_type(distribution), &text)
@@ -1247,14 +1230,15 @@ fn writer_loop(
                         subject,
                         body,
                         stationery,
+                        package,
                         item_guid,
                         money,
                         cod,
                     } => w.send_mail(
                         mailbox, &receiver, &subject, &body,
-                        // The chosen stationery and package 0, as the reference sends; vmangos
-                        // stores `MAIL_STATIONERY_DEFAULT` (41) regardless.
-                        stationery, 0, item_guid, money, cod,
+                        // vmangos stores `MAIL_STATIONERY_DEFAULT` (41) regardless of the chosen
+                        // stationery, and reads the package id (`Packets/Mail.cpp:10`) unused.
+                        stationery, package, item_guid, money, cod,
                     ),
                     ClientCommand::MailTakeMoney { mailbox, mail_id } => {
                         w.mail_take_money(mailbox, mail_id)
@@ -1349,6 +1333,7 @@ fn writer_loop(
                     ClientCommand::ClearTradeItem { trade_slot } => w.clear_trade_item(trade_slot),
                     ClientCommand::Logout => w.logout_request(),
                     ClientCommand::LogoutCancel => w.logout_cancel(),
+                    ClientCommand::OpeningCinematic => w.opening_cinematic(),
                     ClientCommand::CompleteCinematic => w.complete_cinematic(),
                     ClientCommand::NextCinematicCamera => w.next_cinematic_camera(),
                     ClientCommand::MoveModeAck {
@@ -1490,8 +1475,6 @@ fn writer_loop(
                         warned += 1;
                     }
                 }
-                // What reached the socket, by name (tag `out`); one command can be several packets.
-                trace_sends(w);
             },
         }
     }
