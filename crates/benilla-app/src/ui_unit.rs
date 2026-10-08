@@ -1694,6 +1694,8 @@ mod tests {
         assert_eq!(memo.last_level, None, "its level is a first sighting, not a ding");
         assert_eq!(memo.last_xp, None);
         assert!(!memo.entered_world, "and it enters the world again");
+    }
+
     /// `"mouseover"` resolves through the pick the tooltip publishes: the hovered unit, until a
     /// nearer GameObject wins it and the resolver rejects the GameObject's guid (`0x515bd9 je`).
     #[test]
