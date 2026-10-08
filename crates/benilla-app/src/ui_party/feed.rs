@@ -325,6 +325,7 @@ pub(super) fn feed_party(
                 own_group.clone(),
                 chr,
                 types,
+                names.player_traits(m.guid).map(|(_, class, _)| class),
             )
         });
         if fed.units[i] != snap {
@@ -410,6 +411,7 @@ pub(super) fn feed_party(
                     own_group.clone(),
                     chr,
                     types,
+                    names.player_traits(m.guid).map(|(_, class, _)| class),
                 ))
             }
         });
@@ -764,6 +766,8 @@ fn member_unit_state(
     classes: Option<&benilla_formats::ChrClasses>,
     // The creature type resolves from the live descriptor alone, so an unstreamed member has none.
     types: CreatureTypeSources<'_>,
+    // The name cache's class byte, the one `GetRaidRosterInfo` reads, for a member with no object.
+    class_byte: Option<u8>,
 ) -> UnitState {
     let class = class_byte.and_then(crate::ui_unit::class_names);
     let mut s = match store {
@@ -1529,6 +1533,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            None,
         );
         assert_eq!(
             (s.health, s.max_health),
@@ -1552,6 +1557,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            None,
         );
         assert_eq!((bare.health, bare.max_health, bare.power), (0, 0, 0));
         assert!(bare.exists);
@@ -1566,12 +1572,30 @@ mod tests {
             flags: 0,
         };
         let group = GroupState::default();
-        let s = member_unit_state(&m, None, None, &group, None, Default::default(), Some(1));
+        let s = member_unit_state(
+            &m,
+            None,
+            None,
+            &group,
+            None,
+            None,
+            Default::default(),
+            Some(1),
+        );
         assert_eq!(
             (s.class.as_deref(), s.class_file.as_deref()),
             (Some("Warrior"), Some("WARRIOR"))
         );
-        let s = member_unit_state(&m, None, None, &group, None, Default::default(), None);
+        let s = member_unit_state(
+            &m,
+            None,
+            None,
+            &group,
+            None,
+            None,
+            Default::default(),
+            None,
+        );
         assert_eq!((s.class, s.class_file), (None, None));
     }
 
@@ -1598,6 +1622,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            None,
         );
         assert!(
             s.dead,
@@ -1617,6 +1642,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            None,
         );
         assert!(s.ghost);
         assert!(!s.dead, "a released ghost is not `dead` — only a ghost");
@@ -1634,6 +1660,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            None,
         );
         assert!(s.dead);
     }
