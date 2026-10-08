@@ -92,6 +92,8 @@ fn main() {
     // matters on Android (crash vs. clean quit vs. app-switch), that would need to be surfaced
     // through something Android-specific instead — not attempted here.
     let _ = benilla_app::run(BuildId {
+        version: env!("CARGO_PKG_VERSION"),
+        describe: env!("BENILLA_GIT_DESCRIBE"),
         sha: env!("BENILLA_GIT_SHA"),
         short: env!("BENILLA_GIT_SHORT"),
         date: env!("BENILLA_GIT_DATE"),
