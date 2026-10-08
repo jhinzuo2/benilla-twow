@@ -523,4 +523,45 @@ mod tests {
             }
         }
     }
+
+    /// `IsWindowsClient` (`0x48c960`) pushes 1 and `IsLinuxClient` (`0x48c990`) nil, one value
+    /// each; `GetDebugStats` (`0x488af0`) pushes none.
+    #[test]
+    fn the_platform_queries_and_debug_stats_answer_the_pc_build() {
+        let s = UiScript::new().unwrap();
+        assert_eq!(s.arity("IsWindowsClient()").unwrap(), 1);
+        assert_eq!(s.eval::<f64>("return IsWindowsClient(0)").unwrap(), 1.0);
+        assert_eq!(s.arity("IsLinuxClient()").unwrap(), 1);
+        assert!(s.eval::<bool>("return IsLinuxClient() == nil").unwrap());
+        assert_eq!(s.arity("GetDebugStats()").unwrap(), 0);
+    }
+
+    /// Each `OpeningCinematic()` queues one send and returns nothing.
+    #[test]
+    fn opening_cinematic_queues_one_send_per_call() {
+        let mut s = UiScript::new().unwrap();
+        assert_eq!(s.arity("OpeningCinematic()").unwrap(), 0);
+        s.run("OpeningCinematic(1)").unwrap();
+        assert_eq!(s.take_opening_cinematic_asks(), 2);
+        assert_eq!(
+            s.take_opening_cinematic_asks(),
+            0,
+            "the drain empties the queue"
+        );
+    }
+
+    /// The three setters never raise, whatever they are handed, and return zero values.
+    #[test]
+    fn the_stateless_setters_take_any_argument() {
+        let s = UiScript::new().unwrap();
+        for name in ["SetEuropeanNumbers", "SetLayoutMode", "SetConsoleKey"] {
+            for arg in ["", "nil", "1", "\"x\"", "{}", "\"ESCAPE\""] {
+                assert_eq!(
+                    s.arity(&format!("{name}({arg})")).unwrap(),
+                    0,
+                    "{name}({arg})"
+                );
+            }
+        }
+    }
 }

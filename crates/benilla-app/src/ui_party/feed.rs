@@ -325,7 +325,6 @@ pub(super) fn feed_party(
                 own_group.clone(),
                 chr,
                 types,
-                names.player_traits(m.guid).map(|(_, class, _)| class),
             )
         });
         if fed.units[i] != snap {
@@ -411,7 +410,6 @@ pub(super) fn feed_party(
                     own_group.clone(),
                     chr,
                     types,
-                    names.player_traits(m.guid).map(|(_, class, _)| class),
                 ))
             }
         });
@@ -766,8 +764,6 @@ fn member_unit_state(
     classes: Option<&benilla_formats::ChrClasses>,
     // The creature type resolves from the live descriptor alone, so an unstreamed member has none.
     types: CreatureTypeSources<'_>,
-    // The name cache's class byte, the one `GetRaidRosterInfo` reads, for a member with no object.
-    class_byte: Option<u8>,
 ) -> UnitState {
     let class = class_byte.and_then(crate::ui_unit::class_names);
     let mut s = match store {
@@ -1533,7 +1529,6 @@ mod tests {
             None,
             None,
             Default::default(),
-            None,
         );
         assert_eq!(
             (s.health, s.max_health),
@@ -1557,7 +1552,6 @@ mod tests {
             None,
             None,
             Default::default(),
-            None,
         );
         assert_eq!((bare.health, bare.max_health, bare.power), (0, 0, 0));
         assert!(bare.exists);
@@ -1604,7 +1598,6 @@ mod tests {
             None,
             None,
             Default::default(),
-            None,
         );
         assert!(
             s.dead,
@@ -1624,7 +1617,6 @@ mod tests {
             None,
             None,
             Default::default(),
-            None,
         );
         assert!(s.ghost);
         assert!(!s.dead, "a released ghost is not `dead` — only a ghost");
@@ -1642,7 +1634,6 @@ mod tests {
             None,
             None,
             Default::default(),
-            None,
         );
         assert!(s.dead);
     }
