@@ -947,6 +947,8 @@ mod differential_tests {
 #[cfg(test)]
 mod ppem_tests {
     use super::*;
+    // The trait behind `chain.lock_recover()`; only these tests reach through the mutex directly.
+    use benilla_assets::LockRecover;
 
     fn engine_or_skip() -> Option<TextEngine> {
         match test_engine(1.0) {
