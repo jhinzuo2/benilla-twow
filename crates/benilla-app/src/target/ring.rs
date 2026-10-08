@@ -504,6 +504,8 @@ pub(crate) fn forced_rank(reputations: &Reputations, faction: u32) -> Option<u8>
         .iter()
         .find(|&&(id, _)| id == faction)
         .map(|&(_, rank)| rank.min(7) as u8)
+}
+
 /// Whether two stores are one object: the reference compares object pointers (`UnitReaction`
 /// `0x606200`, `CanCooperate` `0x606ba6`), and an entity holds one store.
 fn same_object(a: &ObjectStore, b: &ObjectStore) -> bool {
