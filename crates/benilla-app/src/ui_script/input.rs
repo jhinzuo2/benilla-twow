@@ -181,7 +181,12 @@ pub(super) fn feed_ui_input(
             (MouseButton::Right, "RightButton"),
             (MouseButton::Middle, "MiddleButton"),
         ] {
-            if buttons.just_pressed(btn) {
+            // Only LEFT gets the touch merge: a tap is a left click, as on desktop.
+            let just_pressed =
+                buttons.just_pressed(btn) || (btn == MouseButton::Left && touch_just_pressed);
+            let just_released =
+                buttons.just_released(btn) || (btn == MouseButton::Left && touch_just_released);
+            if just_pressed {
                 // A left press that would drop into the world (`world_drop_click`: any payload over
                 // terrain or nothing) is consumed now: the drop fires on the release, but the world
                 // click-pick and camera orbit act on the press. Over an object the reference runs

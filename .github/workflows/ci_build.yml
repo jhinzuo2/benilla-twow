@@ -247,6 +247,12 @@ jobs:
           # in.
           targets: aarch64-linux-android
 
+      # `rust-toolchain.toml` pins the channel, so cargo runs on the pinned toolchain, not the
+      # `stable` the action above installed the target into. Add it to the pinned one (run from
+      # the checkout so rustup reads the toolchain file).
+      - name: Add Android target to the pinned toolchain
+        run: rustup target add aarch64-linux-android
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
