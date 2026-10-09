@@ -22,6 +22,9 @@ const HAIR_SUBSTITUTE_VARIATION: u8 = 1;
 /// An atlas rect `(x, y, w, h)` in pixels.
 type Tile = (u32, u32, u32, u32);
 
+/// The 1.12 body atlas edge the tiles are laid out on (`0x475c50`).
+const ATLAS_SIZE: u32 = 256;
+
 /// The head strip of the 256² partition `0x475c50` writes: g8 the upper band, g9 the lower.
 const TILE_G8: Tile = (0, 160, 128, 32);
 const TILE_G9: Tile = (0, 192, 128, 64);
@@ -531,6 +534,10 @@ pub fn equip_region_candidates(layer: usize, name: &str, sex: u8) -> [String; 2]
 
 /// Source-over blit of an overlay's mip pyramid at `tile`, level by level, from the overlay's own
 /// origin (`0x4770f0`: src `(0,0)`, extent the tile); an opaque texel copies, the client's REPLACE.
+///
+/// Deviation: an HD texture patch ships skins and overlays at a whole multiple of the 1.12 size.
+/// The tile scales by the atlas's multiple of 256 and the overlay is resampled (nearest) by its own
+/// multiple of the tile, so mixed stock and HD art still lands in place. At 1× both are identity.
 fn blit_over(dst: &mut BlpMipChain, src: &BlpMipChain, tile: Tile) {
     // Both chains must be decoded RGBA: DXT blocks would blend into garbage without failing.
     debug_assert!(
@@ -538,23 +545,27 @@ fn blit_over(dst: &mut BlpMipChain, src: &BlpMipChain, tile: Tile) {
         "character-skin compositing needs decoded chains on both sides"
     );
     let (tx, ty, tw, th) = tile;
+    let kd = (dst.width / ATLAS_SIZE).max(1) as usize;
+    let ks = (src.width / tw.max(1)).max(1) as usize;
     let levels = dst.mips.len().min(src.mips.len());
     for i in 0..levels {
         let dw = (dst.width >> i).max(1) as usize;
         let dh = (dst.height >> i).max(1) as usize;
         let sw = (src.width >> i).max(1) as usize;
         let sh = (src.height >> i).max(1) as usize;
-        let (ox, oy) = ((tx >> i) as usize, (ty >> i) as usize);
-        let cw = ((tw >> i).max(1) as usize)
-            .min(sw)
+        let (ox, oy) = ((tx as usize * kd) >> i, (ty as usize * kd) >> i);
+        let cw = ((tw as usize * kd) >> i)
+            .max(1)
+            .min(sw * kd / ks)
             .min(dw.saturating_sub(ox));
-        let ch = ((th >> i).max(1) as usize)
-            .min(sh)
+        let ch = ((th as usize * kd) >> i)
+            .max(1)
+            .min(sh * kd / ks)
             .min(dh.saturating_sub(oy));
         let (d, s) = (&mut dst.mips[i], &src.mips[i]);
         for row in 0..ch {
             for col in 0..cw {
-                let si = (row * sw + col) * 4;
+                let si = (row * ks / kd * sw + col * ks / kd) * 4;
                 let di = ((oy + row) * dw + (ox + col)) * 4;
                 if si + 4 > s.len() || di + 4 > d.len() {
                     continue;
@@ -1229,6 +1240,37 @@ mod tests {
         let before = dst.mips[0].clone();
         blit_over(&mut dst, &chain(1, 1, vec![1, 2, 3, 0]), (0, 0, 1, 1));
         assert_eq!(dst.mips[0], before, "transparent texel is a no-op");
+    }
+
+    #[test]
+    fn blit_over_scales_to_an_hd_atlas() {
+        let red = [255, 0, 0, 255];
+        let at = |c: &BlpMipChain, x: usize, y: usize| {
+            let i = (y * c.width as usize + x) * 4;
+            c.mips[0][i..i + 4].to_vec()
+        };
+        // A 512² atlas: the tile (128, 192, 2, 2) lands at (256, 384) and spans 4×4.
+        let mut dst = chain(512, 512, [0, 0, 0, 255].repeat(512 * 512));
+        blit_over(&mut dst, &chain(2, 2, red.repeat(4)), (128, 192, 2, 2));
+        assert_eq!(
+            at(&dst, 256, 384),
+            red,
+            "1× overlay upscales into the 2× tile"
+        );
+        assert_eq!(at(&dst, 259, 387), red, "and fills all of it");
+        assert_eq!(at(&dst, 260, 384), [0, 0, 0, 255], "and stops at its edge");
+        assert_eq!(at(&dst, 128, 192), [0, 0, 0, 255], "not at the 1× position");
+
+        // A 2× overlay on a 256² atlas downsamples into the 1× tile instead of cropping.
+        let mut dst = chain(256, 256, [0, 0, 0, 255].repeat(256 * 256));
+        let mut src = [0, 0, 255, 255].repeat(16);
+        src[(2 * 4 + 2) * 4..(2 * 4 + 2) * 4 + 4].copy_from_slice(&red);
+        blit_over(&mut dst, &chain(4, 4, src), (0, 0, 2, 2));
+        assert_eq!(
+            at(&dst, 1, 1),
+            red,
+            "texel (1,1) samples the overlay's (2,2)"
+        );
     }
 
     /// On the shipped files a Human male's head and pelvis tiles change, and the torso does not.
