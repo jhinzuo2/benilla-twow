@@ -117,3 +117,12 @@ lto = "off"
 # the leg pin, at one the profile is +0.5, and a cold build is no slower.
 [profile.play.package."*"]
 codegen-units = 1
+
+# iNilla: the iOS app. Release optimisation, built as a static library on Linux (no linker
+# involved) and linked on macOS (`ios/package-ipa.sh`). No LTO — the final link is Apple's and
+# sees an archive — and symbols stay in, so a crash report's backtrace names functions.
+[profile.ios]
+inherits = "release"
+debug = false
+strip = false
+incremental = false

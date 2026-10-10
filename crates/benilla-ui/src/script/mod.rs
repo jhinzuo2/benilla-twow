@@ -55,6 +55,8 @@ mod addon_enable;
 pub mod addon_gate;
 mod char_name;
 mod client;
+// iNilla: the locale `GetLocale()` answers, set from the game data.
+pub use client::set_locale;
 mod clock;
 mod cvars;
 mod dressup;
@@ -129,6 +131,9 @@ pub use object::frame_kind_from_tag;
 mod party;
 mod pet;
 mod petition;
+/// iNilla: plain-value Lua results for hosts outside the VM (the remote console, the HUD
+/// icons) — wenilla's `plain.rs`, carried as-is.
+pub mod plain;
 mod pointer;
 mod pvp;
 mod quest;
