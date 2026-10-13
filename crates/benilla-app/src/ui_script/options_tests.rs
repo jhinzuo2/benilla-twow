@@ -1090,6 +1090,37 @@ fn the_display_mode_dropdown_maps_its_entries_to_the_gx_window_polarity() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// **A chain with no `OptionsFrameSliders`** (the server's patch-9.mpq category window) gets the
+/// server's patch-8.mpq nine rows, and a chain that carries the table keeps its own.
+#[test]
+fn a_chain_without_the_slider_table_gets_the_stock_rows() {
+    benilla_formats::wow_data_or_skip!();
+    let s = harness();
+    // The stock chain's table stays: the fallback does not replace what addons write.
+    assert!(s
+        .eval::<bool>(
+            "local t = OptionsFrameSliders \
+             t[3].maxValue = 15 \
+             BenillaOptionsFrameSliders_Fallback() \
+             return OptionsFrameSliders == t and t[3].maxValue == 15"
+        )
+        .unwrap());
+    s.run("OPTIONS_FARCLIP_MIN, OPTIONS_FARCLIP_MAX = 177, 777 OptionsFrameSliders = nil")
+        .unwrap();
+    s.run("BenillaOptionsFrameSliders_Fallback()").unwrap();
+    assert!(s
+        .eval::<bool>(
+            "local t = OptionsFrameSliders \
+             return table.getn(t) == 9 and t[3].func == 'WorldDetail' \
+             and t[1].minValue == 0.64 and t[1].valueStep == 0.01 \
+             and t[2].minValue == 177 and t[2].maxValue == 777 and t[2].valueStep == 60 \
+             and t[6].func == 'Gamma' and t[6].minValue == -0.5 \
+             and t[8].func == 'spellEffectLevel' and t[9].maxValue == 3"
+        )
+        .unwrap());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// 1.12's Video Options checkbox 5 (`OptionsFrame.lua:9`). Not deferred despite its
 /// `gxRestart = 1`: the present mode changes live.
 #[test]

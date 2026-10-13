@@ -616,6 +616,31 @@
         -- UIOptionsFrame.lua:193-227 re-applies saved uvars, so this window has no load ladder.
 
         -- OptionsFrameSliders is the stock table (OptionsFrame.lua:24-34), which addons write.
+        -- **The table when the chain has none.** The server's patch-9.mpq replaces the video
+        -- window with a category window whose OptionsFrame.lua defines no OptionsFrameSliders, and
+        -- every Graphics row's OnLoad below died indexing nil. Guarded on nil, so a chain that
+        -- carries the table keeps its own rows: they load before us, and addons (pfUI's
+        -- hdgraphic) write them. The rows are the server's patch-8.mpq's, the last carrier.
+        function BenillaOptionsFrameSliders_Fallback()
+            if ( OptionsFrameSliders ~= nil ) then
+                return
+            end
+            -- Transcribed but for the tooltip fields; patch-9's Options.lua keeps the farclip pair.
+            local lo, hi = OPTIONS_FARCLIP_MIN or 177, OPTIONS_FARCLIP_MAX or 777
+            OptionsFrameSliders = {
+                { text = UI_SCALE, func = "uiscale", minValue = 0.64, maxValue = 1.0, valueStep = 0.01 },
+                { text = FARCLIP, func = "farclip", minValue = lo, maxValue = hi, valueStep = (hi - lo) / 10 },
+                { text = ENVIRONMENT_DETAIL, func = "WorldDetail", minValue = 0, maxValue = 2, valueStep = 1 },
+                { text = TERRAIN_MIP, func = "TerrainMip", minValue = 0, maxValue = 1, valueStep = 1 },
+                { text = TEXTURE_DETAIL, func = "BaseMip", minValue = 0, maxValue = 1, valueStep = 1 },
+                { text = GAMMA, func = "Gamma", cvar1 = "gamma", minValue = -0.5, maxValue = 0.5, valueStep = 0.1 },
+                { text = ANISOTROPIC, func = "anisotropic", minValue = 1, maxValue = 4, valueStep = 1 },
+                { text = SPELL_DETAIL, func = "spellEffectLevel", minValue = 0, maxValue = 2, valueStep = 1 },
+                { text = WEATHER_DETAIL, func = "weatherDensity", minValue = 0, maxValue = 3, valueStep = 1 },
+            }
+        end
+        BenillaOptionsFrameSliders_Fallback()
+
         -- Holes at 4, 5 and 7, so the OnShow loop uses the pairs form: ipairs would stop at 3.
         BENILLA_GRAPHICS_SLIDER_ROWS = {
             "RowUiScale", "RowFarclip", "RowWorldDetail",
