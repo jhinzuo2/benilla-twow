@@ -672,8 +672,8 @@ fn physically_down(
     buttons: &ButtonInput<MouseButton>,
 ) -> bool {
     match key {
-        Held::Key(kc) => key_physically_down(kc, keys),
-        Held::Mouse(b) => buttons.pressed(b),
+        Held::Key(kc) => key_physically_down(*kc, keys),
+        Held::Mouse(b) => buttons.pressed(*b),
         // A notch is a press and a release in one frame; it is never "held".
         Held::Wheel => false,
         // iNilla: synthetic holds are released by their owner, not by physical input.
