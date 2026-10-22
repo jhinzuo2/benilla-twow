@@ -84,9 +84,9 @@ fn a_numeric_string_at_a_shape_c_position_is_its_number() {
         T = F:CreateTexture(nil, "ARTWORK")
         T:SetVertexColor(".6", "0.5", " 1 ", 1)
         local r, g, b, a = T:GetVertexColor()
-        -- The colour is stored as an f32, as the reference's is.
-        assert(math.abs(r - 0.6) < 1e-5, "'.6' is 0.6, got " .. tostring(r))
-        assert(math.abs(g - 0.5) < 1e-5, "'0.5' is 0.5, got " .. tostring(g))
+        -- The colour is stored a byte per channel, as the reference's is: within 1/255.
+        assert(math.abs(r - 0.6) < 1 / 255, "'.6' is 0.6, got " .. tostring(r))
+        assert(math.abs(g - 0.5) < 1 / 255, "'0.5' is 0.5, got " .. tostring(g))
         assert(b == 1, "' 1 ' is 1, got " .. tostring(b))
         assert(a == 1, "the alpha slot is untouched")
         "#,
