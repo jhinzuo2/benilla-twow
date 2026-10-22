@@ -73,6 +73,8 @@ fn message(looked_in: &[PathBuf]) -> String {
 /// is `unattended`, so an instrumented run never waits on a click.
 pub(crate) fn fail(err: &NoInstall, unattended: bool) -> AppExit {
     eprintln!("benilla: {}", err.message());
+    // iNilla/Android: no native dialog on the phones (rfd has no backend there); stderr reports it.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if !unattended {
         // Linux shows it through `zenity` and logs nothing when that is missing, which stderr covers.
         rfd::MessageDialog::new()
@@ -82,6 +84,8 @@ pub(crate) fn fail(err: &NoInstall, unattended: bool) -> AppExit {
             .set_buttons(rfd::MessageButtons::Ok)
             .show();
     }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = unattended;
     AppExit::error()
 }
 

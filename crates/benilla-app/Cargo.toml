@@ -54,10 +54,6 @@ fancy-regex = { version = "0.18", default-features = false, features = ["std", "
 libc = "0.2"
 # PNG encoding only: the macOS cursor's NSImage data and screenshots.
 image = { version = "0.25", default-features = false, features = ["png"] }
-# The "no WoW install" error dialog (`no_install`): AppKit, Win32 and, on Linux, `zenity`; no GTK.
-# `xdg-portal` is the Linux backend that carries the message dialog; `wayland` is its file-dialog
-# parent handle, which a message dialog without a parent never reads.
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Thread-to-ECS channels: crossbeam's `Receiver` is `Sync`, so it is a resource without a mutex.
 crossbeam-channel = "0.5"
 benilla-assets = { path = "../benilla-assets", default-features = false }
@@ -173,6 +169,11 @@ bevy = { workspace = true, features = ["android-native-activity"] }
 # a NonSend system) — required for the macOS NSPasteboard path. Covers macOS, Windows, and Linux/BSD
 # under X11; the Wayland backend is `smithay-clipboard` above (decision 0702).
 arboard = "3"
+# The "no WoW install" error dialog (`no_install`): AppKit, Win32 and, on Linux, `zenity`; no GTK.
+# `xdg-portal` is the Linux backend that carries the message dialog; `wayland` is its file-dialog
+# parent handle, which a message dialog without a parent never reads. iNilla/Android: rfd has no
+# backend on either, so it lives in this desktop-only section; the phones report on stderr.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # The login cycle's fake realmd runs the server half of SRP6 (`net::io::cycle_tests`).
 [dev-dependencies]
