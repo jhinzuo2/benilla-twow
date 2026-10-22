@@ -416,11 +416,7 @@ fn classify_touches(
 ///
 /// Mirrors the coordinate conversion the UI pass already does: flip through the window height into
 /// the engine's y-up space, then divide by the seam scale into its 768-virtual units.
-fn hits_ui(
-    script: Option<&benilla_ui::script::UiScript>,
-    win_h: f32,
-    pos: Vec2,
-) -> bool {
+fn hits_ui(script: Option<&benilla_ui::script::UiScript>, win_h: f32, pos: Vec2) -> bool {
     let Some(script) = script else {
         return false;
     };
@@ -458,7 +454,10 @@ mod tests {
         let c = cfg();
         let len = c.dead_zone + 0.01;
         let scaled = (len - c.dead_zone) / (1.0 - c.dead_zone);
-        assert!(scaled < 0.02, "first step outside the dead zone must be small");
+        assert!(
+            scaled < 0.02,
+            "first step outside the dead zone must be small"
+        );
     }
 
     /// 8-way digital output: a clean diagonal lights both axes.

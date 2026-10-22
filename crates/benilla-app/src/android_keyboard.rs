@@ -127,9 +127,7 @@ mod tests {
             .set(ClientState::CharSelect);
         app.update(); // land on CharSelect, not typing yet
         assert!(!app.world().resource::<WasTyping>().0);
-        app.world_mut()
-            .resource_mut::<UiKeyboardCapture>()
-            .typing = true;
+        app.world_mut().resource_mut::<UiKeyboardCapture>().typing = true;
         app.update();
         assert!(app.world().resource::<WasTyping>().0);
     }

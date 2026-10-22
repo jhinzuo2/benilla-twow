@@ -153,7 +153,10 @@ fn drive_stick(
         n.top = Val::Px(centre.y + offset.y - knob * 0.5);
         // A touch brighter once it is actually deflected, so the stick reads as "engaged" at a
         // glance without needing to see the knob's exact position.
-        bg.0
-            .set_alpha(if mv.analog.length() > 0.01 { 0.55 } else { 0.35 });
+        bg.0.set_alpha(if mv.analog.length() > 0.01 {
+            0.55
+        } else {
+            0.35
+        });
     }
 }

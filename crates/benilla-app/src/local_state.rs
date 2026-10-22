@@ -97,7 +97,6 @@ fn resident_home() -> Option<PathBuf> {
         .map(|dir| dir.join(STATE_DIR))
 }
 
-
 /// The current user's Documents folder via the shell API Microsoft documents for exactly this
 /// (`FOLDERID_Documents`), not `%USERPROFILE%\Documents` string-glued by hand: a redirected or
 /// OneDrive-relocated Documents folder — both common, neither the player's fault — lives somewhere

@@ -267,7 +267,8 @@ pub(super) fn feed_ui_input(
             // release.
             for (btn, name) in UI_MOUSE_BUTTONS {
                 let left = btn == MouseButton::Left;
-                let just_pressed = buttons.just_pressed(btn) || (left && touch_pointer.just_pressed);
+                let just_pressed =
+                    buttons.just_pressed(btn) || (left && touch_pointer.just_pressed);
                 let just_released =
                     buttons.just_released(btn) || (left && touch_pointer.just_released);
                 if just_pressed {

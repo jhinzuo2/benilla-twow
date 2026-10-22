@@ -1267,6 +1267,8 @@ fn a_font_objects_handle_is_a_light_userdata() {
             "{code}: {e}"
         );
     }
+}
+
 /// **A non-string `flags` argument to `SetFont` is "no flags", never a raise** — on all three
 /// widgets that carry the verb (a Font object, a FontString, a Button).
 ///

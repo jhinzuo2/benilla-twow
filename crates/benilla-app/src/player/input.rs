@@ -164,9 +164,7 @@ pub(super) fn move_axes(
     // setter, so it nets against S like W and never trips the cancel set, which fires on key-down
     // edges.
     let fwd_axis = state::forward_axis(
-        binds.pressed(crate::bindings::Input::MoveForward)
-            || player.auto_forward
-            || touch.forward,
+        binds.pressed(crate::bindings::Input::MoveForward) || player.auto_forward || touch.forward,
         binds.pressed(crate::bindings::Input::MoveBackward) || touch.backward,
         both_buttons,
         autorun,
