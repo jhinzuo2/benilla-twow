@@ -14,7 +14,8 @@ use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
 use crate::items::Items;
-use crate::net::{NetCommands, Objects};
+use crate::net::Objects;
+use crate::query_cache::Ask;
 
 /// One server-side release, run into the VM by [`apply_item_releases`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,51 +65,25 @@ pub(crate) struct HeldItemLocks {
 }
 
 /// Take the dying VM's locks and cursor into [`HeldItemLocks`], as the reload's leave-world
-/// sweep (`0x490c20` → `0x490a80`) leaves them. Its legs model here only by their lock and
-/// cursor effects (the windows themselves are not closed yet):
-/// - the loot leg (`0x490ab2` → `0x4c1ca0` → `0x48f200`) unlocks an item source (`0x48f2bd`,
-///   `0x4c1d36`), and clears a mode-6 cursor (`0x48f36e`), which benilla never holds;
-/// - the mail leg (`0x490b1b` → `0x4acc00` → `0x4acdc0`) unlocks the attachment (`0x4acdd6`);
-/// - the auction leg (`0x490b25` → `0x4cc2f0` → `0x4cd5f0`, while an auctioneer is open) fires
-///   `AUCTION_HOUSE_CLOSED` and unlocks the sell item (`0x4cd640`, `0x4cd653`), so the cascade's
-///   own reset (`0x490a05` → `0x4cc280`) finds it already empty;
-/// - the vendor's close, through the interaction close (`0x490b5f` → `0x493310` → `0x4fadf0`),
-///   clears a held vendor row, mode 5 (`0x4fae31`, `0x4fae4a`), which holds no lock;
-/// - the trade leg only cancels (`0x490adf` → `0x5d4310`), and the cascade then zeroes the trade
-///   tables with no `UnlockItem` (`0x4909b5` → `0x4bf0e0`), so the answer's `UnlockTradeItems`
-///   finds nothing: an offered item stays locked until its seat or stack moves, the revive's
-///   unlock-all or a relog, as in the reference.
+/// sweep (`0x490c20` → `0x490a80`) leaves them. The sweep has run on this VM by now, and its
+/// legs made their own lock and cursor changes in it: the loot leg's two unlocks of an item
+/// source, the mail leg's attachment unlock, the auction leg's sell-slot unlock and the merchant
+/// leg's held-row clear. The trade leg only cancels, and the cascade then zeroes the trade tables
+/// with no `UnlockItem` (`0x4909b5` → `0x4bf0e0`), so the answer's `UnlockTradeItems` finds
+/// nothing: an offered item stays locked until its seat or stack moves, the revive's unlock-all or
+/// a relog, as in the reference.
 ///
-/// Nothing on the path writes the cursor otherwise (its setters and `ClearCursor` are the only
-/// writers of `[0xb4d900]` and `[0xb4e248]`), so a held item stays held, with its lock, and an
-/// armed wrap stays armed.
+/// Nothing else on the path writes the cursor (its setters and `ClearCursor` are the only writers
+/// of `[0xb4d900]` and `[0xb4e248]`), so a held item stays held, with its lock, and an armed wrap
+/// stays armed.
 pub(crate) fn fold_dying_vm_item_locks(world: &mut World) {
-    let loot_item = world
-        .get_resource::<crate::ui_loot::LootState>()
-        .and_then(crate::ui_loot::LootState::source)
-        .filter(|&g| benilla_protocol::guid::is_item(g));
-    let Some(held) = world.get_non_send_resource::<UiScript>().map(|s| {
-        let swept = [
-            Some(s.mail_send_guid()),    // 0x4acdd6
-            Some(s.auction_sell_guid()), // 0x4cd653
-            loot_item,                   // 0x48f2bd, 0x4c1d36
-        ];
-        let mut cursor = s.held_cursor();
-        if matches!(
-            cursor.payload(),
-            Some(benilla_ui::script::CursorPayload::Merchant(_))
-        ) {
-            cursor.drop_payload(); // 0x4fae4a
-        }
-        HeldItemLocks {
-            locks: s
-                .item_locks()
-                .into_iter()
-                .filter(|g| !swept.contains(&Some(*g)))
-                .collect(),
-            cursor,
-        }
-    }) else {
+    let Some(held) = world
+        .get_non_send_resource::<UiScript>()
+        .map(|s| HeldItemLocks {
+            locks: s.item_locks(),
+            cursor: s.held_cursor(),
+        })
+    else {
         return;
     };
     world.insert_resource(held);
@@ -317,112 +292,112 @@ pub(crate) struct LockWatch {
 /// with the one still in the descriptor (`0x5ddd42`), so a handler reads the slot as it was.
 #[allow(clippy::too_many_arguments)] // the input set
 pub(crate) fn apply_item_releases(
-    script: Option<NonSendMut<UiScript>>,
+    mut vm: crate::script_calls::VmWith<Option<ResMut<'static, crate::ui_loot::LootState>>>,
     mut inv: crate::items::Inventory,
     created: Query<&crate::net::Guid, Added<crate::items::ItemObject>>,
     me: Res<crate::net::SelfGuid>,
     items: Res<Items>,
-    commands: Res<NetCommands>,
     mut queued: ResMut<ItemReleases>,
-    // The loot window's closes and refusals owe theirs on the session.
-    loot: Option<ResMut<crate::ui_loot::LootState>>,
     mut watch: ResMut<LockWatch>,
 ) {
-    // Read before taking, so a frame owing nothing leaves the session unchanged for its feed.
-    if let Some(mut loot) = loot.filter(|l| l.owes_unlocks()) {
-        queued.0.extend(
-            loot.take_item_unlocks()
-                .into_iter()
-                .filter_map(|(guid, live)| {
-                    let resolves = !live || inv.objects.object(guid).is_some_and(|f| f.is_item());
-                    resolves.then_some(Release::Item(guid))
-                }),
-        );
-    }
-    let Some(mut script) = script else {
-        queued.0.clear();
-        return;
-    };
-    let watch = &mut *watch;
-    let (Some(store), Some(me)) = (inv.self_store.iter().next(), me.0) else {
-        *watch = LockWatch::default();
-        queued.apply(&mut script);
-        return;
-    };
-    // The arrival unlock fires from the item's create (`0x5d8300`), never from a seat a moved bag
-    // brings into view; the VM's first look owns what already exists.
-    if watch.seen.is_some() {
-        watch.arrivals.extend(created.iter().map(|g| g.0));
-    }
-    let moved = inv.changes.moved() || !inv.self_changed.is_empty();
-    // A template answer moves no item object, so the frame it lands has its own trigger.
-    let templates = items.template_epoch();
-    let answered = watch.templates != templates;
-    watch.templates = templates;
-    let mut out = Vec::new();
-    // Whether an entry stacks past 1 (`[rec+0x60] > 1`, `0x5d857b`, `0x5d947e`); `None` while the
-    // template is unanswered.
-    let stackable = |entry: u32, guid: u64| {
-        items
-            .template(entry, guid, &commands)
-            .map(|t| t.stackable > 1)
-    };
-    let objects = &inv.objects;
-    let release = |guid: u64, entry: u32, walk: Walk, stacks: bool| {
-        if stacks {
-            Release::Entry(kin(&store.0, objects, walk, entry))
-        } else {
-            Release::Item(guid)
+    vm.turn(|script, loot| {
+        // Read before taking, so a frame owing nothing leaves the session unchanged for its feed.
+        if let Some(mut loot) = loot.filter(|l| l.owes_unlocks()) {
+            queued.0.extend(
+                loot.take_item_unlocks()
+                    .into_iter()
+                    .filter_map(|(guid, live)| {
+                        let resolves =
+                            !live || inv.objects.object(guid).is_some_and(|f| f.is_item());
+                        resolves.then_some(Release::Item(guid))
+                    }),
+            );
         }
-    };
-    if moved || watch.seen.is_none() {
-        let now = snapshot(&store.0, objects, me);
-        if let Some(was) = watch.seen.replace(now) {
-            let now = watch.seen.as_ref().expect("just stored");
-            out.extend(seat_unlocks(&was, now).into_iter().map(Release::Item));
-            for guid in restacked(&was, now) {
-                let entry = objects.object(guid).and_then(ObjectFields::object_entry);
-                // An unanswered template unlocks the item alone (`0x5d947c`).
-                let stacks = entry.and_then(|e| stackable(e, guid)).unwrap_or(false);
-                out.push(release(guid, entry.unwrap_or(0), Walk::Stack, stacks));
+        let Some(script) = script else {
+            queued.0.clear();
+            return;
+        };
+        let watch = &mut *watch;
+        let (Some(store), Some(me)) = (inv.self_store.iter().next(), me.0) else {
+            *watch = LockWatch::default();
+            queued.apply(script);
+            return;
+        };
+        // The arrival unlock fires from the item's create (`0x5d8300`), never from a seat a moved
+        // bag brings into view; the VM's first look owns what already exists.
+        if watch.seen.is_some() {
+            watch.arrivals.extend(created.iter().map(|g| g.0));
+        }
+        let moved = inv.changes.moved() || !inv.self_changed.is_empty();
+        // A template answer moves no item object, so the frame it lands has its own trigger.
+        let templates = items.template_epoch();
+        let answered = watch.templates != templates;
+        watch.templates = templates;
+        let mut out = Vec::new();
+        // Whether an entry stacks past 1 (`[rec+0x60] > 1`, `0x5d857b`, `0x5d947e`); `None` while
+        // the template is unanswered.
+        let stackable = |entry: u32, guid: u64| {
+            items
+                .template(entry, guid, Ask::Read)
+                .map(|t| t.stackable > 1)
+        };
+        let objects = &inv.objects;
+        let release = |guid: u64, entry: u32, walk: Walk, stacks: bool| {
+            if stacks {
+                Release::Entry(kin(&store.0, objects, walk, entry))
+            } else {
+                Release::Item(guid)
+            }
+        };
+        if moved || watch.seen.is_none() {
+            let now = snapshot(&store.0, objects, me);
+            if let Some(was) = watch.seen.replace(now) {
+                let now = watch.seen.as_ref().expect("just stored");
+                out.extend(seat_unlocks(&was, now).into_iter().map(Release::Item));
+                for guid in restacked(&was, now) {
+                    let entry = objects.object(guid).and_then(ObjectFields::object_entry);
+                    // An unanswered template unlocks the item alone (`0x5d947c`).
+                    let stacks = entry.and_then(|e| stackable(e, guid)).unwrap_or(false);
+                    out.push(release(guid, entry.unwrap_or(0), Walk::Stack, stacks));
+                }
             }
         }
-    }
-    // A locked item whose object went away, or came back as a new one (a cross-map worldport
-    // rebuilds them all), loses the lock silently: it lived on the old object, and the new one
-    // is built unlocked (`0x5d821f`, `0x5d823e`).
-    let mut owners = HashMap::new();
-    for guid in script.item_locks() {
-        let now = objects.entity(guid);
-        let was = watch.lock_owners.get(&guid).copied();
-        match now {
-            Some(e) if was.is_none_or(|w| w == e) => {
-                owners.insert(guid, e);
-            }
-            _ => script.forget_item_lock(guid),
-        }
-    }
-    watch.lock_owners = owners;
-    if moved || answered {
-        let mut waiting = Vec::new();
-        for guid in std::mem::take(&mut watch.arrivals) {
-            // Ours only (`0x5d851f`); a vanished object owes nothing.
-            let Some(f) = objects.object(guid).filter(|f| f.item_owner() == Some(me)) else {
-                continue;
-            };
-            let Some(entry) = f.object_entry() else {
-                waiting.push(guid);
-                continue;
-            };
-            match stackable(entry, guid) {
-                Some(stacks) => out.push(release(guid, entry, Walk::Arrival, stacks)),
-                None => waiting.push(guid),
+        // A locked item whose object went away, or came back as a new one (a cross-map worldport
+        // rebuilds them all), loses the lock silently: it lived on the old object, and the new one
+        // is built unlocked (`0x5d821f`, `0x5d823e`).
+        let mut owners = HashMap::new();
+        for guid in script.item_locks() {
+            let now = objects.entity(guid);
+            let was = watch.lock_owners.get(&guid).copied();
+            match now {
+                Some(e) if was.is_none_or(|w| w == e) => {
+                    owners.insert(guid, e);
+                }
+                _ => script.forget_item_lock(guid),
             }
         }
-        watch.arrivals = waiting;
-    }
-    queued.0.splice(0..0, out);
-    queued.apply(&mut script);
+        watch.lock_owners = owners;
+        if moved || answered {
+            let mut waiting = Vec::new();
+            for guid in std::mem::take(&mut watch.arrivals) {
+                // Ours only (`0x5d851f`); a vanished object owes nothing.
+                let Some(f) = objects.object(guid).filter(|f| f.item_owner() == Some(me)) else {
+                    continue;
+                };
+                let Some(entry) = f.object_entry() else {
+                    waiting.push(guid);
+                    continue;
+                };
+                match stackable(entry, guid) {
+                    Some(stacks) => out.push(release(guid, entry, Walk::Arrival, stacks)),
+                    None => waiting.push(guid),
+                }
+            }
+            watch.arrivals = waiting;
+        }
+        queued.0.splice(0..0, out);
+        queued.apply(script);
+    })
 }
 
 #[cfg(test)]
@@ -527,14 +502,12 @@ mod tests {
 
     /// The release system over a world with arrows in backpack slot 1, its baseline taken.
     fn arrow_world() -> (App, Entity) {
-        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.init_resource::<Items>()
             .init_resource::<ItemReleases>()
             .init_resource::<LockWatch>()
             .init_resource::<crate::net::GuidIndex>()
             .insert_resource(crate::net::SelfGuid(Some(ME)))
-            .insert_resource(NetCommands(tx))
             .add_systems(Update, apply_item_releases);
         let mut items = app.world_mut().resource_mut::<Items>();
         items.insert_template(

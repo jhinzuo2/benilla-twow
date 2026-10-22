@@ -585,7 +585,7 @@
             SetCVar(row.partner.cvar, v)
         end
 
-        -- A uvar's default is captured at OnLoad, before the saved-variables chunk runs.
+        -- A uvar's default is captured at OnLoad, before the saved-variables file is read.
         function BenillaOptionsRow_Default(row)
             if row.uvar then return row.udefault end
             if row.getFunc then return row.fdefault end
@@ -816,7 +816,8 @@
             end
             getglobal(control:GetName() .. "Value"):SetText(BenillaOptionsRow_FormatValue(row, value))
             if BenillaOptionsRow_HasStore(row) and not row.refreshing then
-                -- Trailing zeros stripped, so a value at its default stays out of the config file.
+                -- Two decimals, trailing zeros stripped: a whole value writes "1", not "1.00",
+                -- which still differs from a default registered as "1.0" and so is saved.
                 local str = string.gsub(string.format("%.2f", value), "%.?0+$", "")
                 if row.deferred then
                     -- Stored on Apply; a pending equal to the committed value is dropped.
@@ -1300,9 +1301,11 @@
             <BackgroundInsets><AbsInset left="11" right="12" top="12" bottom="11"/></BackgroundInsets>
         </Backdrop>
         <Layers>
-            <Layer level="BACKGROUND">
+            <!-- BORDER, over the tile: a layer draws its textures sorted by texture, not in
+                 declaration order, so on BACKGROUND the fill could sort under the tile. -->
+            <Layer level="BORDER">
                 <!-- 0.88 combined with the tile, so labels read over bright terrain. Inset 15:
-                     regions draw over the border, whose ink ends by texel 14. -->
+                     clear of the border's ink, which ends by texel 14. -->
                 <Texture name="$parentGroundDim">
                     <Anchors>
                         <Anchor point="TOPLEFT"><Offset><AbsDimension x="15" y="-15"/></Offset></Anchor>
@@ -1561,8 +1564,14 @@
                             <OnScrollRangeChanged>BenillaScroll_SyncBar(this)</OnScrollRangeChanged>
                         </Scripts>
                         <Frames>
-                            <!-- Declared before the body and the bar so it draws beneath both. -->
-                            <Frame name="$parentBarTrough" inherits="BenillaScrollTroughTemplate"/>
+                            <!-- At the ScrollFrame's own level, beneath both the body, which the
+                                 ScrollFrame's HIGHLIGHT callback draws at that level, and the bar,
+                                 a level up. -->
+                            <Frame name="$parentBarTrough" inherits="BenillaScrollTroughTemplate">
+                                <Scripts>
+                                    <OnLoad>this:SetFrameLevel(this:GetParent():GetFrameLevel())</OnLoad>
+                                </Scripts>
+                            </Frame>
                             <!-- Sized, not anchored: SetScrollChild pins its TOPLEFT and
                                  BenillaOptionsScroll_Fit sizes it. -->
                             <Frame name="BenillaOptionsFrameContainerBody">
@@ -2044,6 +2053,7 @@
                                     <Scripts>
                                         <OnShow>
                                             for i, name in BENILLA_GRAPHICS_SLIDER_ROWS do
+                                                local info = OptionsFrameSliders[i]
                                                 local row = getglobal(this:GetName() .. name)
                                                 if ( info and row ) then
                                                     BenillaOptionsSliderRow_Setup(row, info.minValue, info.maxValue,
@@ -2428,7 +2438,12 @@
                                             </OnLoad></Scripts>
                                         </Frame>
                                         <!-- Saved globals in 1.12; the mode greys with its switch
-                                             (UIOptionsFrame.lua:697-701). -->
+                                             (UIOptionsFrame.lua:697-701). Neither row applies anything:
+                                             1.12's options only write the uvars (UIOptionsFrame.lua:65),
+                                             and the target frames' OnUpdates show or hide the frame on
+                                             the next frame (TargetFrame.lua:492-501). Called from a row,
+                                             TargetofTarget_Update would refresh the row's debuffs
+                                             (RefreshBuffs(this, ...), TargetFrame.lua:538). -->
                                         <Frame name="$parentRowTargetOfTarget" inherits="BenillaOptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowStatusText" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
@@ -2437,7 +2452,6 @@
                                             <Scripts><OnLoad>
                                                 BenillaOptionsGlobalRow_OnLoad(this, "SHOW_TARGET_OF_TARGET",
                                                     "Show Target of Target", "OPTION_TOOLTIP_SHOW_TARGET_OF_TARGET")
-                                                this.applyFunc = "TargetofTarget_Update"
                                             </OnLoad></Scripts>
                                         </Frame>
                                         <!-- The label is ours, since 1.12 never sets this
@@ -2457,7 +2471,6 @@
                                                     { text = "Party or Raid", value = "4", tip = "OPTION_TOOLTIP_TARGETOFTARGET4" },
                                                     { text = "Always", value = "5", tip = "OPTION_TOOLTIP_TARGETOFTARGET5" },
                                                 })
-                                                this.applyFunc = "TargetofTarget_Update"
                                             </OnLoad></Scripts>
                                         </Frame>
                                         <!-- PLAYER_FLAGS bits, API rows
@@ -2892,7 +2905,8 @@
                                     </Anchors>
                                 </Frame>
                                         <!-- Declared before the faux frame so it draws beneath
-                                             it. -->
+                                             it: inside the body, the scroll child, link order
+                                             draws, not level. -->
                                         <Frame name="$parentScrollFrameScrollBarTrough" inherits="BenillaScrollTroughTemplate"/>
                                         <!-- Ends at -32, so the kit's bar rides the -26..-10
                                              gutter. -->
@@ -3004,7 +3018,6 @@
                                     <Anchor point="TOPRIGHT"><Offset><AbsDimension x="-10" y="-21"/></Offset></Anchor>
                                     <Anchor point="BOTTOMRIGHT"><Offset><AbsDimension x="-10" y="20"/></Offset></Anchor>
                                 </Anchors>
-                                <Scripts><OnValueChanged>BenillaScrollBar_OnValueChanged(this, arg1)</OnValueChanged></Scripts>
                             </Slider>
                         </Frames>
                     </ScrollFrame>
@@ -3057,13 +3070,14 @@
                         <Anchors><Anchor point="RIGHT"><Offset><AbsDimension x="-3" y="0"/></Offset></Anchor></Anchors>
                         <Layers>
                             <Layer level="ARTWORK">
-                                <Texture name="$parentIcon" file="Interface\Buttons\UI-Panel-MinimizeButton-Up" alpha="0.5">
+                                <Texture name="$parentIcon" file="Interface\Buttons\UI-Panel-MinimizeButton-Up">
                                     <Size><AbsDimension x="17" y="17"/></Size>
                                     <Anchors><Anchor point="CENTER"/></Anchors>
                                 </Texture>
                             </Layer>
                         </Layers>
                         <Scripts>
+                            <OnLoad>getglobal(this:GetName() .. "Icon"):SetAlpha(0.5)</OnLoad>
                             <OnClick>
                                 BenillaOptionsFrameSearchBox:SetText("")
                                 BenillaOptionsFrameSearchBox:ClearFocus()

@@ -8,6 +8,8 @@ use super::test_ui::load_ui as load_xml;
 /// The chat stack, fonts first so `inherits="ChatFontNormal"` resolves.
 pub(crate) fn chat_frame() -> UiScript {
     let mut s = UiScript::new().unwrap();
+    // No engine behind it: the calls its verbs make are kept for the `take_*` readers.
+    s.keep_calls();
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, "Interface\\FrameXML\\BasicControls.xml");
@@ -33,6 +35,15 @@ pub(crate) fn chat_frame() -> UiScript {
     load_xml(&s, "Interface\\FrameXML\\FloatingChatFrame.xml");
     super::fire_chat_login(&mut s);
     s.set_screen_size(1600.0, 900.0);
+    // The local player `SendChatMessage` needs (`0x49f223`).
+    s.set_unit(
+        "player",
+        Some(benilla_ui::script::UnitState {
+            exists: true,
+            name: Some("Probe".into()),
+            ..Default::default()
+        }),
+    );
     s.resolve();
     s
 }
@@ -118,8 +129,12 @@ fn wheel_scroll_re_arms_the_fade_then_freezes_it() {
     let mut s = chat_frame();
     s.run("ChatFrame1:SetTimeVisible(0); ChatFrame1:SetFadeDuration(4)")
         .unwrap();
-    for t in ["L0", "L1", "L2"] {
-        s.add_chat_message("ChatFrame1", t, 1.0, 1.0, 1.0);
+    // More lines than the window holds: a view that shows the oldest cannot scroll up (`0x78861c`).
+    for t in (0..20)
+        .map(|n| format!("F{n}"))
+        .chain(["L0", "L1", "L2"].map(String::from))
+    {
+        s.add_chat_message("ChatFrame1", &t, 1.0, 1.0, 1.0);
     }
     s.resolve();
     s.tick(1.0);
@@ -141,6 +156,27 @@ fn wheel_scroll_re_arms_the_fade_then_freezes_it() {
     let a4 = text_color(&s.extract(), "L1").expect("L1 visible")[3];
     assert!(a4 < 1.0 && a4 > 0.0, "the fade resumed at the bottom: {a4}");
     assert!(close(a4, a1), "and from a full re-arm: {a4} vs {a1}");
+}
+
+/// The stock `ChatFrame.xml` writes `<FontString bytes="256"/>` on the chat box, which caps it at
+/// 255 bytes (`0x77a225`-`0x77a260`, `0x77c040`): a line is stopped before vmangos would drop it.
+#[test]
+fn the_stock_chat_box_stops_at_255_bytes() {
+    benilla_formats::wow_data_or_skip!();
+    let s = chat_frame();
+    assert_eq!(
+        s.eval::<i64>("return ChatFrameEditBox:GetMaxBytes()")
+            .unwrap(),
+        256
+    );
+    s.run("ChatFrameEditBox:SetText(string.rep('\\195\\169', 200))")
+        .unwrap();
+    assert_eq!(
+        s.eval::<i64>("return string.len(ChatFrameEditBox:GetText())")
+            .unwrap(),
+        254,
+        "127 two-byte letters"
+    );
 }
 
 #[test]
@@ -355,8 +391,12 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
+            bonding: 0,
+            use_spell: 0,
             bar_placeable: true,
             consumable: false,
             durability: None,
@@ -371,14 +411,19 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -716,7 +761,7 @@ fn an_idle_dock_stops_rewriting_the_tab_alpha_every_frame() {
 
     let alpha: f64 = s.eval("return ChatFrame1Tab:GetAlpha()").unwrap();
     assert!(
-        (alpha - 0.42).abs() < 1e-6,
+        alpha == benilla_ui::color::alpha_f64(benilla_ui::color::frame_alpha_byte(0.42)),
         "a settled dock must not rewrite its tab alpha — got {alpha}"
     );
 }
@@ -760,8 +805,9 @@ fn hovering_the_dock_still_reveals_the_tabs() {
 fn a_chat_view_at_the_bottom_stops_rewriting_the_flash() {
     benilla_formats::wow_data_or_skip!();
     let mut s = chat_frame();
-    for t in ["L0", "L1", "L2"] {
-        s.add_chat_message("ChatFrame1", t, 1.0, 1.0, 1.0);
+    // More lines than the window holds, so the view can scroll up (`0x78861c`).
+    for t in (0..20).map(|n| format!("L{n}")) {
+        s.add_chat_message("ChatFrame1", &t, 1.0, 1.0, 1.0);
     }
     for _ in 0..3 {
         s.tick(0.016);
@@ -1014,7 +1060,7 @@ fn a_glass_windows_plate_fades_in_on_every_hover() {
         assert!(s.errors().is_empty(), "{:?}", s.errors());
         let a = bg(&mut s);
         assert!(
-            (a - 0.25).abs() < 1e-6,
+            a == benilla_ui::color::alpha_f64(benilla_ui::color::wrap_alpha_byte(0.25)),
             "hover {round}: the plate fades to DEFAULT_CHATFRAME_ALPHA — got {a} (oldAlpha={:?})",
             s.eval::<Option<f64>>("return ChatFrame1.oldAlpha").unwrap()
         );
@@ -1090,13 +1136,13 @@ fn a_glass_windows_plate_fades_in_on_every_hover_under_the_full_manifest() {
         });
         assert!(
             over_frame1.is_some_and(|(_, a, c)| {
-                (a - 0.25).abs() < 1e-3 && c.is_some_and(|c| c[0] == 0.0 && c[1] == 0.0 && c[2] == 0.0)
+                (a - 0.25).abs() < 1.0 / 255.0 && c.is_some_and(|c| c[0] == 0.0 && c[1] == 0.0 && c[2] == 0.0)
             }),
             "hover {round}: the extracted plate quad over ChatFrame1 ({left}, {bottom}) — {plates:?}"
         );
         let a = bg(&mut s);
         assert!(
-            (a - 0.25).abs() < 1e-6,
+            a == benilla_ui::color::alpha_f64(benilla_ui::color::wrap_alpha_byte(0.25)),
             "hover {round}: the plate fades to DEFAULT_CHATFRAME_ALPHA — got {a} (oldAlpha={:?}, hover={:?}, hasBeenFaded={:?}, init={:?})",
             s.eval::<Option<f64>>("return ChatFrame1.oldAlpha").unwrap(),
             s.eval::<Option<f64>>("return ChatFrame1.hover").unwrap(),
@@ -1174,7 +1220,10 @@ fn a_quick_exit_and_reentry_keeps_the_plates_hover_fade() {
     // The control: the reference's Lua alone.
     let mut bare = chat_frame();
     let (first, reentry, later) = drive(&mut bare);
-    assert!((first - 0.25).abs() < 1e-6, "control, first hover: {first}");
+    assert!(
+        first == benilla_ui::color::alpha_f64(benilla_ui::color::wrap_alpha_byte(0.25)),
+        "control, first hover: {first}"
+    );
     assert!(
         reentry.abs() < 1e-6 && later.abs() < 1e-6,
         "the control must trap — the reference's Lua nils oldAlpha under a live hover \
@@ -1196,15 +1245,40 @@ fn a_quick_exit_and_reentry_keeps_the_plates_hover_fade() {
     super::fire_chat_login(&mut shipped);
     shipped.resolve();
     let (first, reentry, later) = drive(&mut shipped);
-    assert!((first - 0.25).abs() < 1e-6, "shipped, first hover: {first}");
     assert!(
-        (reentry - 0.25).abs() < 1e-6,
+        first == benilla_ui::color::alpha_f64(benilla_ui::color::wrap_alpha_byte(0.25)),
+        "shipped, first hover: {first}"
+    );
+    assert!(
+        reentry == benilla_ui::color::alpha_f64(benilla_ui::color::wrap_alpha_byte(0.25)),
         "shipped: the plate comes back on the quick re-entry — got {reentry}"
     );
     assert!(
-        (later - 0.25).abs() < 1e-6,
+        later == benilla_ui::color::alpha_f64(benilla_ui::color::wrap_alpha_byte(0.25)),
         "shipped: and on every hover after — got {later}"
     );
+}
+
+/// The Lua binding's chat-type table (`0x49f7a0`) and the drain's token map are one list: every
+/// token the binding accepts is a send, and `RAID_LEADER` and `BATTLEGROUND_LEADER`, which the
+/// reference derives itself (`0x49f3bf`, `0x49f48b`), are neither, so a token the binding lets
+/// through is never dropped by the drain.
+#[test]
+fn the_binding_and_the_drain_share_one_chat_type_list() {
+    use crate::ui_chat::edit::SendType;
+    use std::collections::HashSet;
+
+    let mut wires = HashSet::new();
+    for token in benilla_ui::script::SEND_CHAT_TOKENS {
+        let kind = SendType::from_token(token).unwrap_or_else(|| panic!("{token} has no send"));
+        assert!(
+            wires.insert(format!("{:?}", kind.wire())),
+            "{token} repeats a wire kind"
+        );
+    }
+    for token in ["RAID_LEADER", "BATTLEGROUND_LEADER"] {
+        assert!(SendType::from_token(token).is_none(), "{token}");
+    }
 }
 
 /// The stock `/afk` and `/dnd` call `SendChatMessage(msg, "AFK")` or `"DND"`
@@ -1274,6 +1348,8 @@ fn the_stock_afk_and_dnd_commands_reach_the_wire() {
 fn the_docked_tabs_follow_the_dock_through_a_session() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    // No engine behind it: `RaidFrame`'s `RequestRaidInfo()` at world entry is kept.
+    s.keep_calls();
     s.set_screen_size(768.0 * 16.0 / 9.0, 768.0);
     s.set_texture_size_probe(Box::new(|_| Some((32, 32))));
     s.set_text_measurer(Box::new(super::FixedWidthFont(6.0)));
@@ -1353,6 +1429,8 @@ fn the_docked_tabs_follow_the_dock_through_a_session() {
 fn the_recruitment_join_reaches_the_chat_frame_before_the_verb_returns() {
     benilla_formats::wow_data_or_skip!();
     let mut s = chat_frame();
+    // No engine: the join's call is kept, its window entry made in the verb.
+    s.keep_calls();
     s.set_guild_recruitment_plan(benilla_ui::script::RecruitmentPlan::Join {
         name: "GuildRecruitment - City".into(),
         shortcut: "GuildRecruitment".into(),

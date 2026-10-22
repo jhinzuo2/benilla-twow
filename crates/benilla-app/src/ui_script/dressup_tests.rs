@@ -129,7 +129,7 @@ fn backpack_with_jerky(s: &mut UiScript) -> String {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -382,5 +382,26 @@ fn reset_re_dresses_close_empties_and_the_arrows_spin_the_pane() {
     // The app empties the booth off the frame's visibility; the stock `OnHide` queues nothing.
     assert!(!s.frame_visible("DressUpFrame"), "the room is hidden");
     assert!(s.take_dressup_intents().is_empty());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// `DressUpItem` opens the room on the player (`DressUpFrame.lua:5`): the pane stores the
+/// player's GUID and, shown, asks for its copy.
+#[test]
+fn the_room_binds_the_player() {
+    benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_room(&s);
+    s.set_unit_guids(&benilla_ui::script::UnitGuids {
+        player: 0x42,
+        ..Default::default()
+    });
+    s.run("DressUpItem(117)").unwrap();
+    let pane = s
+        .character_pane(s.frame_handle("DressUpModel").unwrap())
+        .expect("a character pane");
+    assert_eq!(pane.guid, 0x42);
+    assert!(pane.pending(), "the shown pane asks for its copy");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

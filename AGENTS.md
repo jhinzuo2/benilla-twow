@@ -1,3 +1,20 @@
+# iNilla (this fork)
+
+This repository is **iNilla**, the iOS build of benilla: `crates/inilla-*`, `ios/`,
+`crates/benilla-app/src/inilla/` and the `inilla-*` workflows are ours; everything else is
+upstream benilla, merged in (see `docs/UPSTREAM.md` for the carries and how to sync). Read
+`docs/INILLA.md` first, then `docs/IOS-BUILD.md` and `docs/DEBUGGING.md`.
+
+- Engine-free logic goes in `inilla-core` with a unit test (`cargo test -p inilla-core`).
+- OS calls go in `inilla-platform`, behind a function that compiles on every target.
+- A change inside an upstream file is a carry: keep it minimal, mark it `iNilla`, list it in
+  `docs/UPSTREAM.md`.
+- Before pushing: `cargo check -p benilla-app` and
+  `source ios/toolchain/linux-env.sh && cargo check --target aarch64-apple-ios -p inilla-ios`.
+- Never commit anything from a WoW install (the `.MPQ` archives, extracted assets).
+
+---
+
 # benilla
 
 A from-scratch World of Warcraft 1.12.1 client in Rust and Bevy. The reference client is the
@@ -10,8 +27,13 @@ Read, in this order:
    touching anything.
 3. `docs/CONTRIBUTING.md` — what gets in and how a change is judged.
 
-The rest of the root is code and data: `crates/` the workspace, `reference/` the 1.12 name
-catalogues the tests check against, `scripts/` the gates and instruments, `third_party/`
-vendored code.
+What the real client does comes from [benilla-re](https://github.com/samwhosung/benilla-re), the
+reverse engineering of 1.12.1, before you build: clone it beside this repo and grep it, or look an
+address up at `https://samwhosung.github.io/benilla-re/?0x5e6853`. `docs/CONTRIBUTING.md`, "The
+reference", says how to read it and what to do when it has a gap.
+
+The rest of the root is code and data: `crates/` the workspace, `reference/` benilla-re's
+tables vendored at a pinned commit, which the tests check against, `scripts/` the gates and
+instruments, `third_party/` vendored code.
 
 @docs/METHOD.md

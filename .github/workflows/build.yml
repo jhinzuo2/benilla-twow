@@ -1,0 +1,396 @@
+# Every platform's build, in parallel, and one GitHub Release that bundles them.
+#
+#   desktop      (Linux / Windows / macOS)  dev build and perf build per OS      -> benilla-*
+#   android      (Linux)                    signed release APK                   -> benilla-android-aarch64.apk
+#   ios-staticlib (Linux, 1× minutes)       the whole Rust build -> libinilla_ios.a
+#   ios-package  (macOS, 10× minutes)       link + bundle + sign + zip           -> iNilla-<version>.ipa
+#   release                                 downloads every artifact above       -> one GitHub Release
+#
+# The iOS jobs spend macOS minutes, so they run on tags and manual runs only. A release is either an
+# annotated tag `v*` pushed from a checkout (its message is the release text), or Run workflow with
+# `release` and `notes` filled in (GitHub then creates the tag). A manual run with `release` empty is
+# a test build: artifacts only.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dev:
+        description: "iOS: compile benilla's dev instruments in (debug panel, perf HUD)"
+        type: boolean
+        default: false
+      release:
+        description: "Publish as this release tag, e.g. v0.2.0 (empty: a test build)"
+        type: string
+        default: ""
+      notes:
+        description: "Release text in Markdown; the first line is the title"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Only the player-facing binary (`-p benilla`), not `--workspace --all-targets`: building every
+  # crate's test binaries would relink a full Bevy executable per test target, multi-GB of output
+  # that has blown through the windows-latest runner's free disk before now.
+  #
+  #   dev   `--release`, `default = ["dev"]` on: carries bevy_egui, the debug panel, the perf HUD,
+  #         the inspector, the capture harness and the probe fleet. The one a bug report wants.
+  #   perf  `--profile ship` (fat LTO, one codegen unit) and `--no-default-features`: the
+  #         instruments compiled out. The measurable build, and the gate that nothing outside
+  #         `dev` depends on `dev`. Its single-threaded link runs well behind the dev build.
+  #
+  # No `RUSTFLAGS=-Ctarget-cpu=native`: a runner's CPU is not the player's, and an uploaded
+  # artifact has to be portable.
+  desktop:
+    name: ${{ matrix.flavor }} build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, flavor: dev, cargo_args: "--release", out_dir: release, bin: benilla, asset: benilla-linux-x86_64 }
+          - { os: windows-latest, flavor: dev, cargo_args: "--release", out_dir: release, bin: benilla.exe, asset: benilla-windows-x86_64.exe }
+          - { os: macos-latest, flavor: dev, cargo_args: "--release", out_dir: release, bin: benilla, asset: benilla-macos-aarch64 }
+          - { os: ubuntu-latest, flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, bin: benilla, asset: benilla-perf-linux-x86_64 }
+          - { os: windows-latest, flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, bin: benilla.exe, asset: benilla-perf-windows-x86_64.exe }
+          - { os: macos-latest, flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, bin: benilla, asset: benilla-perf-macos-aarch64 }
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # bevy_audio pulls alsa on Linux and gilrs (gamepad support) pulls udev; both link against
+      # system libs, so the dev headers have to exist before `cargo build` touches those crates.
+      # x11/xkbcommon/wayland are dlopen'd at runtime by winit. Windows and macOS need nothing extra.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      # Reads channel/components straight from the repo's rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own key per flavor: `ship` objects are LTO'd from a different feature set and share
+          # nothing with `release` ones; a shared key would ping-pong one cache entry between them.
+          key: ${{ matrix.flavor }}
+          cache-on-failure: true
+
+      - name: cargo build ${{ matrix.cargo_args }} -p benilla
+        shell: bash
+        run: cargo build ${{ matrix.cargo_args }} --locked -p benilla
+
+      # Cargo names the output directory after the profile: `target/release/`, `target/ship/`.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: target/${{ matrix.out_dir }}/${{ matrix.bin }}
+          if-no-files-found: error
+
+  # Not a desktop matrix row: Android needs the NDK, a second Rust target and `cargo-apk` instead of
+  # a plain `cargo build`. Compile, link and signed `--release` packaging are proven; installing and
+  # running the APK on a device or emulator is not done here.
+  android:
+    name: build (android)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # The build machine is still Ubuntu: host-side build scripts and proc macros link alsa/udev
+      # the same way the desktop Linux build does.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # aarch64 covers effectively every real Android device of the last several years.
+          targets: aarch64-linux-android
+
+      # `rust-toolchain.toml` pins the channel, so cargo runs on the pinned toolchain, not the
+      # `stable` the action above installed the target into. Add it to the pinned one.
+      - name: Add Android target to the pinned toolchain
+        run: rustup target add aarch64-linux-android
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own key: aarch64-linux-android artifacts share nothing with the host-triple ones.
+          key: android
+          cache-on-failure: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # `packages: ""` is required: the action's default `tools platform-tools` dies since Google
+      # removed the legacy `tools` package from the SDK index (android-actions/setup-android#537).
+      # Empty skips the package install while still setting ANDROID_HOME, putting cmdline-tools on
+      # PATH and accepting the licenses.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      #   * build-tools 34.0.0 -- cargo-apk 0.10 still shells out to aapt v1, dropped after 34.x.
+      #   * platforms;android-31 -- must match `target_sdk_version = 31` in benilla-android's
+      #     [package.metadata.android.sdk]. Raise the two together or not at all.
+      #   * platform-tools -- adb, for a later install/instrumentation step.
+      - name: Install pinned SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-31" "build-tools;34.0.0"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          # r26: the last NDK line with broad cargo-apk compatibility. Bump deliberately.
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+
+      # The keystore is base64 in the ANDROID_RELEASE_KEYSTORE secret, decoded outside the checkout
+      # so it can never end up in an artifact or a stray `git add .`.
+      - name: Decode release keystore
+        env:
+          ANDROID_RELEASE_KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE }}
+        run: |
+          if [ -z "$ANDROID_RELEASE_KEYSTORE" ]; then
+            echo "::error::ANDROID_RELEASE_KEYSTORE secret is not set -- see the keystore setup notes."
+            exit 1
+          fi
+          echo "$ANDROID_RELEASE_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "ANDROID_RELEASE_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+
+      # cargo-apk's own env override for `[package.metadata.android.signing.release]`.
+      - name: cargo apk build --release -p benilla-android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CARGO_APK_RELEASE_KEYSTORE: ${{ env.ANDROID_RELEASE_KEYSTORE_PATH }}
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+        run: cargo apk build --release -p benilla-android
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benilla-android-aarch64.apk
+          path: target/release/apk/*.apk
+          if-no-files-found: error
+
+  # The repository is private: GitHub bills macOS minutes at 10×. This reports the month's use
+  # against the included quota (warning at 60 %) when a BILLING_TOKEN secret is set. It never
+  # blocks the build.
+  ios-budget:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Actions minutes this month
+        env:
+          GH_TOKEN: ${{ secrets.BILLING_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          QUOTA: ${{ vars.INILLA_ACTIONS_QUOTA || '2000' }}
+          WARN_AT: ${{ vars.INILLA_BUDGET_WARN || '60' }}
+        run: ios/tools/actions-budget.sh
+
+  # iNilla.ipa, built where each step is cheapest: the Rust build on Linux (~20–40 min cold,
+  # cached after), then only link, bundle and sign on macOS (~3 min).
+  ios-staticlib:
+    name: build (ios staticlib)
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios
+      - name: System packages
+        run: sudo apt-get update -q && sudo apt-get install -yq clang lld llvm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: inilla-ios-${{ inputs.dev && 'dev' || 'player' }}
+          cache-targets: true
+          cache-on-failure: true
+      - name: Build libinilla_ios.a
+        env:
+          INILLA_FEATURES: ${{ inputs.dev && 'dev' || '' }}
+        run: ios/build-staticlib.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inilla-ios-staticlib
+          path: |
+            target/inilla-ios-out/libinilla_ios.a
+            target/inilla-ios-out/lib/
+            target/inilla-ios-out/native-libs.txt
+            target/inilla-ios-out/commit.txt
+          # Only ios-package reads it; artifacts count against the plan's Actions storage.
+          retention-days: 1
+          compression-level: 6
+
+  ios-package:
+    name: build (ios ipa)
+    needs: ios-staticlib
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: inilla-ios-staticlib
+          path: target/inilla-ios-out
+      - name: Package iNilla.ipa
+        env:
+          INILLA_BUILD: ${{ github.run_number }}
+          INILLA_VERSION: ${{ (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || inputs.release || '0.1.0' }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          export INILLA_VERSION="${INILLA_VERSION#v}"
+          ios/package-ipa.sh
+          SHORT=$(cat target/inilla-ios-out/commit.txt)
+          if [[ "$GITHUB_REF" == refs/tags/v* || -n "$RELEASE" ]]; then NAME="iNilla-${INILLA_VERSION}.ipa"; else NAME="iNilla-${SHORT}.ipa"; fi
+          mv target/inilla-ios-out/iNilla.ipa "target/inilla-ios-out/${NAME}"
+          IPA="target/inilla-ios-out/${NAME}"
+          echo "IPA=${IPA}" >> "$GITHUB_ENV"
+          echo "IPA_NAME=${NAME}" >> "$GITHUB_ENV"
+          # The build facts, for the run summary and the release notes.
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          XCODE=$(xcodebuild -version | head -n 1)
+          {
+            echo "## iOS build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${SHORT}\` (CI build ${INILLA_BUILD}) |"
+            echo "| version | ${INILLA_VERSION} (${INILLA_BUILD}) |"
+            echo "| iOS | 17.0 or later, arm64 — linked against the iPhoneOS ${SDK} SDK (${XCODE}) |"
+            echo "| size | $(du -h "${IPA}" | cut -f1) |"
+            echo "| SHA-256 | \`$(shasum -a 256 "${IPA}" | cut -d' ' -f1)\` |"
+            echo "| signing | ad-hoc — SideStore, AltStore and LiveContainer re-sign it |"
+            echo ""
+            echo "## iOS install"
+            echo ""
+            echo "1. On the iPhone, download \`${NAME}\` (Safari, signed in to GitHub). From a run's artifacts it arrives as a zip: tap it in the Files app."
+            echo "2. **SideStore** → My Apps → ＋ → the \`.ipa\`, or **LiveContainer** → ＋ → the \`.ipa\` (keep it a private app)."
+            echo "3. First launch asks for the game data: your own 1.12.1 \`Data\` folder, copied in or downloaded from your iNilla server's data host."
+            echo ""
+            echo "Crash or black screen: Files → iNilla → benilla-config → Diagnostics holds the session log."
+          } > target/inilla-ios-out/build-notes.md
+          cat target/inilla-ios-out/build-notes.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      # Read by the release job for its notes; not a release asset.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inilla-build-notes
+          path: target/inilla-ios-out/build-notes.md
+          retention-days: 1
+
+  # One GitHub Release with every platform's artifact. Runs on a `v*` tag, or on a manual run with
+  # `release` set; any failed build job skips it. Pre-release until a build is marked tested by hand.
+  release:
+    needs: [desktop, android, ios-package]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Without a name, every artifact lands in its own dist/<artifact-name>/ folder.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # Each asset is named after its artifact, so the two `benilla` binaries (Linux, macOS) do not
+      # collide. The staticlib and the notes are intermediates, not assets.
+      - name: Bundle release assets
+        run: |
+          shopt -s nullglob
+          mkdir -p release
+          for dir in dist/*/; do
+            name=$(basename "$dir")
+            case "$name" in inilla-ios-staticlib|inilla-build-notes) continue ;; esac
+            files=("$dir"*)
+            if [ "${#files[@]}" -ne 1 ]; then
+              echo "::error::artifact $name holds ${#files[@]} files, expected 1"
+              exit 1
+            fi
+            cp "${files[0]}" "release/$name"
+          done
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          ls -l release
+
+      # The release text is the annotated tag's message, or the `notes` input (first line the
+      # title); the iOS build facts and install steps follow, then GitHub's generated changelog.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          NOTES_IN: ${{ inputs.notes }}
+        run: |
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="$GITHUB_REF_NAME"
+            git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            SUBJECT=$(git tag -l --format='%(contents:subject)' "$TAG")
+            git tag -l --format='%(contents:body)' "$TAG" > "$NOTES"
+            WHERE=(--verify-tag)
+          else
+            TAG="$RELEASE"
+            if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "release must look like v1.2.3, got: $TAG" >&2
+              exit 1
+            fi
+            SUBJECT=$(printf '%s\n' "$NOTES_IN" | head -n 1)
+            printf '%s\n' "$NOTES_IN" | tail -n +2 > "$NOTES"
+            WHERE=(--target "$GITHUB_SHA")
+          fi
+          if [ -f dist/inilla-build-notes/build-notes.md ]; then
+            { echo ""; cat dist/inilla-build-notes/build-notes.md; } >> "$NOTES"
+          fi
+          gh release create "$TAG" release/* "${WHERE[@]}" --title "benilla-TWOW ${TAG}${SUBJECT:+ — $SUBJECT}" \
+            --notes-file "$NOTES" --generate-notes --prerelease

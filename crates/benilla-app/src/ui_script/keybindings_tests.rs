@@ -527,6 +527,9 @@ fn the_esc_ladder_closes_the_window_and_the_checkbox_switches_sets() {
         .unwrap(),
         "the box springs back until the popup decides"
     );
+    // A frame with the popup up runs `StaticPopup_OnUpdate`, which compares its timeout.
+    s.tick(0.1);
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
     s.run("StaticPopup1Button2:Click()").unwrap();
     assert_eq!(s.current_binding_set(), 2);
     assert!(s.character_bindings_exist());
@@ -541,6 +544,25 @@ fn the_esc_ladder_closes_the_window_and_the_checkbox_switches_sets() {
     );
     assert_eq!(s.take_keybind_requests(), vec![KeybindRequest::Save(1)]);
     assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// `StaticPopup_Show` copies an entry's `timeout` into `timeleft`, and `StaticPopup_OnUpdate`
+/// compares it with 0 every frame (`StaticPopup.lua:1713`), so every entry declares one, as each
+/// stock entry does.
+#[test]
+fn every_dialog_declares_a_timeout() {
+    benilla_formats::wow_data_or_skip!();
+    let s = harness();
+    let missing = s
+        .eval::<String>(
+            "local out = {} \
+             for which, d in pairs(StaticPopupDialogs) do \
+                 if type(d.timeout) ~= 'number' then table.insert(out, which) end \
+             end \
+             table.sort(out) return table.concat(out, ' ')",
+        )
+        .unwrap();
+    assert_eq!(missing, "", "dialogs with no numeric timeout");
 }
 
 #[test]
@@ -653,10 +675,10 @@ fn the_action_bar_abbreviation_is_the_refs_own_getbindingtext() {
         .unwrap());
 }
 
-/// A spin bubbles up the parent chain, so the wheel handler sits on the mouse-enabled page body,
-/// which also catches a spin over a row's name. The bar sits in the gutter inside the body.
+/// The wheel handler sits on the page body, which takes the wheel itself and so catches a spin
+/// over a row's name (no parent walk). The bar sits in the gutter inside the body.
 #[test]
-fn the_wheel_bubbles_from_the_rows_and_the_bar_rides_the_gutter() {
+fn the_body_takes_a_spin_over_a_row_and_the_bar_rides_the_gutter() {
     benilla_formats::wow_data_or_skip!();
     let mut s = harness();
     on_page(&mut s);

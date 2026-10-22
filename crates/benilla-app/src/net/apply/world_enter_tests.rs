@@ -50,7 +50,6 @@ fn app() -> (App, Receiver<ClientCommand>) {
 /// The login edge `connected` writes at `CMSG_PLAYER_LOGIN`.
 fn log_in(app: &mut App) {
     app.world_mut().write_message(EnteredWorldMessage {
-        billing_time_rested: 0,
         tutorial_flags: None,
     });
 }
@@ -154,11 +153,6 @@ fn the_client_schedules_the_sends_in_the_reference_order() {
     assert!(runs_before(
         &mut app,
         crate::ui_battlefield::reset_on_world_enter,
-        crate::ui_dialog_verbs::meeting_stone_enter_world
-    ));
-    assert!(runs_before(
-        &mut app,
-        crate::ui_dialog_verbs::meeting_stone_leave_world,
         crate::ui_dialog_verbs::meeting_stone_enter_world
     ));
 }

@@ -3,9 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use super::test_support::link_dir;
 use super::{survey, Drew};
-#[cfg(not(unix))]
-use super::use_probe_tests::copy_dir_recursive;
 
 /// One throwaway AddOns root, cleaned up on drop even if a test panics.
 struct Fixtures(PathBuf);
@@ -46,8 +45,8 @@ impl Drop for Fixtures {
     }
 }
 
-/// **The proof, in both directions.** An addon that paints must register; one that does not must
-/// not — and "creates a frame" is not "paints".
+/// An addon that paints registers, one that does not stays `nothing`, and creating a frame is not
+/// painting.
 #[test]
 fn the_render_column_can_fail() {
     benilla_formats::wow_data_or_skip!();
@@ -150,10 +149,7 @@ fn omnicc_and_bagnon_come_out_on_opposite_sides() {
     // Symlinked into a small root: the full corpus sweep is the `addon_harness` example's job.
     let fx = Fixtures::new("oracle");
     for name in ["!OmniCC", "Bagnon", "Bagnon_Core", "Bagnon_Forever"] {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(corpus.join(name), fx.root().join(name)).unwrap();
-        #[cfg(not(unix))]
-        copy_dir_recursive(&corpus.join(name), &fx.root().join(name)).unwrap();
+        link_dir(&corpus.join(name), &fx.root().join(name)).unwrap();
     }
     let reports = survey(fx.root());
     let row = |name: &str| {

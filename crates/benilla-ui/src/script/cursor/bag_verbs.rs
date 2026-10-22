@@ -84,7 +84,9 @@ pub(super) fn put_item_in_bag(model: &mut Model, live: u32) -> bool {
         // An empty slot: the doll handler equips the bag (`0x4c7300`), and the answer is nil
         // whether or not it went in (`0x4c7cae xor eax,eax`). With an item held the doll click
         // only places, so it owes no pickup.
-        let click = doll_click(model, live);
+        // A held item takes the click before an armed item pick (`0x4c769a`), so no bind, and no
+        // gate, is reached.
+        let click = doll_click(model, live, true);
         debug_assert!(matches!(click, DollClick::Done(_)));
         return false;
     }
@@ -96,9 +98,20 @@ pub(super) fn put_item_in_bag(model: &mut Model, live: u32) -> bool {
         return true;
     }
 
-    if is_container(&held) || held.bag == EQUIPMENT_BAG {
-        // A swap (`0x5e0c40`); an item from a bag equipment slot enters this fork too, hence the
-        // `||`. A split stack cannot swap and stays held: the reference splits only when storing.
+    // A held item that lives in this very bag cancels (`0x4c7cea`-`0x4c7d11`: its container guid
+    // is the occupant's): `ClearCursor(1,1)`, answer 1, nothing sent.
+    if autostore_container(live) == Some(held.bag) {
+        clear_cursor(model);
+        return true;
+    }
+
+    // The swap fork: the held item comes from the player's own bag slots 19-22 (`0x4c7d44`-
+    // `0x4c7d5e`, 20-23 here) or is a container (`0x4c7dc4`). Any other item, a worn helm
+    // included, is stored.
+    let from_bag_slot = held.bag == EQUIPMENT_BAG && (20..=23).contains(&held.slot);
+    if from_bag_slot || is_container(&held) {
+        // A swap (`0x5e0c40`). A split stack cannot swap and stays held: the reference splits
+        // only when storing.
         if held.count.is_none() {
             model.container_moves.push(ContainerMove {
                 src_bag: held.bag,
@@ -155,9 +168,9 @@ pub(super) fn put_item_in_backpack(model: &mut Model) -> bool {
 /// occupant that is no container, or is locked, returns (`0x4c7bbf`, `0x4c7bc8`); a container is
 /// picked up, its setter's clear dropping any other payload. It never places or swaps, and the
 /// client has no empty-bag rule: the server refuses with `EQUIP_ERR_CAN_ONLY_DO_WITH_EMPTY_BAGS`.
-pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) {
+pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) -> mlua::Result<()> {
     if !accepts(live) {
-        return;
+        return Ok(());
     }
     let (gated, occupied) = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
@@ -170,7 +183,7 @@ pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) {
         (gated, occupied)
     };
     if gated {
-        return;
+        return Ok(());
     }
     verb(lua, |model| {
         if matches!(model.cursor, Some(CursorPayload::Item(_))) {
@@ -178,8 +191,8 @@ pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) {
         }
     });
     if !occupied {
-        super::doll::pickup_inventory_item(lua, live);
-        return;
+        super::doll::pickup_inventory_item(lua, live)?;
+        return Ok(());
     }
     let picked = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
@@ -188,6 +201,7 @@ pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) {
     if let Some(item) = picked {
         pick_up_item(lua, item);
     }
+    Ok(())
 }
 
 /// `PickupBagFromSlot`'s grab: an unlocked container in `live` (`0x4c7bc1`), which it picks up
@@ -214,6 +228,15 @@ fn grab_bag(model: &Model, live: u32) -> Option<CursorItem> {
         .filter(is_container)
 }
 
+/// The 1-based slot of a bag verb: the slot reader `0x4c8520` passes it and its 0-based slot is
+/// `0x13` or more, else `message`.
+fn bag_slot(lua: &Lua, v: Value, message: &'static str) -> mlua::Result<u32> {
+    match crate::script::inventory_verbs::inventory_slot_arg(lua, v, message) {
+        Ok(slot0) if slot0 >= 0x13 => Ok((slot0 + 1) as u32),
+        _ => Err(mlua::Error::RuntimeError(message.into())),
+    }
+}
+
 /// Register the three verbs as globals.
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
@@ -229,7 +252,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "PutItemInBag",
-        lua.create_function(|lua, live: u32| {
+        lua.create_function(|lua, live: Value| {
+            // `Invalid bag slot in PutItemInBag` (`0x848b84`) unless the slot reader passes and
+            // the slot is a bag's or beyond, Lua 20 up (`0x4c8f13`, `0x4c8f1f`).
+            let live = bag_slot(lua, live, "Invalid bag slot in PutItemInBag")?;
             consumed(verb(lua, |model| put_item_in_bag(model, live)))
         })?,
     )?;
@@ -239,9 +265,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     g.set(
         "PickupBagFromSlot",
-        lua.create_function(|lua, live: u32| {
-            pickup_bag_from_slot(lua, live);
-            Ok(())
+        lua.create_function(|lua, live: Value| {
+            // `Invalid bag slot in PickupBagFromSlot` (`0x848ba8`) on the same two tests
+            // (`0x4c8fb3`, `0x4c8fbf`).
+            let live = bag_slot(lua, live, "Invalid bag slot in PickupBagFromSlot")?;
+            pickup_bag_from_slot(lua, live)
         })?,
     )?;
 
@@ -306,7 +334,7 @@ mod tests {
             },
         );
         ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }
@@ -470,6 +498,91 @@ mod tests {
         assert!(locked(&s));
     }
 
+    /// A worn non-bag item dropped on an occupied bag slot is stored in that bag
+    /// (`0x4c7e06` into `0x5e12e0`), not swapped: only an item held from the bag slots 19-22 or a
+    /// container swaps (`0x4c7d44`-`0x4c7d5e`, `0x4c7dc4`).
+    #[test]
+    fn a_worn_item_on_an_occupied_bag_slot_is_stored_not_swapped() {
+        let mut s = UiScript::new().unwrap();
+        let mut doll: InventorySlots = Default::default();
+        doll[1] = Some(InvSlotView {
+            item_id: 1234,
+            icon: Some("Interface\\Icons\\INV_Helmet_01".into()),
+            count: 1,
+            equip_slots: vec![1],
+            guid: 0x301,
+            ..Default::default()
+        });
+        doll[20] = Some(bag_slot_view(4500));
+        s.set_inventory_slots(doll);
+        s.run("PickupInventoryItem(1)").unwrap();
+        assert_eq!(s.cursor_item().map(|i| i.bag), Some(EQUIPMENT_BAG));
+
+        assert_eq!(s.eval::<i64>("return PutItemInBag(20)").unwrap(), 1);
+        assert!(s.take_container_moves().is_empty(), "a store, not a swap");
+        assert_eq!(
+            s.take_bag_autostores(),
+            vec![BagAutoStore {
+                src_bag: EQUIPMENT_BAG,
+                src_slot: 1,
+                dst_bag: 1,
+                count: None,
+            }]
+        );
+        assert!(s.cursor_item().is_none());
+    }
+
+    /// A bag held from its own bag slot still swaps (`0x4c7d44`-`0x4c7d5e`).
+    #[test]
+    fn a_bag_held_from_a_bag_slot_swaps_with_an_occupied_one() {
+        let mut s = UiScript::new().unwrap();
+        let mut doll: InventorySlots = Default::default();
+        doll[20] = Some(bag_slot_view(4500));
+        doll[21] = Some(bag_slot_view(4501));
+        s.set_inventory_slots(doll);
+        s.run("PickupInventoryItem(20)").unwrap();
+
+        assert_eq!(s.eval::<i64>("return PutItemInBag(21)").unwrap(), 1);
+        assert!(s.take_bag_autostores().is_empty());
+        assert_eq!(
+            s.take_container_moves(),
+            vec![ContainerMove {
+                src_bag: EQUIPMENT_BAG,
+                src_slot: 20,
+                dst_bag: EQUIPMENT_BAG,
+                dst_slot: 21,
+                count: None,
+            }]
+        );
+    }
+
+    /// An item dropped on the bag it already lives in is a cancel (`0x4c7cea`-`0x4c7d11`): the
+    /// cursor clears with an unlock and nothing goes out, where a store would name the same bag.
+    #[test]
+    fn an_item_dropped_on_its_own_bag_cancels() {
+        let mut s = UiScript::new().unwrap();
+        let mut doll: InventorySlots = Default::default();
+        doll[20] = Some(bag_slot_view(4500));
+        s.set_inventory_slots(doll);
+        s.set_container(1, Some(backpack()));
+        s.run("PickupContainerItem(1, 2)").unwrap();
+        assert!(s.item_locked(0x202));
+
+        assert_eq!(s.eval::<i64>("return PutItemInBag(20)").unwrap(), 1);
+        assert!(s.cursor_item().is_none());
+        assert!(!s.item_locked(0x202), "ClearCursor(1,1) unlocked it");
+        assert!(s.take_bag_autostores().is_empty());
+        assert!(s.take_container_moves().is_empty());
+
+        // Another bag's button is still a store.
+        let mut doll: InventorySlots = Default::default();
+        doll[21] = Some(bag_slot_view(4501));
+        s.set_inventory_slots(doll);
+        s.run("PickupContainerItem(1, 2)").unwrap();
+        assert_eq!(s.eval::<i64>("return PutItemInBag(21)").unwrap(), 1);
+        assert_eq!(s.take_bag_autostores().len(), 1);
+    }
+
     #[test]
     fn the_backpack_button_always_auto_stores_even_a_bag() {
         let mut s = UiScript::new().unwrap();
@@ -510,8 +623,14 @@ mod tests {
         s.set_inventory_slots(doll);
         s.run("PickupContainerItem(0, 1)").unwrap();
 
-        assert!(s.eval::<bool>("return PutItemInBag(16) == nil").unwrap());
-        assert!(s.eval::<bool>("return PutItemInBag(0) == nil").unwrap());
+        // Below Lua 20 the verb raises before any move (`0x4c8f1f`, `0x848b84`).
+        for slot in [16, 0] {
+            let e = s
+                .run(&format!("PutItemInBag({slot})"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("Invalid bag slot in PutItemInBag"), "{e}");
+        }
         assert!(s.cursor_item().is_some(), "untouched");
         assert!(s.take_container_moves().is_empty());
         assert!(s.take_bag_autostores().is_empty());

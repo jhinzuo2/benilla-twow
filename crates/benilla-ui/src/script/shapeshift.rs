@@ -4,6 +4,7 @@
 
 use mlua::{Lua, MultiValue, Value};
 
+use super::binding_abi;
 use super::Model;
 
 /// One stance-bar button, resolved by the app.
@@ -54,7 +55,7 @@ impl super::UiScript {
     /// each, or cancels it when it is the active form.
     pub fn take_shapeshift_casts(&mut self) -> Vec<u32> {
         self.take_calls_where(|c| match c {
-            super::ScriptCall::CastShapeshiftForm(id) => Some(*id),
+            super::ScriptCall::CastShapeshiftForm { spell_id, .. } => Some(*spell_id),
             _ => None,
         })
     }
@@ -121,9 +122,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let now = crate::script::clock::now(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(match form_at(&model, i).and_then(|f| f.cooldown) {
-                Some((start, duration, enabled)) if start + duration > now || !enabled => {
-                    (start, duration, i32::from(enabled))
-                }
+                Some((start, duration, enabled)) if start + duration > now || !enabled => (
+                    crate::script::clock::held_start(start, enabled, now),
+                    duration,
+                    i32::from(enabled),
+                ),
                 _ => (0.0, 0.0, 1),
             })
         })?,
@@ -131,12 +134,26 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "CastShapeshiftForm",
-        lua.create_function(|lua, i: u32| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            if let Some(spell_id) = form_at(&model, i).map(|f| f.view.spell_id) {
-                model
-                    .script_calls
-                    .push(super::ScriptCall::CastShapeshiftForm(spell_id));
+        lua.create_function(|lua, i: Value| {
+            // A bare `tonumber` compared with 0.0 (`0x4b4820`, `0x802970`): a zero, and so any
+            // non-number, raises `Usage: CastShapeshiftForm(index)` (`0x846a90`, `0x4b4832`);
+            // the slot is then `_ftol`'s (`0x4b4855`).
+            let n = lua.coerce_number(i)?.unwrap_or(0.0);
+            if n == 0.0 {
+                return Err(mlua::Error::runtime("Usage: CastShapeshiftForm(index)"));
+            }
+            let i = binding_abi::ftol(n) as u32;
+            // The form's cast is `TryCastSpell` (`0x4b4992` → `0x6e5a90`), behind the gate's tag 2;
+            // the cancels of an active form (`0x4b496b`, `0x4b497c`) run ahead of it, so the call
+            // is queued whatever the gate said and carries the answer to the cast alone.
+            let may_cast = super::protected::gate(lua, super::protected::Tag::CAST);
+            let spell_id = form_at(&lua.app_data_ref::<Model>().expect("model app_data"), i)
+                .map(|f| f.view.spell_id);
+            if let Some(spell_id) = spell_id {
+                super::calls::submit(
+                    lua,
+                    super::ScriptCall::CastShapeshiftForm { spell_id, may_cast },
+                )?;
             }
             Ok(())
         })?,
@@ -231,11 +248,45 @@ mod tests {
     #[test]
     fn cast_queues_the_form_spell_and_ignores_out_of_range() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_shapeshift_forms(forms());
 
         s.run("CastShapeshiftForm(2)").unwrap();
         s.run("CastShapeshiftForm(9)").unwrap(); // out of range: no-op
         assert_eq!(s.take_shapeshift_casts(), vec![71]);
         assert!(s.take_shapeshift_casts().is_empty(), "drain empties");
+    }
+
+    /// A held form answers the call's own now, whatever was pushed (`0x6e1517`).
+    #[test]
+    fn a_held_form_answers_the_polls_now() {
+        let mut s = UiScript::new().unwrap();
+        s.tick(10.0);
+        let mut f = forms();
+        f[1].cooldown = Some((0, 1, false));
+        s.set_shapeshift_forms(f);
+        let poll = |s: &UiScript| {
+            s.eval::<(f64, f64, i32)>("return GetShapeshiftFormCooldown(2)")
+                .unwrap()
+        };
+        assert_eq!(poll(&s), (10.0, 0.001, 0));
+        s.tick(0.02);
+        let (start, _, _) = poll(&s);
+        assert_eq!(start, s.eval::<f64>("return GetTime()").unwrap());
+        assert!((start - 10.02).abs() < 1e-9);
+    }
+
+    /// `CastShapeshiftForm` casts through `TryCastSpell` inside the call (`0x4b4992` → `0x6e5a90`).
+    #[test]
+    fn a_form_cast_applies_in_the_call_with_a_host_lent() {
+        let mut s = UiScript::new().unwrap();
+        s.set_shapeshift_forms(forms());
+        assert_eq!(
+            crate::script::host::test_support::applied_in_call(&mut s, "CastShapeshiftForm(2)"),
+            vec![crate::script::ScriptCall::CastShapeshiftForm {
+                spell_id: 71,
+                may_cast: true
+            }]
+        );
     }
 }

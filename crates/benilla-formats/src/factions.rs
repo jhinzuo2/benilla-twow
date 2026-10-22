@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use benilla_dbc::{FieldType, Schema, SchemaField};
 
-use crate::dbc::{parse, u32_at};
+use crate::dbc::{loc_str, parse, u32_at};
 use crate::Chain;
 
 const FACTION_TEMPLATE: &str = "DBFilesClient\\FactionTemplate.dbc";
@@ -22,10 +22,14 @@ const FACTION_GROUP: &str = "DBFilesClient\\FactionGroup.dbc";
 const CHR_RACES: &str = "DBFilesClient\\ChrRaces.dbc";
 
 /// One `FactionTemplate.dbc` row: the fields the reaction comparator reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FactionTemplate {
     /// The row's `Faction.dbc` id, what another template's `enemies`/`friends` lists name.
     pub faction: u32,
+    /// Column 2, `Flags` (`row+0x8`): bit `0x1000` makes the template's units hostile to a
+    /// contested player (`0x6065be`), vmangos `FACTION_TEMPLATE_FLAG_ATTACK_PVP_ACTIVE_PLAYERS`
+    /// (`DBCEnums.h:81`).
+    pub flags: u32,
     /// The faction-group bits this template belongs to (Player/Alliance/Horde/Monster).
     pub group_mask: u32,
     pub friend_group_mask: u32,
@@ -255,6 +259,27 @@ impl FactionCatalog {
         }
     }
 
+    /// This catalog with one `Faction.dbc` row's reputation identity: list slot `rep_index`, and
+    /// `base` for the races in `race_mask`, whatever the class. Fixture constructor for tests.
+    pub fn with_reputation(
+        mut self,
+        faction_id: u32,
+        rep_index: i32,
+        race_mask: u32,
+        base: i32,
+    ) -> Self {
+        let info = FactionInfo {
+            rep_index,
+            team: 0,
+            race_masks: [race_mask, 0, 0, 0],
+            class_masks: [0; 4],
+            base: [base, 0, 0, 0],
+            flags: [0; 4],
+        };
+        self.factions.insert(faction_id, info);
+        self
+    }
+
     /// The template row for a `UNIT_FIELD_FACTIONTEMPLATE` id.
     pub fn template(&self, id: u32) -> Option<&FactionTemplate> {
         self.templates.get(&id)
@@ -423,6 +448,7 @@ pub fn load_faction_catalog(chain: &mut Chain) -> Result<FactionCatalog> {
                 id,
                 FactionTemplate {
                     faction: at(1),
+                    flags: at(2),
                     group_mask: at(3),
                     friend_group_mask: at(4),
                     enemy_group_mask: at(5),
@@ -437,6 +463,7 @@ pub fn load_faction_catalog(chain: &mut Chain) -> Result<FactionCatalog> {
         .read_file(FACTION)
         .with_context(|| format!("reading {FACTION}"))?;
     let rs = parse(&bytes, faction_schema(), "Faction")?;
+    let locale = chain.locale();
     let mut factions = HashMap::with_capacity(rs.records().len());
     let mut names = HashMap::with_capacity(rs.records().len());
     let mut descriptions = HashMap::new();
@@ -455,12 +482,12 @@ pub fn load_faction_catalog(chain: &mut Chain) -> Result<FactionCatalog> {
                     flags: [at(14), at(15), at(16), at(17)],
                 },
             );
-            // Name0 (enUS), column 19: after the ID, the index, 16 slot columns and `Team`.
-            if let Some(name) = crate::dbc::str_at(&rs, r, 19) {
+            // The name block, column 19: after the ID, the index, 16 slot columns and `Team`.
+            if let Some(name) = loc_str(&rs, r, 19, locale) {
                 names.insert(id, name);
             }
-            // Desc0 (enUS), column 28, past the name block; empty on most rows.
-            if let Some(desc) = crate::dbc::str_at(&rs, r, 28) {
+            // The description block, column 28, past the name block; empty on most rows.
+            if let Some(desc) = loc_str(&rs, r, 28, locale) {
                 descriptions.insert(id, desc);
             }
         }
@@ -479,15 +506,15 @@ pub fn load_faction_catalog(chain: &mut Chain) -> Result<FactionCatalog> {
             Some(FactionGroupRow {
                 mask_id: u32_at(r, 1)?,
                 internal: crate::dbc::str_at(&rs, r, 2).unwrap_or_default(),
-                name: crate::dbc::str_at(&rs, r, 3).unwrap_or_default(),
+                name: loc_str(&rs, r, 3, locale).unwrap_or_default(),
             })
         })
         .collect();
     for r in rs.records() {
-        let (Some(mask_id), Some(name)) = (u32_at(r, 1), crate::dbc::str_at(&rs, r, 3)) else {
+        let (Some(mask_id), Some(name)) = (u32_at(r, 1), loc_str(&rs, r, 3, locale)) else {
             continue;
         };
-        // Field 2 is `InternalName`, field 3 `Name0`; `UnitFactionGroup` returns both.
+        // Field 2 is `InternalName`, field 3 the name block; `UnitFactionGroup` returns both.
         if let Some(internal) = crate::dbc::str_at(&rs, r, 2) {
             group_internal_names.insert(1u32 << mask_id, internal);
         }
@@ -524,11 +551,7 @@ mod tests {
     fn tpl(faction: u32) -> FactionTemplate {
         FactionTemplate {
             faction,
-            group_mask: 0,
-            friend_group_mask: 0,
-            enemy_group_mask: 0,
-            enemies: [0; 4],
-            friends: [0; 4],
+            ..Default::default()
         }
     }
 

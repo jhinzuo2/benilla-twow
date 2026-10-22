@@ -73,7 +73,7 @@ fn fired_input(input: FiredInput) -> (Input, f32) {
 
 impl BindingsState {
     /// Apply Lua's binding calls, in call order.
-    pub(super) fn apply_script_input(&mut self, inputs: Vec<BindingInput>) {
+    pub(crate) fn apply_script_input(&mut self, inputs: Vec<BindingInput>) {
         for input in inputs {
             match input {
                 // The set helper `0x514840` early-outs on a bit already set, so a Start on a held
@@ -100,5 +100,18 @@ impl BindingsState {
                 }
             }
         }
+    }
+
+    /// The state after `earlier` frames' calls and this frame's `now`: the earlier edges are
+    /// spent, as the frame start clears them, and the earlier holds stay.
+    #[cfg(test)]
+    pub(crate) fn after_calls(earlier: Vec<BindingInput>, now: Vec<BindingInput>) -> Self {
+        let mut state = Self::default();
+        state.apply_script_input(earlier);
+        state.just.clear();
+        state.fired.clear();
+        state.amounts.clear();
+        state.apply_script_input(now);
+        state
     }
 }

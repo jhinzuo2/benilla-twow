@@ -76,16 +76,8 @@ pub(crate) fn on_cvar(
         "mousespeed" => {
             look.sensitivity = v.clamp(*MOUSE_SPEED_RANGE.start(), *MOUSE_SPEED_RANGE.end());
         }
+        // The registry refuses a speed outside the validator's range (`0x50c000`).
         "camerayawmovespeed" | "camerapitchmovespeed" => {
-            if !CAMERA_SPEED_RANGE.contains(&v) {
-                warn!(
-                    "cvar {}: value out of range ({} - {}) — ignored",
-                    ev.name,
-                    CAMERA_SPEED_RANGE.start(),
-                    CAMERA_SPEED_RANGE.end()
-                );
-                return;
-            }
             if ev.is("cameraYawMoveSpeed") {
                 look.yaw_speed = v;
             } else {
@@ -106,9 +98,9 @@ pub(crate) fn on_cvar(
         // The stock dropdown writes 1 Smart, 2 Always, 0 Never (`UIOptionsFrame.lua:518`).
         "camerasmoothstyle" => follow.style = FollowStyle::from_cvar(v),
         "camerasmoothtrackingstyle" => follow.tracking_style = FollowStyle::from_cvar(v),
-        "camerayawsmoothspeed" => {
-            follow.yaw_speed = v.clamp(*FOLLOW_SPEED_RANGE.start(), *FOLLOW_SPEED_RANGE.end());
-        }
+        // The registry has refused a rate outside the validator's [0.1, 360] (`0x50c000`); the
+        // follow reader takes the stored value as is (`0x512d75`).
+        "camerayawsmoothspeed" => follow.yaw_speed = v,
         _ => {}
     }
 }
@@ -121,10 +113,6 @@ pub(crate) fn on_cvar(
 /// shipped feel: both axes turn alike, where the reference's yaw turns 1.5× faster than its pitch.
 const LOOK_YAW_PER_SPEED: f32 = LOOK_SENSITIVITY / 180.0;
 const LOOK_PITCH_PER_SPEED: f32 = LOOK_SENSITIVITY / 90.0;
-
-/// The reference's validator range for the `camera*MoveSpeed`/`SmoothSpeed` CVars (`0x50c000` →
-/// `0x50b330`): an out-of-range value prints "Value out of range" and the old one stands.
-pub(crate) const CAMERA_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=360.0;
 
 /// The mouse-look knobs. `invert_pitch` is 1.12's `mouseInvertPitch` checkbox
 /// (`UIOptionsFrame.lua:4`); `sensitivity` is `mousespeed`, scaling both the rotation and the click
@@ -154,20 +142,19 @@ impl Default for LookConfig {
 
 impl LookConfig {
     /// Radians of yaw per raw mouse unit, read by both the rotation and the click travel budget.
-    pub(super) fn yaw_rate(self) -> f32 {
+    /// iNilla: `pub(crate)` for the controller's look, which turns radians into mouse units.
+    pub(crate) fn yaw_rate(self) -> f32 {
         self.yaw_speed * LOOK_YAW_PER_SPEED * self.sensitivity
     }
 
     /// Radians of pitch per raw mouse unit: its own CVar and the law's divisor 600.
-    pub(super) fn pitch_rate(self) -> f32 {
+    pub(crate) fn pitch_rate(self) -> f32 {
         self.pitch_speed * LOOK_PITCH_PER_SPEED * self.sensitivity
     }
 }
 /// `cameraYawSmoothSpeed`, default 180°/s (`[0xbe1070]`, read at `0x512d75`): a duration divisor,
 /// as a return lasts `|Δyaw| / rate × factor`. The AUTO_FOLLOW_SPEED slider, greyed under Never.
 pub(crate) const FOLLOW_SPEED_DEFAULT: f32 = 180.0;
-/// The 1.12 slider's own range for [`FollowConfig::yaw_speed`].
-pub(crate) const FOLLOW_SPEED_RANGE: std::ops::RangeInclusive<f32> = 90.0..=270.0;
 /// `cameraSmoothTimeMin`/`Max`: 0.1 s and 2.0 s (`[0xbe105c]`/`[0xbe1038]`, clamped at `0x510f4d`).
 const FOLLOW_TIME_MIN: f32 = 0.1;
 const FOLLOW_TIME_MAX: f32 = 2.0;
@@ -708,46 +695,48 @@ pub(super) fn latch_world_mouse(
     // ground-targeting veto (`+0x3c`, `0x7cba30`) arrives through `PointerOverUi`
     // (`UiScript::set_nameplate_hit_test_veto`). The wheel still zooms over a plate.
     pointer_over_ui: Res<crate::ui_script::PointerOverUi>,
-    // A press the UI consumed with nothing hovered, the layout drag's: no frame saw it, the
-    // world's included (`0x766353`).
+    // A press the UI consumed with nothing hovered, the layout drag's or a right press that
+    // dropped a payload: no frame saw it, the world's included (`0x766353`, `0x766370`).
     press_consumed: Option<Res<crate::ui_script::PlayerUiPressConsumed>>,
     mut rig: ResMut<CameraControl>,
     cameras: Query<&Camera, With<FlyCam>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     cover: Option<Res<crate::loading_screen::LoadingScreen>>,
 ) {
-    let calls = script
-        .as_mut()
-        .map(|s| s.take_mouselook_calls())
-        .unwrap_or_default();
-    let Ok(camera) = cameras.single() else {
-        return;
-    };
-    let over_ui = pointer_over_ui.0 || press_consumed.is_some_and(|c| c.0);
-    let world_press = rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui);
-    let wm = &mut rig.world_mouse;
-    wm.update(&buttons, world_press);
-    // The script's calls, made since the last latch, before this frame's release.
-    for on in calls {
-        wm.mouselook(on);
-    }
-    // The right button's release ends a scripted channel too, wherever its press went: in
-    // freelook every button event goes to the `WorldFrame` (`0x492b50`), whose TURNORACTION up
-    // runs `TurnOrActionStop` (`0x514160`), `0x515090(1, 0, …)`.
-    if buttons.just_released(MouseButton::Right) {
-        wm.scripted = false;
-    }
-    // The world enter behind the cover clears the whole word (`0x5144c0` → `0x514b70(-1, …)`).
-    // A window deactivate clears none of it (`0x5144a3 and eax,0xfffff00f` keeps the low bits):
-    // the session outlives the focus, and only the OS cursor goes back ([`sync_look_focus`]).
-    if cover.is_some_and(|c| c.covering()) {
-        wm.scripted = false;
-    }
-    // `IsMouselooking` (`0x514270`) reads `[InputControl+4] & 1`, the TurnOrAction channel.
-    if let Some(mut script) = script {
-        script.set_turn_or_action_held(rig.world_mouse.turn());
-    }
+    hosted_vm.run(|mut script| {
+        let calls = script
+            .as_mut()
+            .map(|s| s.take_mouselook_calls())
+            .unwrap_or_default();
+        let Ok(camera) = cameras.single() else {
+            return;
+        };
+        let over_ui = pointer_over_ui.0 || press_consumed.is_some_and(|c| c.0);
+        let world_press = rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui);
+        let wm = &mut rig.world_mouse;
+        wm.update(&buttons, world_press);
+        // The script's calls, made since the last latch, before this frame's release.
+        for on in calls {
+            wm.mouselook(on);
+        }
+        // The right button's release ends a scripted channel too, wherever its press went: in
+        // freelook every button event goes to the `WorldFrame` (`0x492b50`), whose TURNORACTION up
+        // runs `TurnOrActionStop` (`0x514160`), `0x515090(1, 0, …)`.
+        if buttons.just_released(MouseButton::Right) {
+            wm.scripted = false;
+        }
+        // The world enter behind the cover clears the whole word (`0x5144c0` → `0x514b70(-1, …)`).
+        // A window deactivate clears none of it (`0x5144a3 and eax,0xfffff00f` keeps the low bits):
+        // the session outlives the focus, and only the OS cursor goes back ([`sync_look_focus`]).
+        if cover.is_some_and(|c| c.covering()) {
+            wm.scripted = false;
+        }
+        // `IsMouselooking` (`0x514270`) reads `[InputControl+4] & 1`, the TurnOrAction channel.
+        if let Some(script) = script {
+            script.set_turn_or_action_held(rig.world_mouse.turn());
+        }
+    })
 }
 
 /// The right button's down edge in the world, before the press is judged a click or a drag:

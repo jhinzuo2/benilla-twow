@@ -2,7 +2,7 @@
 
 use crate::order::Strata;
 
-use super::{ChildWalk, FrameHandle, RegionHandle, WidgetArena, SCALE_EPS};
+use super::{ChildWalk, FrameHandle, KindState, RegionHandle, WidgetArena, SCALE_EPS};
 
 impl WidgetArena {
     // ── Visibility ───────────────────────────────────────────────────────────────────────────────
@@ -27,22 +27,33 @@ impl WidgetArena {
     }
 
     /// [`Self::show_step`]'s mark (`0x76ae7b`, `0x764780`), which follows the gate whatever ran
-    /// between them.
+    /// between them. A character pane coming visible asks for a fresh copy of its subject first:
+    /// its show hook builds one while the frame is not yet visible (`0x505d03`, `0x505d3c`,
+    /// `0x505d56`), then chains to the base step (`0x505d44`).
     pub fn show_mark(&mut self, h: FrameHandle) {
         let Some(f) = self.frame_mut(h) else {
             return;
         };
+        if let KindState::Model(m) = &mut f.kind_state {
+            if let Some(c) = &mut m.character {
+                c.request_build();
+            }
+        }
         f.effective_visible = true;
         self.resequence_to_tail(h);
     }
 
     /// The hide transition's own step (`0x76ad50` up to its child walk): nothing unless the frame
     /// is visible (`0x76ad5b`); otherwise it marks itself invisible (`0x76ad93`). The shown bit is
-    /// not consulted. Whether it transitioned.
+    /// not consulted. Whether it transitioned. A character pane releases what `+0x318` holds
+    /// ([`super::ModelState::release_on_hide`]) and keeps the subject it was built from.
     pub fn hide_step(&mut self, h: FrameHandle) -> bool {
         match self.frame_mut(h) {
             Some(f) if f.effective_visible => {
                 f.effective_visible = false;
+                if let KindState::Model(m) = &mut f.kind_state {
+                    m.release_on_hide();
+                }
                 true
             }
             _ => false,
@@ -246,12 +257,16 @@ impl WidgetArena {
 
     // ── Alpha ────────────────────────────────────────────────────────────────────────────────────
 
-    /// `SetAlpha` (`0x76a690`): write the raw value to `h` and every descendant frame (`+0xc8`),
-    /// with no draw-time product, so a child's own later `SetAlpha` holds until an ancestor's next.
-    pub fn set_alpha(&mut self, h: FrameHandle, alpha: f32) {
+    /// The alpha walk (`0x76a690`, vtable slot 0x28): write the byte to `h` and every descendant
+    /// frame (`+0xc8`), with no draw-time product, so a child's own later `SetAlpha` holds until an
+    /// ancestor's next. A frame whose byte is already `alpha` ends the walk there, its subtree
+    /// untouched (`0x76a69a`), at every level.
+    pub fn set_alpha(&mut self, h: FrameHandle, alpha: u8) {
         let Some(f) = self.frame_mut(h) else { return };
+        if f.alpha == alpha {
+            return;
+        }
         f.alpha = alpha;
-        f.effective_alpha = alpha;
         let children = self.frame(h).expect("just wrote it").children.clone();
         for c in children {
             self.set_alpha(c, alpha);
@@ -324,6 +339,52 @@ impl WidgetArena {
         self.set_frame_level(h, plevel, false);
         let ps = self.parent_effective_scale(h);
         self.propagate_scale(h, ps);
+        // The subtree takes the new parent's scroll membership, none for no parent; the scroll
+        // child mark stays (`0x76ab8c`–`0x76abcb`: `0x76a400(parent & 0x2000, -1)`).
+        let member = new_parent.is_some_and(|np| self.frame(np).is_some_and(|f| f.scroll_member));
+        self.set_scroll_flags(h, member, None);
+    }
+
+    /// `SetScrollChild` (`0x786ce0`) on the ScrollFrame `sf`: the old child's subtree leaves the
+    /// scroll draw and the new one's joins it, old first, so the same child again stays in
+    /// (`0x786cf4`, `0x786d0a`). Returns the old child; `None` changes nothing on a frame that is
+    /// not a ScrollFrame.
+    pub fn set_scroll_child(
+        &mut self,
+        sf: FrameHandle,
+        child: Option<FrameHandle>,
+    ) -> Option<Option<FrameHandle>> {
+        let KindState::Scroll(s) = &mut self.frame_mut(sf)?.kind_state else {
+            return None;
+        };
+        let old = std::mem::replace(&mut s.child, child);
+        if let Some(old) = old {
+            self.set_scroll_flags(old, false, Some(false));
+        }
+        if let Some(new) = child {
+            self.set_scroll_flags(new, true, Some(true));
+        }
+        Some(old)
+    }
+
+    /// `0x76a400`: set or clear the scroll membership (`0x2000`) on `h` and its whole subtree, and
+    /// when `root` is given, the scroll child mark (`0x4000`) on `h` alone. `SetScrollChild`
+    /// clears both on the old child and sets both on the new one (`0x786cf4`, `0x786d0a`).
+    pub fn set_scroll_flags(&mut self, h: FrameHandle, member: bool, root: Option<bool>) {
+        let Some(f) = self.frame_mut(h) else {
+            return;
+        };
+        f.scroll_member = member;
+        if let Some(root) = root {
+            f.scroll_root = root;
+        }
+        let mut stack = f.children.clone();
+        while let Some(c) = stack.pop() {
+            if let Some(cf) = self.frame_mut(c) {
+                cf.scroll_member = member;
+                stack.extend_from_slice(&cf.children);
+            }
+        }
     }
 
     /// `SetParent` whole, for a caller with no handler to fire: the frames that lost visibility,
@@ -446,11 +507,19 @@ impl WidgetArena {
             .is_some_and(|f| f.char_enabled || f.key_enabled)
     }
 
-    /// `EnableMouseWheel`, the wheel's own bit, separate from the mouse's.
+    /// `EnableMouseWheel`, the wheel's own bit, separate from the mouse's. A bit newly set on a
+    /// visible frame enters the wheel list now (`0x76af00`), behind the equal levels there.
     pub fn set_mouse_wheel_enabled(&mut self, h: FrameHandle, enabled: bool) {
+        let stamp = self.next_kb_stamp;
+        let mut joined = false;
         if let Some(f) = self.frame_mut(h) {
+            joined = enabled && !f.mouse_wheel_enabled && f.effective_visible;
             f.mouse_wheel_enabled = enabled;
+            if joined {
+                f.wheel_stamp = stamp;
+            }
         }
+        self.next_kb_stamp += u64::from(joined);
     }
 
     pub fn is_mouse_wheel_enabled(&self, h: FrameHandle) -> bool {
@@ -474,15 +543,17 @@ impl WidgetArena {
     }
 
     /// `SetHitRectInsets`, `[left, right, top, bottom]`.
-    pub fn set_hit_rect_insets(&mut self, h: FrameHandle, insets: [f32; 4]) {
+    pub fn set_hit_rect_insets(&mut self, h: FrameHandle, insets: [crate::layout::Len; 4]) {
         if let Some(f) = self.frame_mut(h) {
             f.hit_rect_insets = insets;
         }
     }
 
     /// `GetHitRectInsets`, `[left, right, top, bottom]`.
-    pub fn hit_rect_insets(&self, h: FrameHandle) -> [f32; 4] {
-        self.frame(h).map(|f| f.hit_rect_insets).unwrap_or([0.0; 4])
+    pub fn hit_rect_insets(&self, h: FrameHandle) -> [crate::layout::Len; 4] {
+        self.frame(h)
+            .map(|f| f.hit_rect_insets)
+            .unwrap_or([crate::layout::Len::Script(0.0); 4])
     }
 
     // ── Small helpers ────────────────────────────────────────────────────────────────────────────

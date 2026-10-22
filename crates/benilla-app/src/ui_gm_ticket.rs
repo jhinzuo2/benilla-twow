@@ -11,14 +11,14 @@
 //! `GMSURVEY_DISPLAY` is not fired: vmangos never sends its trigger, `SMSG_GM_TICKET_STATUS_UPDATE`
 //! status 3, and the survey window (`Blizzard_GMSurveyUI`) is not built.
 
-use benilla_ui::script::{GmTicketIntent, GmTicketWrite, ScriptValue, UiScript};
+use benilla_ui::script::{GmTicketIntent, GmTicketWrite, ScriptValue, UnservedSend};
 use bevy::prelude::*;
 
 use benilla_assets::coords::bevy_to_wow;
 
 use crate::net::{ClientCommand, NetCommands};
 use crate::player::Player;
-use crate::ui_script::{UiFeed, UiInput, VmMemo};
+use crate::ui_script::{UiFeed, VmMemo};
 
 /// Spell 7355 "Stuck", what `Stuck()` casts: the only spell with `SPELL_EFFECT_STUCK` (84), which
 /// moves the player to their last safe position (vmangos `SpellEffects.cpp:4697`).
@@ -82,41 +82,52 @@ struct FedTicket {
     answers: u32,
     queue_answers: u32,
     categories_pushed: bool,
+    survey_pushed: bool,
 }
 
 /// Fire `UPDATE_TICKET` and `UPDATE_GM_STATUS` for unheard answers; push the categories once.
 fn feed_gm_ticket(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     state: Res<GmTicketState>,
     categories: Option<Res<GmTicketCategories>>,
+    survey: Option<Res<GmSurveyResource>>,
     mut feed: ResMut<GmTicketFeedState>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let fed = feed.vm.get(&script);
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        let fed = feed.vm.get(script);
 
-    if !fed.categories_pushed {
-        if let Some(categories) = categories.as_deref() {
-            script.set_gm_ticket_categories(categories.0.clone());
-            fed.categories_pushed = true;
+        if !fed.categories_pushed {
+            if let Some(categories) = categories.as_deref() {
+                script.set_gm_ticket_categories(categories.0.clone());
+                fed.categories_pushed = true;
+            }
         }
-    }
 
-    if fed.queue_answers != state.queue_answers {
-        fed.queue_answers = state.queue_answers;
-        // `arg1` is the status as a number: `HelpFrame` tests `== 1` for up and `== -1` to show
-        // `HELP_TICKET_QUEUE_DISABLED`; vmangos sends only 0 or 1, passed through unmapped.
-        script.fire_event(
-            "UPDATE_GM_STATUS",
-            vec![ScriptValue::Int(i64::from(state.queue_status))],
-        );
-    }
+        if !fed.survey_pushed {
+            if let Some(survey) = survey.as_deref() {
+                script.set_gm_survey_tables(survey.0.clone());
+                fed.survey_pushed = true;
+            }
+        }
 
-    if fed.answers != state.answers {
-        fed.answers = state.answers;
-        script.fire_event("UPDATE_TICKET", update_ticket_args(state.ticket.as_deref()));
-    }
+        if fed.queue_answers != state.queue_answers {
+            fed.queue_answers = state.queue_answers;
+            // `arg1` is the status as a number: `HelpFrame` tests `== 1` for up and `== -1` to show
+            // `HELP_TICKET_QUEUE_DISABLED`; vmangos sends only 0 or 1, passed through unmapped.
+            script.fire_event(
+                "UPDATE_GM_STATUS",
+                vec![ScriptValue::Int(i64::from(state.queue_status))],
+            );
+        }
+
+        if fed.answers != state.answers {
+            fed.answers = state.answers;
+            script.fire_event("UPDATE_TICKET", update_ticket_args(state.ticket.as_deref()));
+        }
+    })
 }
 
 /// `UPDATE_TICKET`'s arguments: category, text, the three day figures, assigned, opened. The wire
@@ -142,56 +153,83 @@ fn update_ticket_args(ticket: Option<&benilla_protocol::messages::GmTicket>) -> 
 
 /// Turn the window's clicks into packets.
 fn drain_gm_ticket(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut reask: ResMut<GmTicketState>,
     commands: Res<NetCommands>,
     player: Option<Res<Player>>,
     map: Option<Res<benilla_world::world_map::CurrentMap>>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
 
-    // The engine's re-asks first: they answer a push that arrived before this frame's input.
-    for _ in 0..reask.take_reasks() {
-        let _ = commands.0.send(ClientCommand::GmTicketGet);
-    }
+        // The engine's re-asks first: they answer a push that arrived before this frame's input.
+        for _ in 0..reask.take_reasks() {
+            let _ = commands.0.send(ClientCommand::GmTicketGet);
+        }
 
-    for _ in 0..script.take_stuck_casts() {
-        let _ = commands.0.send(ClientCommand::CastSpell {
-            spell_id: SPELL_STUCK,
-            target: None,
-        });
-    }
+        for _ in 0..script.take_stuck_casts() {
+            let _ = commands.0.send(ClientCommand::CastSpell {
+                spell_id: SPELL_STUCK,
+                target: None,
+            });
+        }
 
-    let intents = script.take_gm_ticket_intents();
-    if intents.is_empty() {
-        return;
-    }
-    // Where the player stands at send time, in WoW coordinates: where `.ticket go` takes the GM.
-    let pos = player.map(|p| bevy_to_wow(p.pos)).unwrap_or([0.0; 3]);
-    let map = map.map(|m| m.0).unwrap_or(0);
-    // In call order: `DeleteGMTicket(); GetGMTicket()` must not become get-then-delete.
-    for intent in intents {
-        let _ = commands.0.send(match intent {
-            GmTicketIntent::Ask => ClientCommand::GmTicketGet,
-            GmTicketIntent::AskStatus => ClientCommand::GmTicketSystemStatus,
-            GmTicketIntent::Delete => ClientCommand::GmTicketDelete,
-            GmTicketIntent::Write(write) => {
-                let category = write.category;
-                match client_command_for(write, map, pos) {
-                    Some(cmd) => cmd,
-                    None => {
-                        warn!(
-                            "gm ticket: refusing to file under category {category} — not a \
+        // The lottery and survey verbs' sends (the lottery has no module of its own, its window
+        // being unbuilt), in call order.
+        for send in script.take_unserved_sends() {
+            let _ = commands.0.send(match send {
+                UnservedSend::SkillBuyStep { skill_id } => ClientCommand::SkillBuyStep { skill_id },
+                UnservedSend::LotteryQuery => ClientCommand::LotteryQuery,
+                UnservedSend::BuyLotteryTicket { first, second } => {
+                    ClientCommand::BuyLotteryTicket { first, second }
+                }
+                UnservedSend::GmSurveySubmit {
+                    survey,
+                    answers,
+                    comment,
+                } => ClientCommand::GmSurveySubmit {
+                    survey,
+                    answers: answers
+                        .into_iter()
+                        .map(|a| (a.question, a.rating, a.comment))
+                        .collect(),
+                    comment,
+                },
+            });
+        }
+
+        let intents = script.take_gm_ticket_intents();
+        if intents.is_empty() {
+            return;
+        }
+        // Where the player stands at send time, in WoW coordinates: where `.ticket go` takes the
+        // GM.
+        let pos = player.map(|p| bevy_to_wow(p.pos)).unwrap_or([0.0; 3]);
+        let map = map.map(|m| m.0).unwrap_or(0);
+        // In call order: `DeleteGMTicket(); GetGMTicket()` must not become get-then-delete.
+        for intent in intents {
+            let _ = commands.0.send(match intent {
+                GmTicketIntent::Ask => ClientCommand::GmTicketGet,
+                GmTicketIntent::AskStatus => ClientCommand::GmTicketSystemStatus,
+                GmTicketIntent::Delete => ClientCommand::GmTicketDelete,
+                GmTicketIntent::Write(write) => {
+                    let category = write.category;
+                    match client_command_for(write, map, pos) {
+                        Some(cmd) => cmd,
+                        None => {
+                            warn!(
+                                "gm ticket: refusing to file under category {category} — not a \
                              GMTicketCategory.dbc id (1..={GM_TICKET_CATEGORY_MAX})"
-                        );
-                        continue;
+                            );
+                            continue;
+                        }
                     }
                 }
-            }
-        });
-    }
+            });
+        }
+    })
 }
 
 /// The category a `NewGMTicket`/`UpdateGMTicket` call may put on the wire, 0 to 10. vmangos files
@@ -227,6 +265,10 @@ const GM_TICKET_CATEGORY_MAX: u8 = 10;
 #[derive(Resource)]
 pub(crate) struct GmTicketCategories(pub(crate) Vec<(u32, String)>);
 
+/// The survey tables ([`benilla_formats::load_gm_survey`]), for the VM.
+#[derive(Resource)]
+pub(crate) struct GmSurveyResource(benilla_ui::script::GmSurveyTables);
+
 /// Startup, after the MPQ chain opens: a bare `Startup` races the open and can leave the category
 /// list empty for the whole session.
 fn load_gm_ticket_dbc(
@@ -252,6 +294,17 @@ fn load_gm_ticket_dbc(
             ));
         }
         Err(e) => warn!("gm ticket: GMTicketCategory.dbc failed to load: {e:#}"),
+    }
+    match benilla_formats::load_gm_survey(&mut chain) {
+        Ok(survey) => {
+            info!("gm survey: survey {} loaded", survey.id);
+            commands.insert_resource(GmSurveyResource(benilla_ui::script::GmSurveyTables {
+                id: survey.id,
+                questions: survey.questions,
+                texts: survey.texts,
+            }));
+        }
+        Err(e) => warn!("gm survey: the survey tables failed to load: {e:#}"),
     }
 }
 
@@ -378,7 +431,7 @@ impl Plugin for UiGmTicketPlugin {
                 Update,
                 (
                     feed_gm_ticket.in_set(UiFeed),
-                    drain_gm_ticket.after(UiInput),
+                    drain_gm_ticket.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -387,6 +440,113 @@ impl Plugin for UiGmTicketPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
+    /// Each lottery and survey verb reaches the wire exactly once, with the command the bytes
+    /// call for, and a refused call reaches it not at all.
+    #[test]
+    fn the_lottery_and_survey_verbs_send_once_each() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<GmTicketState>()
+            .add_systems(Update, drain_gm_ticket);
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        let run = |app: &mut App, lua: &str| {
+            app.world().non_send_resource::<UiScript>().run(lua).ok();
+            app.update();
+            rx.try_iter().collect::<Vec<_>>()
+        };
+        let one = |sent: Vec<ClientCommand>| {
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            sent.into_iter().next().unwrap()
+        };
+        assert!(matches!(
+            one(run(&mut app, "GetLastLotteryNumbers()")),
+            ClientCommand::LotteryQuery
+        ));
+        assert!(matches!(
+            one(run(&mut app, "BuyRandomPicks(4)")),
+            ClientCommand::BuyLotteryTicket {
+                first: 4,
+                second: 0
+            }
+        ));
+        assert!(matches!(
+            one(run(&mut app, "SubmitNumbers(1, 2, 3, 4)")),
+            ClientCommand::BuyLotteryTicket {
+                first: 0,
+                second: 0b1111
+            }
+        ));
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .set_gm_survey_tables(benilla_ui::script::GmSurveyTables {
+                id: 6,
+                questions: [28, 29, 0, 0, 0, 0, 0, 0, 0, 0],
+                texts: vec![],
+            });
+        match one(run(
+            &mut app,
+            "GMSurveyAnswerSubmit(2, 4, 'ok') GMSurveyCommentSubmit('hi') GMSurveySubmit()",
+        )) {
+            ClientCommand::GmSurveySubmit {
+                survey,
+                answers,
+                comment,
+            } => {
+                assert_eq!(survey, 6);
+                assert_eq!(answers, [(28, 0, String::new()), (29, 4, "ok".to_string())]);
+                assert_eq!(comment, "hi");
+            }
+            other => panic!("{other:?}"),
+        }
+        // `BuySkillTier` on a line its tier prices within the player's points: once.
+        {
+            let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
+            script.set_skills(benilla_ui::script::SkillsState {
+                entries: vec![benilla_ui::script::SkillEntry {
+                    skill_id: 129,
+                    name: "First Aid".into(),
+                    value: 1,
+                    max: 75,
+                    temp_bonus: 0,
+                    perm_bonus: 0,
+                    min_level: 0,
+                    cost_index: 0,
+                    category_id: 2,
+                    category_name: "Professions".into(),
+                    category_order: 2,
+                    description: String::new(),
+                    abandonable: false,
+                    mono: false,
+                    step: 0,
+                    flags: 0x8,
+                    tier_id: 5,
+                }],
+            });
+            script.set_skill_tiers([(5, [30; 16])]);
+            script.set_talents(benilla_ui::script::TalentUiState {
+                points: (0, 30),
+                ..Default::default()
+            });
+        }
+        assert!(matches!(
+            one(run(&mut app, "BuySkillTier(2)")),
+            ClientCommand::SkillBuyStep { skill_id: 129 }
+        ));
+        // Refused, or a verb that sends nothing in the state this client holds.
+        for call in [
+            "BuyRandomPicks(0)",
+            "SubmitNumbers(1, 1, 2, 3)",
+            "AcceptSkillUps()",
+            "BuySkillTier(1)",
+            "BuySkillTier(3)",
+            "LFGQuery(1, 0)",
+        ] {
+            assert!(run(&mut app, call).is_empty(), "{call}");
+        }
+    }
+
     use benilla_protocol::messages::GmTicket;
 
     fn ticket() -> Box<GmTicket> {

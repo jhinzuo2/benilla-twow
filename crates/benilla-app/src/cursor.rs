@@ -6,6 +6,9 @@
 //! continuously redrawing Metal view, so this builds an `NSCursor` per mode, disables the window's
 //! cursor rects and sets the cursor directly; mouselook uses `NSCursor::hide`/`unhide`. Elsewhere
 //! winit's `CursorIcon::Custom` works and hide-on-look is `CursorOptions.visible`.
+//!
+//! The pointer hides for three callers of the device's `0x58b590(0)`: mouselook, a cinematic, and
+//! the glue's `HideCursor` (the credits and the movie frame), read here as [`GluePointerHidden`].
 
 use benilla_assets::AssetSet;
 use bevy::prelude::*;
@@ -75,7 +78,8 @@ fn decode_payload_cursor_rgba(
     assets: &mut benilla_assets::WorldAssets,
     path: &str,
 ) -> Option<Vec<u8>> {
-    let (w, h, rgba) = assets.decode_rgba(path)?;
+    // The dragged picture opens with the loose flag, as the cursor code's `0x449610` opens it.
+    let (w, h, rgba) = assets.decode_rgba(path, benilla_assets::LooseOpen::Index)?;
     let mut out = box_downsample_32(w, h, &rgba);
     for a in out.iter_mut().skip(3).step_by(4) {
         *a = 0xFF;
@@ -126,6 +130,57 @@ fn cursor_path(stem: &str) -> String {
     format!("Interface\\Cursor\\{stem}.blp")
 }
 
+/// Whether the glue's `HideCursor` has the pointer hidden and `ShowCursor` has not put it back
+/// (`0x46db70`/`0x46db60`, the device's `0x58b590`). Mouselook and a cinematic hide the same
+/// pointer on their own paths.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct GluePointerHidden(pub(crate) bool);
+
+/// Read the glue VM's pointer flag. No VM, or the in-game one, is no hide: the glue verbs do not
+/// exist once the world is entered (`0x46de20` unregisters the table), so nothing can show it
+/// again.
+fn read_glue_pointer(
+    script: Option<NonSend<benilla_ui::script::UiScript>>,
+    mut hidden: ResMut<GluePointerHidden>,
+) {
+    let now = script.is_some_and(|s| s.glue_cursor_hidden());
+    if hidden.0 != now {
+        hidden.0 = now;
+    }
+}
+
+/// `CursorOptions.visible` for a caller that hides the pointer while `hidden` holds, given
+/// whether it hid the pointer itself (`ours`) and what `visible` is now: the value to write, or
+/// `None` to leave it. It puts back only what it took, and writes only on a real change:
+/// `bevy_winit` re-applies `CursorOptions` to AppKit on every change, which can stall the main
+/// thread.
+pub(crate) fn pointer_visibility(hidden: bool, ours: &mut bool, visible: bool) -> Option<bool> {
+    if hidden && visible {
+        *ours = true;
+        Some(false)
+    } else if !hidden && *ours {
+        *ours = false;
+        (!visible).then_some(true)
+    } else {
+        None
+    }
+}
+
+/// The picture of the custom cursor mode, [`crate::target::CursorKind::Custom`]: the path
+/// `SetCursor` loaded it by, the client's `0xbe2c70` beside its image slot 41 (`0xc0bd80`).
+#[derive(Resource, Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct CustomCursorName(pub(crate) String);
+
+/// Decode the custom cursor `SetCursor` checked to be 32×32, as `0x523cdb` copies its texels
+/// unfiltered with their alpha; opened with the loose flag, as `0x523c86` opens it.
+fn decode_custom_cursor_rgba(
+    assets: &mut benilla_assets::WorldAssets,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let (w, h, rgba) = assets.decode_rgba(path, benilla_assets::LooseOpen::Index)?;
+    (w == 32 && h == 32).then_some(rgba)
+}
+
 /// The displayed cursor, the client's one sticky mode cell `0xbe2c2c`;
 /// [`crate::target::WorldCursor`] is one of its two writers.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -136,124 +191,167 @@ pub(crate) struct DisplayedCursor(pub(crate) crate::target::WorldCursor);
 /// (`SetCursor`, `ResetCursor`, `ShowContainerSellCursor`, `ShowInspectCursor`). Between writes
 /// the last value stands, so a frame that calls no cursor function changes nothing.
 fn drive_displayed_cursor(
+    // What the host also reaches, read before the VM runs with the host lent.
+    mut hosted: ParamSet<(
+        Res<crate::spell::targeting::SpellTargeting>,
+        crate::script_calls::HostedVm,
+    )>,
     world: Res<crate::target::WorldCursor>,
     over_ui: Res<crate::ui_script::PointerOverUi>,
-    targeting: Res<crate::spell::targeting::SpellTargeting>,
-    script: Option<bevy::ecs::system::NonSendMut<benilla_ui::script::UiScript>>,
     // The base last restored on entering the UI; `None` over the world, so re-entry restores.
     mut last: Local<crate::ui_script::VmMemo<Option<crate::target::WorldCursor>>>,
     mut displayed: ResMut<DisplayedCursor>,
+    mut custom: ResMut<CustomCursorName>,
     screen: Res<crate::loading_screen::LoadingScreen>,
 ) {
-    use crate::target::{CursorKind, WorldCursor};
-    use benilla_ui::script::UiCursorMode;
+    let p = hosted.p0();
+    let targeting_active = p.active();
+    hosted.p1().run(|script| {
+        use crate::target::{CursorKind, WorldCursor};
+        use benilla_ui::script::UiCursorMode;
 
-    // This runs with no VM too (the character screen); `get_for` treats that as its own session,
-    // so the restore re-arms once on each side of the glue phase.
-    let last = last.get_for(script.as_deref());
+        // This runs with no VM too (the character screen); `get_for` treats that as its own
+        // session, so the restore re-arms once on each side of the glue phase.
+        let last = last.get_for(script.as_deref());
 
-    // Under the loading cover the cursor is the plain arrow, ahead of every other arm: the
-    // reference parks index 1 unconditionally before raising the screen (`0x6e49f5`).
-    if screen.covering() {
-        displayed.0 = WorldCursor::default();
-        *last = None;
-        return;
-    }
-
-    // The base cell (`0xbe2c4c`) is mutable and `ResetCursor` restores its value, not Point.
-    // While a spell awaits its click it is Cast(2), so the UI reads blue whatever the hovered item:
-    // 1.12 has no hover-time validity verdict. `ShowContainerSellCursor` (`0x4fa460`) bails unless
-    // the base is Point.
-    let repair = script.as_ref().is_some_and(|s| s.repair_mode());
-    let base = if repair {
-        // `ShowRepairCursor` (`0x4fbcc0`) parks the base at Repair while it holds.
-        WorldCursor {
-            kind: CursorKind::Repair,
-            unable: false,
-        }
-    } else if targeting.active()
-        || script
-            .as_ref()
-            .is_some_and(|s| s.gift_wrap_armed().is_some())
-    {
-        // An armed gift wrap sets both cells to Cast(2) (`0x5edea0`: `SetCursorBaseMode(2)`,
-        // `CursorSetMode(2)`), so its cursor survives the pointer crossing the world.
-        WorldCursor {
-            kind: CursorKind::Cast,
-            unable: false,
-        }
-    } else {
-        WorldCursor::default()
-    };
-
-    if let Some(mut script) = script {
-        if let Some(write) = script.take_cursor_write() {
-            displayed.0 = match write {
-                Some(UiCursorMode::Buy) => WorldCursor {
-                    kind: CursorKind::Buy,
-                    unable: false,
-                },
-                Some(UiCursorMode::UnableBuy) => WorldCursor {
-                    kind: CursorKind::Buy,
-                    unable: true,
-                },
-                Some(UiCursorMode::Inspect) => WorldCursor {
-                    kind: CursorKind::Inspect,
-                    unable: false,
-                },
-                Some(UiCursorMode::Cast) => WorldCursor {
-                    kind: CursorKind::Cast,
-                    unable: false,
-                },
-                Some(UiCursorMode::CastError) => WorldCursor {
-                    kind: CursorKind::Cast,
-                    unable: true,
-                },
-                Some(UiCursorMode::Point) => WorldCursor::default(),
-                // `ResetCursor`: back to the base mode, Repair included.
-                None => base,
-            };
-            *last = Some(base);
+        // Under the loading cover the cursor is the plain arrow, ahead of every other arm: the
+        // reference parks index 1 unconditionally before raising the screen (`0x6e49f5`).
+        if screen.covering() {
+            displayed.0 = WorldCursor::default();
+            *last = None;
             return;
         }
-    }
-    if !over_ui.0 {
-        displayed.0 = *world;
-        *last = None;
-        return;
-    }
-    // Over UI with no FrameXML write: crossing in, or a base change, restores the base once. This
-    // one edge stands for the `ResetCursor()` that ends nearly every reference hover handler and
-    // the classifier's no-hover restore (`0x523d30`).
-    if *last != Some(base) {
-        *last = Some(base);
-        displayed.0 = base;
-    }
+
+        // The base cell (`0xbe2c4c`) is mutable and `ResetCursor` restores its value, not Point.
+        // While a spell awaits its click it is Cast(2), so the UI reads blue whatever the hovered
+        // item: 1.12 has no hover-time validity verdict. `ShowContainerSellCursor` (`0x4fa460`)
+        // bails unless the base is Point.
+        let repair = script.as_ref().is_some_and(|s| s.repair_mode());
+        let base = if repair {
+            // `ShowRepairCursor` (`0x4fbcc0`) parks the base at Repair while it holds.
+            WorldCursor {
+                kind: CursorKind::Repair,
+                unable: false,
+            }
+        } else if targeting_active
+            || script
+                .as_ref()
+                .is_some_and(|s| s.gift_wrap_armed().is_some())
+        {
+            // An armed gift wrap sets both cells to Cast(2) (`0x5edea0`: `SetCursorBaseMode(2)`,
+            // `CursorSetMode(2)`), so its cursor survives the pointer crossing the world.
+            WorldCursor {
+                kind: CursorKind::Cast,
+                unable: false,
+            }
+        } else {
+            WorldCursor::default()
+        };
+
+        if let Some(script) = script {
+            if let Some(write) = script.take_cursor_write() {
+                displayed.0 = match write {
+                    Some(UiCursorMode::Buy) => WorldCursor {
+                        kind: CursorKind::Buy,
+                        unable: false,
+                    },
+                    Some(UiCursorMode::UnableBuy) => WorldCursor {
+                        kind: CursorKind::Buy,
+                        unable: true,
+                    },
+                    Some(UiCursorMode::Inspect) => WorldCursor {
+                        kind: CursorKind::Inspect,
+                        unable: false,
+                    },
+                    Some(UiCursorMode::Cast) => WorldCursor {
+                        kind: CursorKind::Cast,
+                        unable: false,
+                    },
+                    Some(UiCursorMode::CastError) => WorldCursor {
+                        kind: CursorKind::Cast,
+                        unable: true,
+                    },
+                    Some(UiCursorMode::Point) => WorldCursor::default(),
+                    Some(UiCursorMode::UnablePoint) => WorldCursor {
+                        kind: CursorKind::Point,
+                        unable: true,
+                    },
+                    Some(UiCursorMode::Attack) => WorldCursor {
+                        kind: CursorKind::Attack,
+                        unable: false,
+                    },
+                    Some(UiCursorMode::UnableAttack) => WorldCursor {
+                        kind: CursorKind::Attack,
+                        unable: true,
+                    },
+                    Some(UiCursorMode::Custom) => {
+                        let name = script.custom_cursor_name();
+                        if custom.0 != name {
+                            custom.0 = name;
+                        }
+                        WorldCursor {
+                            kind: CursorKind::Custom,
+                            unable: false,
+                        }
+                    }
+                    // `ResetCursor`: back to the base mode, Repair included.
+                    None => base,
+                };
+                *last = Some(base);
+                return;
+            }
+        }
+        if !over_ui.0 {
+            displayed.0 = *world;
+            *last = None;
+            return;
+        }
+        // Over UI with no FrameXML write: crossing in, or a base change, restores the base once.
+        // This one edge stands for the `ResetCursor()` that ends nearly every reference hover
+        // handler and the classifier's no-hover restore (`0x523d30`).
+        if *last != Some(base) {
+            *last = Some(base);
+            displayed.0 = base;
+        }
+    })
 }
 
 pub(crate) struct CursorPlugin;
 
 impl Plugin for CursorPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<DisplayedCursor>();
+        app.init_resource::<DisplayedCursor>()
+            .init_resource::<CustomCursorName>()
+            .init_resource::<GluePointerHidden>();
         #[cfg(target_os = "macos")]
         app.add_systems(Startup, macos::setup.after(AssetSet::Open))
             .add_systems(
                 Update,
-                (drive_displayed_cursor, macos::drive)
+                (read_glue_pointer, drive_displayed_cursor, macos::drive)
                     .chain()
-                    // After the tick: a FrameXML `SetCursor` made this frame is read here.
-                    .after(crate::ui_script::UiInput),
+                    // After the tick: a FrameXML `SetCursor` made this frame is read here; and
+                    // after the target chain, whose clicks, calls and selects end or raise the
+                    // targeting cursor.
+                    .after(crate::ui_script::UiInput)
+                    .after(crate::target::TargetUpdate),
             );
         #[cfg(not(target_os = "macos"))]
         app.init_resource::<other::PayloadCursorImages>()
             .add_systems(Startup, other::setup.after(AssetSet::Open))
             .add_systems(
                 Update,
-                (drive_displayed_cursor, other::drive)
+                (
+                    read_glue_pointer,
+                    drive_displayed_cursor,
+                    other::drive,
+                    other::drive_glue_hide,
+                )
                     .chain()
-                    // After the tick: a FrameXML `SetCursor` made this frame is read here.
-                    .after(crate::ui_script::UiInput),
+                    // After the tick: a FrameXML `SetCursor` made this frame is read here; and
+                    // after the target chain, whose clicks, calls and selects end or raise the
+                    // targeting cursor.
+                    .after(crate::ui_script::UiInput)
+                    .after(crate::target::TargetUpdate),
             );
     }
 }
@@ -271,7 +369,8 @@ mod other {
     #[derive(Resource, Default)]
     pub(super) struct CursorImages(HashMap<String, Handle<Image>>);
 
-    /// Held-payload icon path → its 32×32 cursor, built on first use and cached.
+    /// Held-payload icon path, or `custom:` and the custom cursor's path → its 32×32 cursor, built
+    /// on first use and cached.
     #[derive(Resource, Default)]
     pub(super) struct PayloadCursorImages(HashMap<String, Handle<Image>>);
 
@@ -300,9 +399,10 @@ mod other {
     pub(super) fn drive(
         mut commands: Commands,
         cursor: Res<super::DisplayedCursor>,
+        custom: Res<super::CustomCursorName>,
         cursors: Option<Res<CursorImages>>,
         script: Option<NonSend<benilla_ui::script::UiScript>>,
-        world_assets: Option<ResMut<WorldAssets>>,
+        mut world_assets: Option<ResMut<WorldAssets>>,
         mut images: ResMut<Assets<Image>>,
         mut payload_cursors: ResMut<PayloadCursorImages>,
         screen: Res<crate::loading_screen::LoadingScreen>,
@@ -323,8 +423,8 @@ mod other {
                 return; // already showing this icon
             }
             if !payload_cursors.0.contains_key(&icon) && !decode_failed.contains(&icon) {
-                let built = world_assets.and_then(|mut a| {
-                    let rgba = super::decode_payload_cursor_rgba(&mut a, &icon)?;
+                let built = world_assets.as_deref_mut().and_then(|a| {
+                    let rgba = super::decode_payload_cursor_rgba(a, &icon)?;
                     Some(images.add(cursor_texture(32, 32, rgba)))
                 });
                 match built {
@@ -345,6 +445,37 @@ mod other {
             // Decode failed: fall through to the mode cursor.
         }
 
+        // Mode 41 shows the picture `SetCursor` loaded, built from its path on first use.
+        if cursor.0.kind == crate::target::CursorKind::Custom {
+            let key = format!("custom:{}", custom.0);
+            if last_set.as_deref() == Some(key.as_str()) {
+                return;
+            }
+            if !payload_cursors.0.contains_key(&key) && !decode_failed.contains(&key) {
+                let built = world_assets.as_deref_mut().and_then(|a| {
+                    let rgba = super::decode_custom_cursor_rgba(a, &custom.0)?;
+                    Some(images.add(cursor_texture(32, 32, rgba)))
+                });
+                match built {
+                    Some(handle) => {
+                        payload_cursors.0.insert(key.clone(), handle);
+                    }
+                    None => {
+                        warn!(
+                            "custom cursor {} missing/undecodable — Point shown",
+                            custom.0
+                        );
+                        decode_failed.insert(key.clone());
+                    }
+                }
+            }
+            if let Some(handle) = payload_cursors.0.get(&key) {
+                set_custom_cursor(&mut commands, *window, handle.clone());
+                *last_set = Some(key);
+                return;
+            }
+        }
+
         let Some(cursors) = cursors else {
             return;
         };
@@ -361,6 +492,19 @@ mod other {
             set_custom_cursor(&mut commands, *window, handle.clone());
         }
         *last_set = Some(stem);
+    }
+
+    /// The glue's `HideCursor`/`ShowCursor` on the window's pointer.
+    pub(super) fn drive_glue_hide(
+        hidden: Res<super::GluePointerHidden>,
+        mut cursor: Query<&mut bevy::window::CursorOptions, With<PrimaryWindow>>,
+        mut ours: Local<bool>,
+    ) {
+        if let Ok(mut opts) = cursor.single_mut() {
+            if let Some(visible) = super::pointer_visibility(hidden.0, &mut ours, opts.visible) {
+                opts.visible = visible;
+            }
+        }
     }
 
     /// Insert a custom cursor with hotspot `(0, 0)`, the vanilla cursors' top-left tip.
@@ -383,9 +527,7 @@ mod macos {
     use std::collections::{HashMap, HashSet};
 
     use crate::player::CameraControl;
-    use benilla_assets::LockRecover;
     use benilla_assets::WorldAssets;
-    use benilla_formats::read_texture_rgba;
     use bevy::prelude::*;
     use objc2::rc::Retained;
     use objc2::ClassType; // brings `alloc()` into scope
@@ -397,7 +539,8 @@ mod macos {
     /// The built `NSCursor` per mode stem; non-send, as AppKit types are main-thread only.
     pub(super) struct NativeCursors(HashMap<&'static str, Retained<NSCursor>>);
 
-    /// Held-payload icon path → its 32×32 `NSCursor`, built on first use and cached.
+    /// Held-payload icon path, or `custom:` and the custom cursor's path → its 32×32 `NSCursor`,
+    /// built on first use and cached.
     pub(super) struct PayloadCursors(HashMap<String, Retained<NSCursor>>);
 
     /// Build every mode's `NSCursor`; exclusive, so it runs on the main thread.
@@ -411,9 +554,10 @@ mod macos {
         }
         let mut cursors = HashMap::new();
         for stem in CURSOR_STEMS {
-            let Some((w, h, rgba)) = world.get_resource_mut::<WorldAssets>().and_then(|wa| {
-                read_texture_rgba(&mut wa.chain.lock_recover(), &cursor_path(stem)).ok()
-            }) else {
+            let Some((w, h, rgba)) = world
+                .get_resource::<WorldAssets>()
+                .and_then(|wa| wa.cursor_rgba(&cursor_path(stem)))
+            else {
                 warn!("cursor {stem}.blp missing/undecodable — mode falls back");
                 continue;
             };
@@ -437,11 +581,13 @@ mod macos {
         cursors: Option<NonSend<NativeCursors>>,
         mut payload_cursors: NonSendMut<PayloadCursors>,
         script: Option<NonSend<benilla_ui::script::UiScript>>,
-        world_assets: Option<ResMut<WorldAssets>>,
+        mut world_assets: Option<ResMut<WorldAssets>>,
         mode: Res<super::DisplayedCursor>,
+        custom: Res<super::CustomCursorName>,
         screen: Res<crate::loading_screen::LoadingScreen>,
         rig: Res<CameraControl>,
         cinematic: Option<Res<crate::cinematic::Cinematic>>,
+        glue_hidden: Res<super::GluePointerHidden>,
         mut focus: MessageReader<bevy::window::WindowFocused>,
         // The `Local`s below remember OS state, which outlives the VM, so none is a
         // [`crate::ui_script::VmMemo`].
@@ -466,8 +612,8 @@ mod macos {
             .and_then(|s| payload_icon(s, screen.covering()));
         if let Some(icon) = &held_icon {
             if !payload_cursors.0.contains_key(icon) && !decode_failed.contains(icon) {
-                let built = world_assets.and_then(|mut a| {
-                    let rgba = super::decode_payload_cursor_rgba(&mut a, icon)?;
+                let built = world_assets.as_deref_mut().and_then(|a| {
+                    let rgba = super::decode_payload_cursor_rgba(a, icon)?;
                     build_cursor(32, 32, &rgba)
                 });
                 match built {
@@ -481,20 +627,52 @@ mod macos {
                 }
             }
         }
-        // A cinematic hides the pointer too (`0x58b590`); `CursorOptions.visible` is inert here, so
-        // it joins the look's hide/unhide pair, keeping AppKit's hide counter balanced.
-        let looking = rig.holds_cursor() || cinematic.is_some_and(|c| c.is_playing());
+        // A cinematic and the glue's `HideCursor` hide the pointer too (`0x58b590`);
+        // `CursorOptions.visible` is inert here, so they join the look's hide/unhide pair, keeping
+        // AppKit's hide counter balanced.
+        let looking =
+            rig.holds_cursor() || cinematic.is_some_and(|c| c.is_playing()) || glue_hidden.0;
         let stem = mode.0.stem();
+        // Mode 41 shows the picture `SetCursor` loaded, built from its path on first use.
+        let custom_key = (mode.0.kind == crate::target::CursorKind::Custom)
+            .then(|| format!("custom:{}", custom.0));
+        if let Some(key) = &custom_key {
+            if !payload_cursors.0.contains_key(key) && !decode_failed.contains(key) {
+                let built = world_assets.as_deref_mut().and_then(|a| {
+                    let rgba = super::decode_custom_cursor_rgba(a, &custom.0)?;
+                    build_cursor(32, 32, &rgba)
+                });
+                match built {
+                    Some(cursor) => {
+                        payload_cursors.0.insert(key.clone(), cursor);
+                    }
+                    None => {
+                        warn!(
+                            "custom cursor {} missing/undecodable — Point shown",
+                            custom.0
+                        );
+                        decode_failed.insert(key.clone());
+                    }
+                }
+            }
+        }
+        let custom_key = custom_key.filter(|k| payload_cursors.0.contains_key(k.as_str()));
         // The key names the chosen cursor, so `NSCursor::set`, a WindowServer round-trip that can
         // stall the main thread for milliseconds, fires only on a change or a drift.
         let key = held_icon
             .as_ref()
             .filter(|icon| payload_cursors.0.contains_key(icon.as_str()))
             .map(|icon| format!("payload:{icon}"))
+            .or_else(|| custom_key.clone())
             .unwrap_or_else(|| format!("mode:{stem}"));
         let cursor = held_icon
             .as_ref()
             .and_then(|icon| payload_cursors.0.get(icon.as_str()))
+            .or_else(|| {
+                custom_key
+                    .as_ref()
+                    .and_then(|k| payload_cursors.0.get(k.as_str()))
+            })
             .or_else(|| cursors.0.get(stem.as_str()))
             .or_else(|| cursors.0.get(stem.trim_start_matches("Unable")))
             .or_else(|| cursors.0.get("Point"));
@@ -615,6 +793,7 @@ mod tests {
         app.insert_resource(world);
         app.insert_resource(crate::ui_script::PointerOverUi(over_ui));
         app.insert_resource(DisplayedCursor(standing));
+        app.init_resource::<CustomCursorName>();
         let mut targeting = crate::spell::SpellTargeting::default();
         if armed {
             // Feed Pet's own bare item word.
@@ -625,6 +804,84 @@ mod tests {
             .run_system_once(drive_displayed_cursor)
             .expect("the displayed cursor drives");
         app.world().resource::<DisplayedCursor>().0
+    }
+
+    /// One frame of [`read_glue_pointer`] over a glue VM that ran `lua`.
+    fn glue_pointer_after(lua: &str) -> bool {
+        let mut app = App::new();
+        let script = benilla_ui::script::UiScript::new_glue().unwrap();
+        script.run(lua).unwrap();
+        app.insert_non_send_resource(script);
+        app.init_resource::<GluePointerHidden>();
+        app.world_mut()
+            .run_system_once(read_glue_pointer)
+            .expect("the glue pointer flag is read");
+        app.world().resource::<GluePointerHidden>().0
+    }
+
+    /// `0x46db70`/`0x46db60` reach the cursor driver: the credits frame's `HideCursor()` hides
+    /// the pointer until its OnHide `ShowCursor()`.
+    /// `SetCursor` with a 32×32 texture's path shows mode 41 with that path's picture (`0x523c40`).
+    #[test]
+    fn a_custom_set_cursor_shows_mode_41_with_its_path() {
+        let mut app = App::new();
+        let mut script = benilla_ui::script::UiScript::new().unwrap();
+        script.set_texture_size_probe(Box::new(|p| (p == "Custom\\Arrow").then_some((32, 32))));
+        script.run(r#"SetCursor("Custom\\Arrow")"#).unwrap();
+        app.insert_non_send_resource(script);
+        app.insert_resource(crate::loading_screen::LoadingScreen::default());
+        app.insert_resource(WorldCursor::default());
+        app.insert_resource(crate::ui_script::PointerOverUi(true));
+        app.insert_resource(DisplayedCursor(SWORD));
+        app.init_resource::<CustomCursorName>();
+        app.insert_resource(crate::spell::SpellTargeting::default());
+        app.world_mut()
+            .run_system_once(drive_displayed_cursor)
+            .expect("the displayed cursor drives");
+        assert_eq!(
+            app.world().resource::<DisplayedCursor>().0.kind,
+            CursorKind::Custom
+        );
+        assert_eq!(
+            app.world().resource::<CustomCursorName>().0,
+            "Custom\\Arrow"
+        );
+    }
+
+    #[test]
+    fn the_glue_hide_cursor_verb_reaches_the_driver() {
+        assert!(!glue_pointer_after(""));
+        assert!(glue_pointer_after("HideCursor()"));
+        assert!(!glue_pointer_after("HideCursor() ShowCursor()"));
+        assert!(glue_pointer_after("HideCursor() ShowCursor() HideCursor()"));
+    }
+
+    /// Without a VM the flag reads down.
+    #[test]
+    fn no_vm_is_no_glue_hide() {
+        let mut app = App::new();
+        app.insert_resource(GluePointerHidden(true));
+        app.world_mut()
+            .run_system_once(read_glue_pointer)
+            .expect("the glue pointer flag is read");
+        assert!(!app.world().resource::<GluePointerHidden>().0);
+    }
+
+    /// A caller puts back only the hide it made, and writes nothing when nothing changes.
+    #[test]
+    fn a_pointer_hide_is_put_back_only_by_its_owner() {
+        let mut ours = false;
+        assert_eq!(pointer_visibility(false, &mut ours, true), None);
+        assert_eq!(pointer_visibility(true, &mut ours, true), Some(false));
+        assert!(ours);
+        assert_eq!(pointer_visibility(true, &mut ours, false), None);
+        assert_eq!(pointer_visibility(false, &mut ours, false), Some(true));
+        assert!(!ours);
+        assert_eq!(pointer_visibility(false, &mut ours, true), None);
+        // Another caller already holds the pointer hidden: not ours to show.
+        assert_eq!(pointer_visibility(true, &mut ours, false), None);
+        assert!(!ours);
+        assert_eq!(pointer_visibility(false, &mut ours, false), None);
     }
 
     /// The reference parks cursor index 1 before the loading screen goes up (`0x6e49f5`).
@@ -729,6 +986,7 @@ mod tests {
         app.insert_resource(CAST_GREY);
         app.insert_resource(crate::ui_script::PointerOverUi(true));
         app.insert_resource(DisplayedCursor(CAST_GREY));
+        app.init_resource::<CustomCursorName>();
         let mut targeting = crate::spell::SpellTargeting::default();
         targeting.enter(6991, crate::spell::CastCommit::Spell, 0x0010);
         app.insert_resource(targeting);

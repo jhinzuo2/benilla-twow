@@ -40,6 +40,7 @@ fn look_frame(
     };
     run_look_session(
         &motion,
+        &crate::touch::TouchLook::default(),
         both,
         &mut rig,
         &mut cam,

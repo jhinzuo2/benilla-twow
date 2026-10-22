@@ -13,10 +13,10 @@ use benilla_ui::script::{TrainerServiceCategory, TrainerTooltip, TRAINER_GROUP_K
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
-use crate::net::NetCommands;
 use crate::ui_items::item_icon;
 
 use super::{TRAINER_TYPE_MOUNT, TRAINER_TYPE_TRADESKILL};
+use crate::query_cache::Ask;
 
 /// `GetTrainerServiceIcon 0x4d8f50`: at a tradeskill trainer (`[0xb73a08]`), the item the wire
 /// spell's first learn effect (`0x4d8ff5`/`0x4d8ffa`) teaches to create (`0x4d906a`); otherwise
@@ -29,7 +29,7 @@ pub(super) fn service_icon(
     spells: &SpellCatalog,
     icons: Option<&ItemDisplays>,
     items: &Items,
-    commands: &NetCommands,
+    ask: Ask<'_>,
 ) -> Option<String> {
     let wire = spells.get(wire_spell)?;
     if trainer_type == TRAINER_TYPE_TRADESKILL {
@@ -47,7 +47,7 @@ pub(super) fn service_icon(
             .filter(|&e| e != 0)
         {
             return items
-                .template(product, 0, commands)
+                .template(product, 0, ask)
                 .map(|t| t.display_info_id)
                 .and_then(|d| item_icon(icons, d));
         }
@@ -119,7 +119,7 @@ pub(super) fn service_description(
     trainer_type: u32,
     spells: &SpellCatalog,
     items: &Items,
-    commands: &NetCommands,
+    ask: Ask<'_>,
     text: &ServiceText,
 ) -> Option<String> {
     let d = spells.get(wire.spell)?;
@@ -152,7 +152,7 @@ pub(super) fn service_description(
                 && taught.effects[0] == SPELL_EFFECT_CREATE_ITEM
             {
                 if let Some(t) = items
-                    .template(taught.effect_item_type[0], 0, commands)
+                    .template(taught.effect_item_type[0], 0, ask)
                     .map(|item| item.description.clone())
                     .filter(|t| !t.is_empty())
                 {
@@ -205,6 +205,30 @@ pub(super) fn service_group(
         .map(|l| l.name.clone())
         .unwrap_or_else(|| format!("Skill {line}"));
     (line, name)
+}
+
+/// `IsTrainerServiceTradeSkill` (`0x4d9f70`) and `IsTrainerServiceLearnSpell` (`0x4d9e70`) over
+/// the wire spell's three effect slots; the trainer's type plays no part. The first answers 1 for
+/// any `LEARN_SPELL` slot teaching a spell with `Attributes & 0x20` (`0x4d9fe0`-`0x4d9ffe`). The
+/// second stops at the first slot that decides: a `LEARN_SPELL` teaching a missing or unflagged
+/// spell is `Some(false)` (`0x4d9ed9`-`0x4d9f01`), a `LEARN_PET_SPELL` `Some(true)` (`0x4d9f03`),
+/// and a flagged `LEARN_SPELL` moves on (`0x4d9f08`). No record answers nil for both.
+pub(super) fn service_kind(wire_spell: u32, spells: &SpellCatalog) -> (bool, Option<bool>) {
+    let Some(wire) = spells.get(wire_spell) else {
+        return (false, None);
+    };
+    let flagged = |slot: usize| {
+        spells
+            .get(wire.effect_trigger_spell[slot])
+            .is_some_and(|t| t.attributes & SPELL_ATTR_IS_TRADESKILL != 0)
+    };
+    let trade_skill = (0..3).any(|i| wire.effects[i] == SPELL_EFFECT_LEARN_SPELL && flagged(i));
+    let learn_spell = (0..3).find_map(|i| match wire.effects[i] {
+        SPELL_EFFECT_LEARN_SPELL if !flagged(i) => Some(false),
+        SPELL_EFFECT_LEARN_PET_SPELL => Some(true),
+        _ => None,
+    });
+    (trade_skill, learn_spell)
 }
 
 /// A wire `state` byte's category; anything but GREEN or GRAY, an unexpected value too, is gated.

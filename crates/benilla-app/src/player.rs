@@ -30,16 +30,21 @@ mod net;
 mod body_pose;
 pub(crate) mod camera;
 mod camera_channel;
+mod camera_clip;
 pub(crate) mod camera_dynamics;
 pub(crate) mod camera_zoom;
 mod controller;
 mod world_focus;
+#[cfg(test)]
+pub(crate) use world_focus::insert_test_room;
+pub(crate) use world_focus::{publish_caster_outdoors, BarUnitOutdoors, PlayerOutdoors};
 // The remembered camera pose, inside `player/` to read the rig's `pub(super)` fields.
 mod camera_saved;
 mod camera_water;
 // The five named camera views, inside `player/` to write the rig's `pub(super)` fields.
 pub(crate) mod camera_view;
-mod drunk;
+pub(crate) mod drunk;
+mod edge;
 mod embody;
 mod flags;
 mod follow;
@@ -65,6 +70,12 @@ mod swim;
 mod view_subject;
 mod walk;
 mod wire_in;
+pub(crate) use wire_in::regain_control_on_arrival;
+
+/// The create's control restore (`regain_control_on_arrival`): every system that reads `Player`'s
+/// control flags runs after it in the frame, so it sees the restored flags, not the lost ones.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ControlRestore;
 
 // The last writer of a self body part's render alpha: `entities::apply_unit_mat_alpha` orders
 // itself before it.
@@ -79,9 +90,11 @@ use camera_zoom::{apply_zoom_scroll, CAM_DIST_DEFAULT};
 // `follow` owns the motion.
 pub(crate) use follow::{FollowRequest, FollowState};
 // Click to Move: `crate::target`'s dispatchers start it and run the verb it owes on arrival.
+#[cfg(test)]
+pub(crate) use approach::on_cvar as approach_on_cvar;
 pub(crate) use approach::{
-    can_auto_interact, Approach, ApproachVerb, AutoMove, Refused, Subject, RANGE_STOP_FRACTION,
-    TALK_STOP,
+    can_auto_interact, cancel_move_action_on_ui_shutdown, Approach, ApproachVerb, AutoMove,
+    Refused, Subject, RANGE_STOP_FRACTION, TALK_STOP,
 };
 use state::{
     MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, FALL_FAR_DROP, FALL_FAR_TIME, FOOT_CONE_HEIGHT,
@@ -91,7 +104,7 @@ use state::{
     WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
 };
 pub(crate) use state::{
-    Player, PlayerCapsule, CAPSULE_HEIGHT, CAPSULE_RADIUS, CREATURE_STEP_UP_HEIGHT,
+    OwnControlLost, Player, PlayerCapsule, CAPSULE_HEIGHT, CAPSULE_RADIUS, CREATURE_STEP_UP_HEIGHT,
     DEFAULT_COLLISION_HEIGHT, FEATHER_TERMINAL_VELOCITY, GRAVITY, HOVER_CLIMB_RATE, HOVER_HEIGHT,
     SETTLE_TIMEOUT, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
 };
@@ -167,7 +180,11 @@ pub(super) type BodyQuery<'w, 's> = Query<
         &'static mut Transform,
         Option<&'static mut MovementState>,
         Option<&'static CameraPivot>,
-        Option<&'static crate::creature_anim::AnimDriver>,
+        // The driver and the unit's committed sheath state, which it requires.
+        Option<(
+            &'static crate::creature_anim::AnimDriver,
+            &'static crate::creature_anim::CommittedSheath,
+        )>,
         Option<&'static crate::net::ObjectStore>,
         Has<crate::creature_anim::Engaged>,
         Option<&'static crate::net::UnitSpeeds>,
@@ -199,6 +216,11 @@ pub(super) type TransportQuery<'w, 's> = Query<
     ),
 >;
 
+/// The stream focus's publish and the post-snap hold's release, which write the player's settle
+/// state: a reader of it this frame runs after the set.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorldFocusSet;
+
 /// The controller's ordering handle, for anything that writes the aim or the camera rig before
 /// `control` reads them (`capture::probe_look`, `capture::probe_cam`).
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -212,27 +234,42 @@ impl Plugin for PlayerPlugin {
         net::register(app);
         follow::plugin(app);
         approach::plugin(app);
+        camera_clip::plugin(app);
         camera_saved::plugin(app);
         camera_view::plugin(app);
         // The stream focus is published after `control`'s teleport snap and before the stream
         // stage, and the post-snap hold released after it. Both edges are needed: without
         // `.after(Input)` the focus can precede the snap, the world streams around the departure,
-        // and the hold releases at once.
+        // and the hold releases at once. Both run among the VM pass's hosts, which read the
+        // player's settle state, so a host after them reads this frame's.
         app.add_systems(
             Update,
-            (world_focus::publish_viewer, world_focus::publish_view_focus)
-                .after(benilla_world::schedule::WorldStage::Input)
-                .before(benilla_world::schedule::WorldStage::Stream),
-        )
-        .add_systems(
-            Update,
-            world_focus::release_post_snap_hold.after(benilla_world::schedule::WorldStage::Stream),
+            (
+                (world_focus::publish_viewer, world_focus::publish_view_focus)
+                    .after(benilla_world::schedule::WorldStage::Input)
+                    .before(benilla_world::schedule::WorldStage::Stream),
+                world_focus::release_post_snap_hold
+                    .after(benilla_world::schedule::WorldStage::Stream),
+            )
+                .in_set(WorldFocusSet)
+                .in_set(crate::vm_pass::VmPass::Member),
         );
+        // The casters' outdoors answers, once this frame's re-place has put the body where it
+        // stands; the cast validator's place rungs read them, so it runs among the VM pass's hosts.
+        app.init_resource::<PlayerOutdoors>()
+            .init_resource::<BarUnitOutdoors>()
+            .add_systems(
+                Update,
+                publish_caster_outdoors
+                    .after(WorldFocusSet)
+                    .in_set(crate::vm_pass::VmPass::Member),
+            );
         app.add_observer(camera::on_cvar);
         app.add_observer(camera_dynamics::on_cvar);
         app.init_resource::<camera::LookConfig>();
         app.init_resource::<camera_zoom::ZoomLimit>();
         app.init_resource::<camera::FollowConfig>();
+        app.init_resource::<OwnControlLost>();
         app.init_resource::<camera_dynamics::CameraOptions>();
         // Far sight resolves `PLAYER_FARSIGHT` to a pose before `control` seats the camera: a
         // separate system, as `control` holds our `Transform` mutably and cannot read another's.
@@ -248,7 +285,7 @@ impl Plugin for PlayerPlugin {
                 )
                     .in_set(WorldStage::Input)
                     .before(control)
-                    .in_set(crate::char_select::InWorldGated),
+                    .in_set(crate::client_state::InWorldGated),
             );
         app.add_systems(
             Startup,
@@ -259,7 +296,11 @@ impl Plugin for PlayerPlugin {
         )
         // The world camera renders only in world or under the loading screen, whose covered
         // render compiles the world's pipelines before the first visible frame.
-        .add_systems(Update, setup::gate_world_camera)
+        // Before the VM pass, whose script calls read the cameras: the gate is settled first.
+        .add_systems(
+            Update,
+            setup::gate_world_camera.before(crate::vm_pass::VmPass::Start),
+        )
         // Off in capture mode, where the harness pins the camera, and in world only, so the glue
         // screens keep the cursor and send no movement.
         .add_systems(
@@ -268,7 +309,7 @@ impl Plugin for PlayerPlugin {
                 .in_set(PlayerControlSet)
                 .in_set(WorldStage::Input)
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
-                .in_set(crate::char_select::InWorldGated),
+                .in_set(crate::client_state::InWorldGated),
         )
         // The posture queue (the `/sit` family), which `control` alone executes.
         .add_message::<StandStateRequest>()
@@ -280,7 +321,7 @@ impl Plugin for PlayerPlugin {
             land::land_here
                 .in_set(WorldStage::Input)
                 .before(control)
-                .in_set(crate::char_select::InWorldGated),
+                .in_set(crate::client_state::InWorldGated),
         )
         // A server spline driving us (Charge, knockback, taxi) is mirrored into `Player` before
         // `control` reads `pos`; gated as `control` is.
@@ -290,7 +331,7 @@ impl Plugin for PlayerPlugin {
                 .in_set(WorldStage::Input)
                 .before(control)
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
-                .in_set(crate::char_select::InWorldGated),
+                .in_set(crate::client_state::InWorldGated),
         )
         // A session end (a `/logout` or a lost session) drops `active`, re-arming the take-control
         // latch for the next login; ungated, as the message lands while the state flips.
@@ -332,7 +373,7 @@ impl Plugin for PlayerPlugin {
                 .in_set(WorldStage::Input)
                 .before(control)
                 .before(follow::steer_follow)
-                .in_set(crate::char_select::InWorldGated),
+                .in_set(crate::client_state::InWorldGated),
         )
         // The world's right mouse-down, off that latch and ahead of `control`, the button's
         // binding, as `0x483c40` runs its hook before `ExecuteBinding`; off in capture mode, like
@@ -344,7 +385,7 @@ impl Plugin for PlayerPlugin {
                 .after(camera::latch_world_mouse)
                 .before(control)
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
-                .in_set(crate::char_select::InWorldGated),
+                .in_set(crate::client_state::InWorldGated),
         )
         // `/follow` and Click to Move steer before `control`, so the player's own turn input
         // lands after them and wins over their steering.
@@ -354,7 +395,7 @@ impl Plugin for PlayerPlugin {
                 .chain()
                 .in_set(WorldStage::Input)
                 .before(control)
-                .in_set(crate::char_select::InWorldGated),
+                .in_set(crate::client_state::InWorldGated),
         )
         // The self-avatar fade shares the `MeshTag` and material channel with the interior
         // classifier and the appear and despawn fades, and writes `Visibility` for the

@@ -367,22 +367,32 @@ fn only_a_possessed_units_attack_press_raises_the_latch() {
 }
 
 /// `0x5ee5a0` asks for the unit we possess, not the one we own.
+/// `0x5ee5a0` answers the player's far-sight unit (`PLAYER_FARSIGHT`, `0x5ee5e9`) when it is
+/// possessed (`0x5ee626`) and charmed, else created, by the player (`0x5ee62f`): possession, not
+/// ownership, and only of the unit the player's view is on.
 #[test]
 fn the_latch_gate_is_possession_not_ownership() {
     const FLAGS: u16 = 46;
     const CHARMEDBY: u16 = 10;
     const CREATEDBY: u16 = 14;
+    /// `PLAYER_FARSIGHT`, low word.
+    const FARSIGHT: u16 = 712;
+    const UNIT: u64 = 0x2A;
     let unit =
         |pairs: &[(u16, u32)]| ObjectStore(benilla_protocol::ObjectFields::from_pairs(pairs));
     let me = Some(0x77u64);
+    let viewing = |guid: u64| unit(&[(FARSIGHT, guid as u32), (FARSIGHT + 1, 0)]);
+    let player = viewing(UNIT);
+    let possessing = |store: Option<&ObjectStore>| possessing(UNIT, store, Some(&player), me);
 
     // An ordinary hunter pet: ours, in combat, not possessed.
     let hunter_pet = unit(&[
         (CREATEDBY, 0x77),
         (CREATEDBY + 1, 0),
-        (FLAGS, UNIT_FLAG_PET_IN_COMBAT),
+        // The in-combat bit, which `0x5ee5a0` does not read.
+        (FLAGS, 0x800),
     ]);
-    assert!(!possessing(Some(&hunter_pet), me));
+    assert!(!possessing(Some(&hunter_pet)));
 
     // The same pet under Eyes of the Beast.
     let driven = unit(&[
@@ -390,11 +400,11 @@ fn the_latch_gate_is_possession_not_ownership() {
         (CREATEDBY + 1, 0),
         (FLAGS, UNIT_FLAG_POSSESSED),
     ]);
-    assert!(possessing(Some(&driven), me));
+    assert!(possessing(Some(&driven)));
 
     // A mind-controlled mob: CHARMEDBY comes first, so it needs no CREATEDBY.
     let charmed = unit(&[(CHARMEDBY, 0x77), (CHARMEDBY + 1, 0), (FLAGS, 0x0100_0000)]);
-    assert!(possessing(Some(&charmed), me));
+    assert!(possessing(Some(&charmed)));
 
     // Another player's possessed unit.
     let theirs = unit(&[
@@ -402,9 +412,24 @@ fn the_latch_gate_is_possession_not_ownership() {
         (CHARMEDBY + 1, 0),
         (FLAGS, UNIT_FLAG_POSSESSED),
     ]);
-    assert!(!possessing(Some(&theirs), me));
+    assert!(!possessing(Some(&theirs)));
 
-    assert!(!possessing(None, me));
+    assert!(!possessing(None));
+
+    // Ours and possessed, but the player's view is elsewhere, or nowhere.
+    assert!(!super::drain::possessing(
+        UNIT,
+        Some(&charmed),
+        Some(&viewing(0x99)),
+        me
+    ));
+    assert!(!super::drain::possessing(
+        UNIT,
+        Some(&charmed),
+        Some(&viewing(0)),
+        me
+    ));
+    assert!(!super::drain::possessing(UNIT, Some(&charmed), None, me));
 }
 
 #[test]
@@ -531,51 +556,6 @@ fn touching_your_target_calls_the_pet_off() {
     // With the latch down it sends nothing (`0x4bd65e`).
     assert!(!stop_pet_attack(&mut bar, &commands));
     assert!(rx.try_recv().is_err());
-}
-
-/// The owner test falls back to SUMMONEDBY, not `0x5ee5a0`'s CREATEDBY.
-#[test]
-fn the_attack_events_read_the_pets_combat_flag_not_the_click_latch() {
-    const FLAGS: u16 = 46;
-    const CHARMEDBY: u16 = 10;
-    const SUMMONEDBY: u16 = 12;
-    let unit =
-        |pairs: &[(u16, u32)]| ObjectStore(benilla_protocol::ObjectFields::from_pairs(pairs));
-    let me = Some(0x77u64);
-
-    // Ours by SUMMONEDBY, fighting or not.
-    let mine = |flags: u32| unit(&[(SUMMONEDBY, 0x77), (SUMMONEDBY + 1, 0), (FLAGS, flags)]);
-    assert_eq!(
-        pet_combat_flag(&mine(UNIT_FLAG_PET_IN_COMBAT), me),
-        Some(true)
-    );
-    assert_eq!(pet_combat_flag(&mine(0), me), Some(false));
-    // The callback tests one bit.
-    assert_eq!(pet_combat_flag(&mine(0x1000), me), Some(false));
-
-    // Another player's minion never fires.
-    let theirs = unit(&[
-        (SUMMONEDBY, 0x99),
-        (SUMMONEDBY + 1, 0),
-        (FLAGS, UNIT_FLAG_PET_IN_COMBAT),
-    ]);
-    assert_eq!(pet_combat_flag(&theirs, me), None);
-
-    // CHARMEDBY wins over SUMMONEDBY, both ways.
-    let charmed_by_me = unit(&[
-        (CHARMEDBY, 0x77),
-        (CHARMEDBY + 1, 0),
-        (FLAGS, UNIT_FLAG_PET_IN_COMBAT),
-    ]);
-    assert_eq!(pet_combat_flag(&charmed_by_me, me), Some(true));
-    let stolen = unit(&[
-        (CHARMEDBY, 0x99),
-        (CHARMEDBY + 1, 0),
-        (SUMMONEDBY, 0x77),
-        (SUMMONEDBY + 1, 0),
-        (FLAGS, UNIT_FLAG_PET_IN_COMBAT),
-    ]);
-    assert_eq!(pet_combat_flag(&stolen, me), None);
 }
 
 #[test]
@@ -946,7 +926,11 @@ fn a_held_pet_reads_connected_and_its_stock_power_bar_shows_its_power() {
     );
     assert_eq!(
         (r, g, b),
-        (1.0, 0.5, 0.25),
+        (
+            benilla_ui::color::quant::read(1.0),
+            benilla_ui::color::quant::read(0.5),
+            benilla_ui::color::quant::read(0.25)
+        ),
         "FOCUS, not the disconnected grey"
     );
     let errors = script.errors();
@@ -973,6 +957,7 @@ fn a_held_pet_names_its_templates_creature_type() {
             pet_family: 0,
             rank: 0,
             type_flags: 0,
+            pet_spell_list: 0,
             civilian: false,
             racial_leader: false,
             display_id: 0,
@@ -983,6 +968,7 @@ fn a_held_pet_names_its_templates_creature_type() {
         .init_resource::<crate::net::GuidIndex>()
         .init_resource::<crate::net::SelfGuid>()
         .insert_resource(names)
+        .insert_resource(crate::target::CreatureTypes::korean_for_tests())
         .insert_resource(PetBar {
             spells: PetSpells {
                 pet_guid: PET,
@@ -1017,5 +1003,79 @@ fn a_held_pet_names_its_templates_creature_type() {
         .non_send_resource_mut::<benilla_ui::script::UiScript>()
         .eval::<Option<String>>("return UnitCreatureType('pet')")
         .unwrap();
-    assert_eq!(answer.as_deref(), Some("Demon"));
+    assert_eq!(answer.as_deref(), Some("악마"));
+}
+
+/// `PET_ATTACK_START`/`STOP` are the flags watcher's (`crate::field_watch`, `0x5ff79f`): the pet
+/// feed fires neither, at first sight in combat or on either edge after.
+#[test]
+fn the_pet_feed_fires_no_attack_event() {
+    use bevy::prelude::*;
+    const ME: u64 = 0x77;
+    const PET: u64 = 0xF140_0000_0000_002A;
+    const FLAGS: u16 = 46;
+    const SUMMONEDBY: u16 = 12;
+
+    let mut app = App::new();
+    app.add_message::<crate::net::FieldChanged>()
+        .init_resource::<crate::net::GuidIndex>()
+        .insert_resource(crate::net::SelfGuid(Some(ME)))
+        .init_resource::<crate::names::NameCache>()
+        .insert_resource(PetBar {
+            spells: PetSpells {
+                pet_guid: PET,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .add_systems(Update, feed_pet_unit);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    // Kept alive for the run: a dropped receiver would fail the name query.
+    std::mem::forget(rx);
+    app.insert_resource(NetCommands(tx));
+    let pet = app
+        .world_mut()
+        .spawn((
+            crate::net::Guid(PET),
+            ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (SUMMONEDBY, ME as u32),
+                (FLAGS, 0x800),
+            ])),
+        ))
+        .id();
+    app.world_mut()
+        .resource_mut::<crate::net::GuidIndex>()
+        .0
+        .insert(PET, pet);
+    let script = benilla_ui::script::UiScript::new().unwrap();
+    script
+        .run(
+            r#"
+            SEEN = {}
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("PET_ATTACK_START")
+            f:RegisterEvent("PET_ATTACK_STOP")
+            f:SetScript("OnEvent", function() table.insert(SEEN, event) end)
+        "#,
+        )
+        .unwrap();
+    app.insert_non_send_resource(script);
+
+    for flags in [0x800, 0, 0x800] {
+        app.world_mut()
+            .entity_mut(pet)
+            .get_mut::<ObjectStore>()
+            .unwrap()
+            .0
+            .merge(benilla_protocol::ObjectFields::from_pairs(&[(
+                FLAGS, flags,
+            )]));
+        app.update();
+        let mut script = app
+            .world_mut()
+            .non_send_resource_mut::<benilla_ui::script::UiScript>();
+        script.resolve();
+        let seen = script.eval::<Vec<String>>("return SEEN").unwrap();
+        assert!(seen.is_empty(), "flags {flags:#x}: {seen:?}");
+    }
 }

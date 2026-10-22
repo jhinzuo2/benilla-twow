@@ -3,10 +3,10 @@
 //! and an accept re-issues that action with a suppress flag, as 1.12 has no confirm packet. The
 //! app owns the pending records; this module holds only the intents.
 
-use mlua::Lua;
+use mlua::{Lua, Value};
 
+use super::binding_abi;
 use super::Model;
-use crate::script::binding_abi::Idx32;
 
 /// One answer to a pending-equip question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +28,14 @@ impl super::UiScript {
 
     /// `ConfirmBindOnUse()` calls since the last drain.
     pub fn take_bind_on_use_confirms(&mut self) -> u32 {
+        self.take_bind_on_use_casts().len() as u32
+    }
+
+    /// The `ConfirmBindOnUse()` calls since the last drain, each with what the protected-action
+    /// gate's tag 2 allowed it: the re-issued use is `CGItem::Use` (`0x5d92c1`), whose cast is
+    /// `TryCastSpell`'s, behind the gate. The call spends its pending state whatever the gate said
+    /// (`0x5d92c6`-`0x5d92cc`), so it is queued either way.
+    pub fn take_bind_on_use_casts(&mut self) -> Vec<bool> {
         std::mem::take(&mut self.model_mut().bind_on_use_confirms)
     }
 
@@ -45,7 +53,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // `0x4898f0`, the `OnAccept` of `EQUIP_BIND` and `AUTOEQUIP_BIND` (`StaticPopup.lua:612-647`).
     g.set(
         "EquipPendingItem",
-        lua.create_function(|lua, index: u32| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: EquipPendingItem(index)` (`0x842600`, `0x489901`).
+            let index = binding_abi::index_arg32(lua, index, "Usage: EquipPendingItem(index)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model.pending_equip_answers.push(PendingEquipAnswer {
                 index,
@@ -59,7 +69,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // standing dialog (`exclusive = 1`), and that cancel releases the superseded item's locks.
     g.set(
         "CancelPendingEquip",
-        lua.create_function(|lua, Idx32(index): Idx32| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: CancelPendingEquip(index)` (`0x842620`, `0x489971`).
+            let index = binding_abi::index_arg32(lua, index, "Usage: CancelPendingEquip(index)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model.pending_equip_answers.push(PendingEquipAnswer {
                 index,
@@ -74,8 +86,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "ConfirmBindOnUse",
         lua.create_function(|lua, ()| {
+            let may_cast = super::protected::gate(lua, super::protected::Tag::CAST);
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.bind_on_use_confirms += 1;
+            model.bind_on_use_confirms.push(may_cast);
             Ok(())
         })?,
     )?;

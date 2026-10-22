@@ -9,8 +9,10 @@ use common::hx;
 
 #[test]
 fn update_object_fixture_decodes() {
-    // A unit create (0xAA), a gameobject create (0xBB) and an out-of-range block [0x10, 0x20].
-    let body = hx("03000000000301aa03200000000000000000cdd70bc6357e04c3f90fa74200000040000000000000803f0000e040000090400000000000000000db0f4940051700000000000000000000000000000008000000aa00000000000000090000000000c03f320000000301bb05000117810700bb000000000000002100000000000040630000000000c84200004843000096430000803f040200000001100120");
+    // An out-of-range block [0x10, 0x20], first as vmangos sends it (`UpdateData.cpp:143-155`),
+    // a unit create (0xAA) and a gameobject create (0xBB, a HAS_POSITION block at (100, 200,
+    // 300), as vmangos sends one).
+    let body = hx("03000000000402000000011001200301aa03200000000000000000cdd70bc6357e04c3f90fa74200000040000000000000803f0000e040000090400000000000000000db0f4940051700000000000000000000000000000008000000aa00000000000000090000000000c03f320000000301bb05400000c84200004843000096430000803f0117810700bb000000000000002100000000000040630000000000c84200004843000096430000803f");
     let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
     let events = decode(packet);
 
@@ -243,7 +245,8 @@ fn item_and_container_creates_decode() {
     }
     let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
     let events = decode(packet);
-    assert_eq!(events.len(), 2, "both creates decode, nothing spatial");
+    assert_eq!(events.len(), 3, "both creates decode, nothing spatial");
+    assert!(matches!(events[2], SessionEvent::ObjectUpdateEnd));
     match &events[0] {
         SessionEvent::ItemCreate {
             guid: 0x42,
@@ -279,7 +282,7 @@ fn gameobject_create_surfaces_transport_progress_and_position_fallback() {
     let guid: u64 = 176_495 | (0x1FC0u64 << 48);
 
     let mut body = 1u32.to_le_bytes().to_vec(); // amount_of_objects
-    body.push(0); // has_transport (unused by the parser)
+    body.push(0); // the header byte: no first pass
     body.push(2); // update_type: CREATE_OBJECT
     write_packed_guid(guid, &mut body).unwrap();
     body.push(5); // TypeId::GameObject
@@ -309,7 +312,7 @@ fn gameobject_create_surfaces_transport_progress_and_position_fallback() {
             transport_progress,
             transport,
             ..
-        }] => {
+        }, SessionEvent::ObjectUpdateEnd] => {
             assert_eq!(*g, guid);
             assert_eq!(*kind, EntityKind::GameObject);
             assert_eq!(*display_id, Some(3015));
@@ -382,7 +385,7 @@ fn unit_living_block_surfaces_on_transport_rider_pose() {
             transport_progress,
             transport,
             ..
-        }] => {
+        }, SessionEvent::ObjectUpdateEnd] => {
             assert_eq!(*position, [100.0, 200.0, 5.0], "the unit's own world pose");
             assert_eq!(*orientation, 1.0);
             assert_eq!(
@@ -447,7 +450,7 @@ fn unit_living_block_surfaces_the_swim_it_is_already_in() {
             mover,
             speeds,
             ..
-        }] => {
+        }, SessionEvent::ObjectUpdateEnd] => {
             assert_eq!(*orientation, 2.0);
             assert_eq!(
                 mover,
@@ -488,7 +491,7 @@ fn a_dry_living_block_has_no_pitch_tail_and_reads_level() {
 
     let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
     match decode(packet).as_slice() {
-        [SessionEvent::ObjectCreate { mover, speeds, .. }] => {
+        [SessionEvent::ObjectCreate { mover, speeds, .. }, SessionEvent::ObjectUpdateEnd] => {
             assert_eq!(
                 mover,
                 &Some(benilla_protocol::MoverState { flags, pitch: 0.0 }),
@@ -571,7 +574,7 @@ fn unit_living_block_surfaces_the_walk_it_is_already_on() {
             position,
             spline,
             ..
-        }] => {
+        }, SessionEvent::ObjectUpdateEnd] => {
             let s = spline.as_ref().expect("the create block's live spline");
             assert_eq!(
                 s.path, path,
@@ -597,6 +600,109 @@ fn unit_living_block_surfaces_the_walk_it_is_already_on() {
     }
 }
 
+/// The GameObject constructor copies the create block's position over `GAMEOBJECT_POS_X`..`FACING`
+/// (`0x5f7046`..`0x5f706b`), so a create whose descriptor and block disagree is placed by the block.
+#[test]
+fn gameobject_create_is_placed_by_the_block_over_its_position_fields() {
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.push(0); // has_transport
+    body.push(2); // CREATE_OBJECT
+    write_packed_guid(0xBB, &mut body).unwrap();
+    body.push(5); // TypeId::GameObject
+    body.push(0x40); // HAS_POSITION
+    for v in [5000.0f32, 6000.0, 15.0, 2.0] {
+        body.extend_from_slice(&v.to_le_bytes()); // the block's pose
+    }
+    // Fields 8 (GAMEOBJECT_DISPLAYID) and 15..=18 (GAMEOBJECT_POS_X, _Y, _Z, FACING) in block 0.
+    body.push(1);
+    body.extend_from_slice(&((1u32 << 8) | (0xF << 15)).to_le_bytes());
+    body.extend_from_slice(&3015u32.to_le_bytes());
+    for v in [100.0f32, 200.0, 300.0, 1.0] {
+        body.extend_from_slice(&v.to_le_bytes()); // the descriptor's pose
+    }
+
+    let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
+    match decode(packet).as_slice() {
+        [SessionEvent::ObjectCreate {
+            position,
+            orientation,
+            display_id,
+            ..
+        }, SessionEvent::ObjectUpdateEnd] => {
+            assert_eq!(*display_id, Some(3015), "control: the fields were sent");
+            assert_eq!(*position, [5000.0, 6000.0, 15.0], "the block wins");
+            assert_eq!(*orientation, 2.0);
+        }
+        other => panic!("expected one ObjectCreate, got {other:?}"),
+    }
+}
+
+/// The create spline's final-facing bits are tested one by one, each field read in this order when
+/// its bit is set: point (`0x10000`, 12 bytes, `0x47f0bf`), guid (`0x20000`, 8, `0x47f0e8`), angle
+/// (`0x40000`, 4, `0x47f0f9`). The id, timing and path behind them land only if every set bit took
+/// its bytes. Flags `0x50000` is the golden: the point (1, 2, 3), then the angle 1.5.
+#[test]
+fn create_spline_reads_each_final_facing_field_its_bit_names() {
+    // A unit create with a LIVING block on a spline: head and move flags, pose, speeds, then
+    // `spline flags`, the facing fields, timing (3000, 12000, id 42, 5 nodes), the 5 nodes and the
+    // final destination, and a descriptor behind it (UNIT_FIELD_DISPLAYID 1234).
+    fn create(spline_flags: &str, facing: &str) -> Vec<u8> {
+        hx(&[
+            concat!("01000000", "00", "02", "01aa", "03", "20"),
+            concat!("00004000", "00000000"),
+            concat!("000060410000a0410000f04100000000", "00000000"),
+            "000020400000e04000009040721c974000002040db0f4940",
+            spline_flags,
+            facing,
+            "b80b0000e02e00002a00000005000000",
+            concat!("000000000000a0410000f041", "000020410000a0410000f041"),
+            concat!("0000a0410000a0410000f041", "0000a041000020420000f041"),
+            concat!("0000a041000020420000f041", "0000a041000020420000f041"),
+            "050000000000000000000000000000000008000000d2040000",
+        ]
+        .concat())
+    }
+    let point = "0000803f0000004000004040";
+    let guid = "1122334455667788";
+    let angle = "0000c03f";
+    for (name, flags, facing) in [
+        ("point and angle", "00000500", [point, angle].concat()),
+        ("point and guid", "00000300", [point, guid].concat()),
+        ("guid and angle", "00000600", [guid, angle].concat()),
+        ("all three", "00000700", [point, guid, angle].concat()),
+        ("the point alone", "00000100", point.to_string()),
+        ("the guid alone", "00000200", guid.to_string()),
+        ("the angle alone", "00000400", angle.to_string()),
+        ("none", "00000000", String::new()),
+    ] {
+        let packet = messages::parse_server(
+            messages::opcode::SMSG_UPDATE_OBJECT,
+            &create(flags, &facing),
+        )
+        .unwrap();
+        match decode(packet).as_slice() {
+            [SessionEvent::ObjectCreate {
+                guid: 0xAA,
+                display_id,
+                spline,
+                ..
+            }, SessionEvent::ObjectUpdateEnd] => {
+                let s = spline.as_ref().expect("the spline");
+                assert_eq!(s.id, 42, "{name}: the id is read where the facing ends");
+                assert_eq!(s.time_passed_ms, 3_000, "{name}");
+                assert_eq!(s.duration_ms, 12_000, "{name}");
+                assert_eq!(s.path.len(), 3, "{name}");
+                assert_eq!(
+                    *display_id,
+                    Some(1234),
+                    "{name}: the fields behind it parse"
+                );
+            }
+            other => panic!("{name}: expected one ObjectCreate, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn unit_living_block_without_the_spline_flag_carries_no_walk() {
     let mut body = 1u32.to_le_bytes().to_vec();
@@ -618,7 +724,9 @@ fn unit_living_block_without_the_spline_flag_carries_no_walk() {
 
     let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
     match decode(packet).as_slice() {
-        [SessionEvent::ObjectCreate { spline, .. }] => assert!(spline.is_none()),
+        [SessionEvent::ObjectCreate { spline, .. }, SessionEvent::ObjectUpdateEnd] => {
+            assert!(spline.is_none())
+        }
         other => panic!("expected one ObjectCreate, got {other:?}"),
     }
 }
@@ -662,5 +770,130 @@ fn values_update_decodes_player_visible_item_entries() {
         fields.player_visible_item_entry(19),
         None,
         "slot out of range (19 slots, 0..=18)"
+    );
+}
+
+/// Every block reaches the app, an empty values block and a near-objects block included (the
+/// reference's handler acts on both: `0x46720f`, `0x467230`), and the packet's end closes them.
+#[test]
+fn an_update_packet_decodes_every_block_then_its_end() {
+    // Two blocks: values for 0xAA with no mask words, near objects [0x10].
+    let mut body = hx("0200000000");
+    body.extend_from_slice(&hx("0001aa00"));
+    body.extend_from_slice(&hx("05010000000110"));
+    let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
+    match decode(packet).as_slice() {
+        [SessionEvent::ObjectValues { guid: 0xAA, fields }, SessionEvent::ObjectsNear(near), SessionEvent::ObjectUpdateEnd] =>
+        {
+            assert!(fields.is_empty());
+            assert_eq!(near, &[0x10]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A first-pass guid: its top four bits are 6 (`0x4660e6`).
+const FIRST_SIX: u64 = 0x6000_0000_0000_0042;
+
+/// One event as the pass tests compare it: the block's kind and guid, any other event whole.
+fn shape(ev: &SessionEvent) -> String {
+    match ev {
+        SessionEvent::ObjectCreate { guid, .. } => format!("create {guid:#x}"),
+        SessionEvent::ItemCreate { guid, .. } => format!("item {guid:#x}"),
+        SessionEvent::ObjectValues { guid, .. } => format!("values {guid:#x}"),
+        SessionEvent::ObjectMove { guid, .. } => format!("move {guid:#x}"),
+        SessionEvent::ObjectsNear(guids) => format!("near {guids:x?}"),
+        SessionEvent::ObjectsRemoved(guids) => format!("out of range {guids:x?}"),
+        SessionEvent::ObjectUpdateEnd => "end".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn update_shapes(body: &[u8]) -> Vec<String> {
+    let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, body).unwrap();
+    decode(packet).iter().map(shape).collect()
+}
+
+/// Five blocks behind the header byte: values for 0xAA (entry 0x12); for the first-pass guid
+/// [`FIRST_SIX`], a gameobject create at (100, 200, 300) with display 3015, a movement block and
+/// values (entry 0x13); near objects [0x10, 0x8000_0000_0000_0011].
+fn mixed_passes(header: &str) -> Vec<u8> {
+    hx(&[
+        "05000000",
+        header,
+        "0001aa010800000012000000",
+        "0281426005400000c84200004843000096430000803f0100010000c70b0000",
+        "01814260400000ca4200004843000096430000803f",
+        "00814260010800000013000000",
+        "05020000000110811180",
+    ]
+    .concat())
+}
+
+/// The header byte runs a first pass over the blocks of top-nibble 6 and 8 guids, then a second
+/// over the rest and every movement block (`0x46520e`, `0x465222`; the guid test `0x4660d8`-
+/// `0x466105`, none in the movement handler `0x467050`). The notify pass reads every block in
+/// packet order (`0x46522d`), so a first-pass block keeps its place there.
+#[test]
+fn the_header_byte_writes_top_nibble_six_and_eight_guids_first() {
+    let notify_create = format!("ObjectNotify {{ guid: {FIRST_SIX}, block: Create(GameObject) }}");
+    let notify_values = format!("ObjectNotify {{ guid: {FIRST_SIX}, block: Values([3]) }}");
+    assert_eq!(
+        update_shapes(&mixed_passes("01")),
+        [
+            "create 0x6000000000000042",
+            "values 0x6000000000000042",
+            "near [8000000000000011]",
+            "values 0xaa",
+            &notify_create,
+            "move 0x6000000000000042",
+            &notify_values,
+            "near [10]",
+            "end",
+        ]
+    );
+}
+
+/// With the header byte clear only the second pass runs, so no pass writes a first-pass guid's
+/// create, values or near entry; the notify pass still reads them (`0x465c50`, `0x465330`).
+#[test]
+fn a_clear_header_byte_writes_no_first_pass_block() {
+    let notify_create = format!("ObjectNotify {{ guid: {FIRST_SIX}, block: Create(GameObject) }}");
+    let notify_values = format!("ObjectNotify {{ guid: {FIRST_SIX}, block: Values([3]) }}");
+    assert_eq!(
+        update_shapes(&mixed_passes("00")),
+        [
+            "values 0xaa",
+            &notify_create,
+            "move 0x6000000000000042",
+            &notify_values,
+            "near [10]",
+            "end",
+        ]
+    );
+}
+
+/// An out-of-range list releases only as the packet's first block, ahead of both passes
+/// (`0x4651e1`); in any other place the notify pass reads past it (`0x465fd0`).
+#[test]
+fn an_out_of_range_list_decodes_only_as_the_first_block() {
+    // Values for 0xAA with no mask words, then out of range [0xAA].
+    assert_eq!(
+        update_shapes(&hx("02000000000001aa00040100000001aa")),
+        ["values 0xaa", "end"]
+    );
+    assert_eq!(
+        update_shapes(&hx("0200000000040100000001aa0001aa00")),
+        ["out of range [aa]", "values 0xaa", "end"]
+    );
+    // First, it goes ahead of the first pass too.
+    assert_eq!(
+        update_shapes(&hx("020000000104010000008142600081426000")),
+        [
+            "out of range [6000000000000042]".to_string(),
+            "values 0x6000000000000042".to_string(),
+            format!("ObjectNotify {{ guid: {FIRST_SIX}, block: Values([]) }}"),
+            "end".to_string(),
+        ]
     );
 }

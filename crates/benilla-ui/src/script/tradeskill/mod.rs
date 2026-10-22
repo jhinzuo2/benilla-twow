@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 
 mod api;
+mod itemstats;
 mod view;
 
 #[cfg(test)]
@@ -88,14 +89,17 @@ pub struct TradeSkillRecipe {
     pub icon: Option<String>,
     pub min_made: u32,
     pub max_made: u32,
-    /// Remaining cooldown in seconds; `None` when ready.
-    pub cooldown_secs: Option<u64>,
+    /// The recipe spell's cooldown as `(start_ms on the GetTime clock, duration_ms, enabled)`,
+    /// `None` when ready: the getter derives the seconds left at its call (`0x4fda20`), so a
+    /// running cooldown never changes the pushed state.
+    pub cooldown: Option<(i64, u32, bool)>,
     /// The created item, 0 for a pure-effect recipe.
     pub product_item: u32,
     /// The product's `InventoryType`, which the inv-slot filter folds to slot bits through
     /// `DAT_00809200` (`0x4fcee6`); 0 takes the catch-all bit.
     pub product_inv_type: u32,
-    /// The product's `ItemLevel`, the sort key between tier and name (`record+0x14`, `0x7c9640`).
+    /// The product's `ItemLevel` (`0x7c9640`), the sort key between tier and name, highest first
+    /// (`row+0x14`, `0x4fd4e6`).
     pub product_item_level: u32,
     /// In display order.
     pub reagents: Vec<TradeSkillReagent>,

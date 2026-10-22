@@ -52,9 +52,9 @@ fn harness_with(mut s: UiScript, definers: &[&str]) -> UiScript {
             super::test_ui::load_ui(&s, file);
         }
     }
-    // The app's post-load pass: `BuffFrame_OnLoad` never pitches the buff rows, and the stock arm
-    // that does waits for `VARIABLES_LOADED` (`UIOptionsFrame.lua:206`).
-    super::manifest::apply_buff_durations(&s).unwrap();
+    // `BuffFrame_OnLoad` never pitches the buff rows; the stock arm that does waits for
+    // `VARIABLES_LOADED` (`UIOptionsFrame.lua:206`).
+    s.fire_event("VARIABLES_LOADED", vec![]);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
     s
 }
@@ -112,6 +112,46 @@ fn controls_is_the_default_category_and_the_title_reads_it() {
         "Action Bars"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The page body is the ScrollFrame's scroll child, which its HIGHLIGHT callback draws at the
+/// ScrollFrame's level (`0x787220`); the bar's trough sits at that level too, so the body and the
+/// bar, a level up, both draw over it.
+#[test]
+fn the_page_body_and_its_bar_draw_over_the_bar_trough() {
+    benilla_formats::wow_data_or_skip!();
+    let mut s = harness();
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.resolve();
+    s.tick(0.05);
+    s.resolve();
+    assert!(
+        s.eval::<bool>("return BenillaOptionsFrameContainerScrollBarTrough:IsVisible() == 1")
+            .unwrap(),
+        "the Controls page scrolls, so its trough shows"
+    );
+    let quads = s.extract();
+    let zs = |pick: &dyn Fn(&str) -> bool| -> Vec<u128> {
+        quads
+            .iter()
+            .filter(|q| s.quad_owner_name(q.target).is_some_and(|n| pick(&n)))
+            .map(|q| q.z)
+            .collect()
+    };
+    let trough = zs(&|n| n == "BenillaOptionsFrameContainerScrollBarTrough");
+    let body = zs(&|n| n.starts_with("BenillaOptionsFrameContainerBody"));
+    let bar =
+        zs(&|n| n.starts_with("BenillaOptionsFrameContainerScrollBar") && !n.ends_with("Trough"));
+    let top = *trough.iter().max().expect("the trough draws");
+    assert!(!body.is_empty() && !bar.is_empty());
+    assert!(
+        body.iter().all(|&z| z > top),
+        "the body draws over the trough"
+    );
+    assert!(
+        bar.iter().all(|&z| z > top),
+        "the bar draws over the trough"
+    );
 }
 
 /// The selection survives a close and reopen: the OnShow re-applies the last category.
@@ -176,12 +216,12 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
     s.run("BENILLA_ERA_WINDOW_SCALE = 1").unwrap();
     s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
 
-    assert_eq!(
+    benilla_ui::assert_near!(
         s.eval::<f64>("return BenillaOptionsFrameCategoryListRowControlsBg:GetWidth()")
             .unwrap(),
         187.0
     );
-    assert_eq!(
+    benilla_ui::assert_near!(
         s.eval::<f64>("return BenillaOptionsFrameCategoryListRowControlsBg:GetHeight()")
             .unwrap(),
         21.0
@@ -195,11 +235,15 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
                 QuadContent::Texture {
                     path: Some(p),
                     color,
-                    additive,
+                    blend,
                     ..
-                } if p.contains("UI-QuestLogTitleHighlight") => {
-                    q.rect.map(|r| (r, color.unwrap_or([1.0; 4]), *additive))
-                }
+                } if p.contains("UI-QuestLogTitleHighlight") => q.rect.map(|r| {
+                    (
+                        r,
+                        color.unwrap_or([1.0; 4]),
+                        *blend == benilla_ui::script::BlendMode::Add,
+                    )
+                }),
                 _ => None,
             })
             .collect()
@@ -211,7 +255,7 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
     };
 
     let before = washes(&mut s);
-    assert_eq!(
+    benilla_ui::assert_near!(
         before.len(),
         1,
         "exactly one wash shows: the locked selection"
@@ -222,7 +266,7 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
     s.run("BenillaOptionsFrameCategoryListRowAudio:Click()")
         .unwrap();
     let after = washes(&mut s);
-    assert_eq!(after.len(), 1, "the wash moved, not multiplied");
+    benilla_ui::assert_near!(after.len(), 1, "the wash moved, not multiplied");
     assert!(gold(&after[0].1), "still the gold tint: {:?}", after[0].1);
     assert!(
         after[0].0.top < before[0].0.top,
@@ -248,13 +292,13 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
     };
     s.mouse_move(cx, cy);
     let hovered = washes(&mut s);
-    assert_eq!(
+    benilla_ui::assert_near!(
         hovered.len(),
         2,
         "hover adds its wash beside the locked gold"
     );
-    assert_eq!(hovered.iter().filter(|w| gold(&w.1)).count(), 1);
-    assert_eq!(
+    benilla_ui::assert_near!(hovered.iter().filter(|w| gold(&w.1)).count(), 1);
+    benilla_ui::assert_near!(
         hovered.iter().filter(|w| blue(&w.1)).count(),
         1,
         "the hover tint is 1.14's steel-blue: {:?}",
@@ -263,7 +307,7 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
 
     s.mouse_move(5.0, 5.0);
     let left = washes(&mut s);
-    assert_eq!(left.len(), 1);
+    benilla_ui::assert_near!(left.len(), 1);
     assert!(gold(&left[0].1));
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -347,6 +391,11 @@ fn search_reflows_live_rows_and_restores_the_page() {
     let authored_top: f32 = s
         .eval("return BenillaOptionsFrameContainerBodyAudioRowMaster:GetTop()")
         .unwrap();
+    // The clear button's icon rests at half alpha, set by its `OnLoad`: no region reads `alpha=`.
+    let icon: f32 = s
+        .eval("return BenillaOptionsFrameSearchBoxClearButtonIcon:GetAlpha()")
+        .unwrap();
+    assert!((icon - 0.5).abs() < 0.01, "the clear icon at rest: {icon}");
 
     s.run("BenillaOptionsFrameSearchBox:SetText(\"music\")")
         .unwrap();
@@ -1716,9 +1765,15 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
         changes.contains(&("farclip".to_string(), "350".to_string())),
         "{changes:?}"
     );
+    // The Brightness row restores through `SetGamma(0)`, which writes `"%f"` of `1 - 0`
+    // (`0x4891f0`): "1.000000" against the registered "1.0".
+    assert!(
+        changes.contains(&("gamma".to_string(), "1.000000".to_string())),
+        "{changes:?}"
+    );
     assert_eq!(
         changes.len(),
-        2,
+        3,
         "only the default writes queue — never the dead pending: {changes:?}"
     );
     // 357, not 350: the registered 350 is off the reference's 177 + n * 60 ladder
@@ -1884,7 +1939,13 @@ fn defaults_resets_the_controls_page_to_registered_defaults() {
         changes.contains(&("autoLootDefault".to_string(), "0".to_string())),
         "{changes:?}"
     );
-    assert_eq!(changes.len(), 2, "only the moved values queue: {changes:?}");
+    // The Mouse Look Speed row's pitch twin is written as the stock save writes it,
+    // `sliderValue/2` as a number (`UIOptionsFrame.lua:355-356`): "90" over the registered "90.0".
+    assert!(
+        changes.contains(&("cameraPitchMoveSpeed".to_string(), "90".to_string())),
+        "{changes:?}"
+    );
+    assert_eq!(changes.len(), 3, "only the moved values queue: {changes:?}");
     assert!(
         !s.eval::<bool>(
             "return BenillaOptionsFrameContainerBodyControlsRowStickyTargetCheck:GetChecked()"
@@ -2843,8 +2904,9 @@ fn the_interface_page_writes_the_three_stock_globals() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
-/// The picker is dead while the switch is off (`UIOptionsFrame.lua:697-701`), both rows run
-/// `TargetofTarget_Update` on a write, and the five entries are the reference's, in its order.
+/// The picker is dead while the switch is off (`UIOptionsFrame.lua:697-701`), both rows only write
+/// their globals, as 1.12's options do (`UIOptionsFrame.lua:65`), and the five entries are the
+/// reference's, in its order.
 #[test]
 fn the_target_of_target_rows_gate_each_other_and_write_their_globals() {
     benilla_formats::wow_data_or_skip!();
@@ -2899,13 +2961,11 @@ fn the_target_of_target_rows_gate_each_other_and_write_their_globals() {
     );
     assert!(
         s.eval::<bool>(
-            "return BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTarget.applyFunc \
-                 == \"TargetofTarget_Update\" \
-             and BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetMode.applyFunc \
-                 == \"TargetofTarget_Update\""
+            "return BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTarget.applyFunc == nil \
+             and BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetMode.applyFunc == nil"
         )
         .unwrap(),
-        "both rows re-decide the frame when they are written"
+        "the frames' own OnUpdates re-decide the frame, as in 1.12"
     );
 
     s.run("BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetModeDropdownButton:Click()")
@@ -2937,6 +2997,53 @@ fn the_target_of_target_rows_gate_each_other_and_write_their_globals() {
         s.take_cvar_changes().is_empty(),
         "still nothing in the CVar table"
     );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// With a target's target up, the switch raises nothing and the frame follows on the next frame,
+/// from `TargetFrame_OnUpdate` and `TargetofTarget_OnUpdate` (`TargetFrame.lua:492-501`). Run from
+/// the row, `TargetofTarget_Update` refreshed the row's own debuffs (`RefreshBuffs(this, …)`,
+/// `TargetFrame.lua:538`) and raised `BuffFrame.lua:281: attempt to index local 'debuffBorder'`.
+#[test]
+fn the_target_of_target_switch_leaves_the_frame_to_its_own_updates() {
+    use benilla_ui::script::UnitState;
+    benilla_formats::wow_data_or_skip!();
+    let mut s = interface_harness();
+    let unit = |name: &str, guid: u64| UnitState {
+        exists: true,
+        is_connected: true,
+        name: Some(name.into()),
+        guid,
+        health: 80,
+        max_health: 100,
+        level: 60,
+        ..UnitState::default()
+    };
+    s.set_unit("player", Some(unit("Tri", 0x100)));
+    s.set_unit("target", Some(unit("Kobold Miner", 0x200)));
+    s.set_unit("targettarget", Some(unit("Tri", 0x100)));
+    s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    let shown = |s: &mut UiScript| {
+        s.eval::<bool>("return TargetofTargetFrame:IsShown() and true or false")
+            .unwrap()
+    };
+
+    s.run("BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetCheck:Click()")
+        .unwrap();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    s.tick(0.016);
+    assert!(
+        shown(&mut s),
+        "on: the target frame's OnUpdate brings it up"
+    );
+
+    s.run("BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetCheck:Click()")
+        .unwrap();
+    s.tick(0.016);
+    assert!(!shown(&mut s), "off: its own OnUpdate takes it down");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -3582,6 +3689,9 @@ fn a_saved_hover_delay_is_applied_when_the_variables_land() {
 fn the_status_bar_text_row_pins_the_numerals_the_moment_it_is_clicked() {
     benilla_formats::wow_data_or_skip!();
     let mut s = interface_harness();
+    // The login's `UPDATE_FACTION` shows the strip the load hid while `UnitXPMax` was 0
+    // (`ReputationWatchBar_Update`); a hidden strip's `OnValueChanged` returns at once.
+    s.fire_event("UPDATE_FACTION", vec![]);
     // A real span first: the bar's update hides the numerals while `valueMax` is 0.
     s.set_player_xp(1000, 10000);
     s.run("this = MainMenuExpBar; MainMenuExpBar_Update()")
@@ -3730,7 +3840,7 @@ fn the_max_camera_distance_slider_stores_a_factor_and_reads_out_yards() {
     assert_eq!(
         s.eval::<String>("return GetCVar(\"cameraDistanceMaxFactor\")")
             .unwrap(),
-        "1"
+        "1.0"
     );
     assert_eq!(
         s.eval::<String>(

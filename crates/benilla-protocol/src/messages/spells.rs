@@ -170,10 +170,19 @@ pub struct SpellGo {
     pub spell_id: u32,
     pub cast_flags: u16,
     pub hits: Vec<u64>,
-    /// `(guid, SpellMissInfo)`; a reflect's trailing outcome byte is dropped.
-    pub misses: Vec<(u64, u8)>,
+    pub misses: Vec<SpellGoMiss>,
     pub targets: SpellCastTargets,
     pub ammo_display_id: Option<u32>,
+}
+
+/// One `SMSG_SPELL_GO` miss entry: the target and its `SpellMissInfo`, and for a reflect (11) the
+/// reflected spell's outcome on its caster, 0 otherwise (the client's `[ebp-0x68]` array, read
+/// by `0x6e7df3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpellGoMiss {
+    pub target: u64,
+    pub info: u8,
+    pub reflect_result: u8,
 }
 
 pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
@@ -191,12 +200,18 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
     let miss_count = read_u8(r)?;
     let mut misses = Vec::with_capacity(capacity_hint(miss_count, usize::from(u8::MAX)));
     for _ in 0..miss_count {
-        let guid = read_u64_le(r)?;
-        let reason = read_u8(r)?;
-        if reason == SPELL_MISS_REFLECT {
-            let _reflect_result = read_u8(r)?;
-        }
-        misses.push((guid, reason));
+        let target = read_u64_le(r)?;
+        let info = read_u8(r)?;
+        let reflect_result = if info == SPELL_MISS_REFLECT {
+            read_u8(r)?
+        } else {
+            0
+        };
+        misses.push(SpellGoMiss {
+            target,
+            info,
+            reflect_result,
+        });
     }
 
     let targets = read_spell_cast_targets(r)?;
@@ -260,11 +275,12 @@ pub(super) fn read_set_spell_modifier(r: &mut impl Read) -> io::Result<(u8, u8, 
 }
 
 /// Read `SMSG_UPDATE_AURA_DURATION` (vmangos `SpellAuras.cpp:7511-7523`): an aura slot and its ms
-/// left. Sent only to the aura's target and never for a permanent aura, so an occupied slot with
-/// no duration lasts until cancelled.
-pub(super) fn read_update_aura_duration(r: &mut impl Read) -> io::Result<(u8, u32)> {
+/// left, signed: the client reads a dword and adds it to its clock (`0x4e4390`), so a negative span
+/// is an expiry in the past. Sent only to the aura's target; vmangos skips a permanent aura, but a
+/// core that sends -1 for one reads as no time left.
+pub(super) fn read_update_aura_duration(r: &mut impl Read) -> io::Result<(u8, i32)> {
     let slot = read_u8(r)?;
-    let remaining_ms = read_u32_le(r)?;
+    let remaining_ms = read_i32_le(r)?;
     Ok((slot, remaining_ms))
 }
 
@@ -343,6 +359,16 @@ pub fn cast_spell_item(spell_id: u32, item_guid: u64) -> Vec<u8> {
     body.extend_from_slice(&spell_id.to_le_bytes());
     body.extend_from_slice(&TARGET_FLAG_ITEM.to_le_bytes());
     crate::wire::write_packed_guid(item_guid, &mut body).expect("vec write");
+    body
+}
+
+/// Body of `CMSG_CAST_SPELL` at the partner's trade slot `slot`: `TARGET_FLAG_TRADE_ITEM` and the
+/// slot as a packed guid, the bind of `0x6e6900` (`0x6e6915`-`0x6e6925`), written by the targets
+/// writer `0x7e4e10` as any item target.
+pub fn cast_spell_trade_item(spell_id: u32, slot: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    super::items::write_cast_targets(&mut body, super::items::UseItemTarget::TradeItem(slot));
     body
 }
 
@@ -472,6 +498,30 @@ mod tests {
             r.is_empty(),
             "the body is exactly 5 bytes — slot is a byte, not a dword"
         );
+
+        // The span is a signed dword (`0x4e4390` adds it to the clock): -1 is an expiry in the
+        // past, not 4,294,967,295 ms.
+        let body = [0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(read_update_aura_duration(&mut &body[..]).unwrap(), (0, -1));
+        let body = [0x20, 0x00, 0x00, 0x00, 0x80];
+        assert_eq!(
+            read_update_aura_duration(&mut &body[..]).unwrap(),
+            (32, i32::MIN)
+        );
+        // Through the packet table, the way the session reads it.
+        let body = [0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        let packet = crate::messages::parse_server(
+            crate::messages::opcode::SMSG_UPDATE_AURA_DURATION,
+            &body,
+        )
+        .unwrap();
+        assert!(matches!(
+            packet,
+            crate::messages::ServerPacket::UpdateAuraDuration {
+                slot: 0,
+                remaining_ms: -1
+            }
+        ));
     }
 
     #[test]

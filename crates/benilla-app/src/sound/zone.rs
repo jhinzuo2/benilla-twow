@@ -457,23 +457,6 @@ fn apply_music_suppression(zone: &mut ZoneAudio, suppressed: bool, now: f64) {
     }
 }
 
-/// `StopMusic()`'s slot action — [`apply_music_suppression`]'s cut edge without the latch: drop
-/// the music slot's handle with the no-fade stop, and reset the starvation watch (the 1109
-/// staleness rule both that cut and [`stop_world_soundscape`] carry). The scheduler is
-/// deliberately left alone: the reap arms the next zone cycle the moment the stopped handle is
-/// collected, so the zone's own music continues its rhythm after the stop. That is the client's
-/// shape too — `StopMusic` stops the *track*, not the cycle, and TWoW's Everlook mute button
-/// (the chain's only caller) pairs it with `SetCVar("EnableMusic", 0)`, whose category-amp 0
-/// makes the resumed cycle inaudible until the player unmutes. Drained from the UI-sound drain
-/// in `super::ui`.
-pub(super) fn cut_music(zone: &mut ZoneAudio) {
-    if let Some(mut h) = zone.music.take() {
-        h.stop(mixer::fade(0));
-        info!("zone music: cut (StopMusic)");
-    }
-    zone.music_watch.reset();
-}
-
 fn zone_music_row(cat: &AreaSoundCatalog, _id: u32) -> Option<&benilla_formats::ZoneMusicEntry> {
     cat.zone_music(_id)
 }
@@ -610,10 +593,10 @@ fn start_music_stream(
         }
         return false;
     }
-    let bytes = {
-        let chain = assets.chain.lock_recover();
-        chain.read(&path)
-    };
+    // Every file FMOD opens is a loose-flagged open (`0x7a8860`).
+    let bytes = assets
+        .read_file_or_loose(&path)
+        .ok_or_else(|| anyhow::anyhow!("not in the loose files or the patch chain"));
     let data = match bytes.and_then(mixer::stream_from_bytes) {
         Ok(d) => d,
         Err(e) => {
@@ -704,7 +687,7 @@ fn open_lua_music(
     let Some(mixer_ref) = out.mixer.as_mut() else {
         return false;
     };
-    // The chain, then the addon folder: an addon's own track has an `Interface\AddOns\…` path.
+    // The addon folder, then the chain: an addon's own track has an `Interface\AddOns\…` path.
     let Some(bytes) = assets.read_file_or_loose(path) else {
         // Silent, as the reference's; the name is used verbatim (`0x458720` appends nothing).
         debug!("Lua music: {path} — not in the patch chain or the AddOns folder");
@@ -938,7 +921,7 @@ fn fade_out_ambience(zone: &mut ZoneAudio, fade_ms: u64) {
 /// The Lua music slot: this frame's queued verbs, the loop, the slider and the watch.
 /// Unconditional: the stream is the caller's, not the world soundscape's.
 fn lua_music(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut zone: NonSendMut<ZoneAudio>,
     mut out: NonSendMut<SoundOutput>,
     assets: Option<Res<WorldAssets>>,
@@ -948,49 +931,51 @@ fn lua_music(
     // Wall time for the stream watch.
     real: Res<Time<bevy::time::Real>>,
 ) {
-    let zone = &mut *zone;
-    let now = time.elapsed_secs_f64();
-    let requests = script.map(|mut s| s.take_music()).unwrap_or_default();
-    for req in requests {
-        match req {
-            // The NULL arm always lands, and moves the pump's clock even from cold.
-            benilla_ui::script::MusicRequest::Stop => {
-                set_lua_music(zone, &mut out, None, &config, None, now)
-            }
-            benilla_ui::script::MusicRequest::Play(path) => {
-                // Under the loading cover a start is dropped, not deferred: the reference's
-                // blocking load plays nothing.
-                let Some(assets) = assets.as_deref().filter(|_| !config.world_hold) else {
-                    debug!("Lua music: {path} dropped — no assets, or the loading cover is up");
-                    continue;
-                };
-                set_lua_music(zone, &mut out, Some(assets), &config, Some(&path), now);
+    hosted_vm.run(|script| {
+        let zone = &mut *zone;
+        let now = time.elapsed_secs_f64();
+        let requests = script.map(|s| s.take_music()).unwrap_or_default();
+        for req in requests {
+            match req {
+                // The NULL arm always lands, and moves the pump's clock even from cold.
+                benilla_ui::script::MusicRequest::Stop => {
+                    set_lua_music(zone, &mut out, None, &config, None, now)
+                }
+                benilla_ui::script::MusicRequest::Play(path) => {
+                    // Under the loading cover a start is dropped, not deferred: the reference's
+                    // blocking load plays nothing.
+                    let Some(assets) = assets.as_deref().filter(|_| !config.world_hold) else {
+                        debug!("Lua music: {path} dropped — no assets, or the loading cover is up");
+                        continue;
+                    };
+                    set_lua_music(zone, &mut out, Some(assets), &config, Some(&path), now);
+                }
             }
         }
-    }
 
-    // The loop: `SetLoopCount(-1)` in the reference, an explicit restart here.
-    if zone
-        .lua_music
-        .as_ref()
-        .is_some_and(|h| h.state() == kira::sound::PlaybackState::Stopped)
-    {
-        zone.lua_music = None;
-        if let (Some(path), Some(assets)) = (zone.lua_music_path.clone(), assets.as_deref()) {
-            open_lua_music(zone, &mut out, assets, &config, &path);
+        // The loop: `SetLoopCount(-1)` in the reference, an explicit restart here.
+        if zone
+            .lua_music
+            .as_ref()
+            .is_some_and(|h| h.state() == kira::sound::PlaybackState::Stopped)
+        {
+            zone.lua_music = None;
+            if let (Some(path), Some(assets)) = (zone.lua_music_path.clone(), assets.as_deref()) {
+                open_lua_music(zone, &mut out, assets, &config, &path);
+            }
         }
-    }
 
-    // The Music slider is live here too (`0x7a6660(ecx=2)`, the MusicVolume re-apply walker).
-    if let Some(h) = zone.lua_music.as_mut() {
-        h.set_volume(
-            mixer::amp_to_db(config.category_amp(SoundCategory::Music) * LUA_MUSIC_VOLUME),
-            mixer::glide(),
-        );
-    }
-    if let Some(h) = zone.lua_music.as_ref() {
-        zone.lua_music_watch.feed(h, f64::from(real.delta_secs()));
-    }
+        // The Music slider is live here too (`0x7a6660(ecx=2)`, the MusicVolume re-apply walker).
+        if let Some(h) = zone.lua_music.as_mut() {
+            h.set_volume(
+                mixer::amp_to_db(config.category_amp(SoundCategory::Music) * LUA_MUSIC_VOLUME),
+                mixer::glide(),
+            );
+        }
+        if let Some(h) = zone.lua_music.as_ref() {
+            zone.lua_music_watch.feed(h, f64::from(real.delta_secs()));
+        }
+    })
 }
 
 /// Server-pushed sounds (`SMSG_PLAY_SOUND`/`PLAY_MUSIC`/`PLAY_OBJECT_SOUND`): kits go through
@@ -1138,15 +1123,14 @@ pub(super) fn plugin(app: &mut App) {
             Update,
             lua_music
                 .before(server_sounds)
-                .after(crate::ui_script::UiInput)
+                .in_set(crate::ui_script::UiDrain)
                 // After the dev mute chord, so the gain feed hears it the same frame.
-                .after(super::toggle_mute)
-                .in_set(WorldStage::Present),
+                .after(super::toggle_mute),
         )
         // Unconditional, so the count falls to zero when the soundscape stops.
         .add_systems(Update, report_stream_voices)
         .add_systems(
-            OnExit(crate::char_select::ClientState::InWorld),
+            OnExit(crate::client_state::ClientState::InWorld),
             leave_world,
         );
 }
