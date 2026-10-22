@@ -683,8 +683,10 @@ pub(super) fn update_hovered_object(
                             self_store, go_guid,
                         ),
                         meeting_stone_queued: crate::target::cursor_mode::meeting_stone_queued(
-                            go_guid
-                                .and_then(|g| go_gate.templates.get(g)?.meeting_stone)
+                            go_gate
+                                .templates
+                                .of(&s.0)
+                                .and_then(|t| t.meeting_stone)
                                 .map(|m| m.area),
                             go_gate.queued_area(),
                         ),
@@ -726,7 +728,7 @@ pub(super) fn update_hovered_object(
     // `0x492890`, `0x52aa20` and `0x4945e0` only past it. Its null mouseover also hides a unit
     // behind the object, which our split picks leave hoverable.
     if let Ok(store) = stores.get(net_entity) {
-        let tmpl = go_gate.templates.get(guid.0);
+        let tmpl = go_gate.templates.of(&store.0);
         let reaction = crate::target::cursor_mode::go_reaction(
             go_gate.factions.as_deref(),
             store.0.gameobject_faction(),
@@ -935,7 +937,7 @@ mod tests {
         world.init_resource::<crate::spell::PicksSelf>();
         world.init_resource::<crate::spell::CorpsePick>();
         world.init_resource::<crate::spell::targeting::UnitPick>();
-        world.insert_resource(crate::net::Reputations(Vec::new()));
+        world.insert_resource(crate::net::Reputations::default());
         let mut camera = Camera::default();
         camera.computed.clip_from_view = Mat4::perspective_infinite_reverse_rh(1.0, 1.0, 0.1);
         camera.computed.target_info = Some(RenderTargetInfo {

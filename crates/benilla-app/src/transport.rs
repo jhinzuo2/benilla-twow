@@ -26,7 +26,7 @@ use benilla_formats::{
 use bevy::prelude::*;
 
 use crate::go_templates::GameObjectTemplates;
-use crate::net::Guid;
+use crate::net::{Guid, ObjectStore};
 use benilla_assets::{LockRecover, WorldAssets};
 use benilla_world::ride_frame::RideFrame;
 use benilla_world::vis_chain::VisChainOnly;
@@ -61,7 +61,10 @@ impl Plugin for TransportPlugin {
                 )
                     .chain()
                     .after(benilla_world::schedule::WorldStage::Net)
-                    .before(benilla_world::schedule::WorldStage::Input),
+                    .before(benilla_world::schedule::WorldStage::Input)
+                    // A script call applies inside its verb, against the decks as they stand
+                    // this frame: before every system that lends the call host.
+                    .before(crate::vm_pass::VmPass::Start),
             )
             // The ride frame last, after `PlayerControlSet` decides what we stand on; its
             // consumers, the particle and ribbon sims, run in `PostUpdate`.
@@ -245,7 +248,7 @@ fn arm_transports(
     templates: Res<GameObjectTemplates>,
     // A re-created lift is already armed but carries a fresh seed, so it re-enters to consume it.
     pending: Query<
-        (Entity, &Guid, Option<&ElevatorSeed>),
+        (Entity, &Guid, Option<&ElevatorSeed>, Option<&ObjectStore>),
         (
             With<TransportAnchor>,
             Or<(Without<Transport>, With<ElevatorSeed>)>,
@@ -255,7 +258,7 @@ fn arm_transports(
     if pending.is_empty() {
         return;
     }
-    for (entity, guid, seed) in &pending {
+    for (entity, guid, seed, store) in &pending {
         // The lift arm.
         if let Some(seed) = seed {
             let Timetables {
@@ -312,7 +315,10 @@ fn arm_transports(
         }
 
         // The boat arm.
-        let Some(mo) = templates.get(guid.0).and_then(|t| t.mo_transport) else {
+        let Some(mo) = store
+            .and_then(|s| templates.of(&s.0))
+            .and_then(|t| t.mo_transport)
+        else {
             continue; // template answer not in yet: next frame
         };
         let Timetables { nodes, built, .. } = &mut *timetables;

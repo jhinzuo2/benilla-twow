@@ -14,7 +14,7 @@ use crate::Chain;
 use anyhow::{Context, Result};
 use benilla_dbc::{FieldType, Schema, SchemaField};
 
-use crate::dbc::{i32_at, parse, str_at, u32_at};
+use crate::dbc::{loc_str, parse, str_at, u32_at};
 
 const ITEM_VISUALS: &str = "DBFilesClient\\ItemVisuals.dbc";
 const ITEM_VISUAL_EFFECTS: &str = "DBFilesClient\\ItemVisualEffects.dbc";
@@ -50,26 +50,13 @@ impl ItemVisualCatalog {
     }
 }
 
-/// `SpellItemEnchantment.dbc`'s visual, enUS name, `Flags` and effects, one load for the glow
-/// chain, the tooltip's enchant line, the bind confirms and whoever applies an enchant's stats.
+/// `SpellItemEnchantment.dbc`'s visual, name and `Flags`, one load for the glow chain, the
+/// tooltip's enchant line and the bind confirms.
 pub struct EnchantCatalog {
     visuals: HashMap<u32, i32>,
     names: HashMap<u32, String>,
     /// `Flags` for every row, 0 included, so its keys are the reference's `enchantTable[id] != 0`.
     flags: HashMap<u32, u32>,
-    /// The three effects of every row that carries one: `(Effect, EffectPointsMin, EffectArg)`,
-    /// fields 1..3, 4..6 and 10..12, as vmangos's `SpellItemEnchantmentEntry` reads them.
-    effects: HashMap<u32, [EnchantEffect; 3]>,
-}
-
-/// One effect of a `SpellItemEnchantment` row: its `ITEM_ENCHANTMENT_TYPE_*` (`kind`; 0 none,
-/// 3 an equip spell, 4 a resistance, 5 a stat), how much, and what it applies to: the stat's
-/// `ITEM_MOD_*` for a stat, the school for a resistance (0 armour), the spell for the others.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EnchantEffect {
-    pub kind: u32,
-    pub amount: i32,
-    pub arg: u32,
 }
 
 /// `Flags & 0x1`: applying the enchant binds the item. It is the only gate on the bind confirm,
@@ -92,12 +79,6 @@ impl EnchantCatalog {
         self.names.get(&enchant_id).map(String::as_str)
     }
 
-    /// The enchant's three effects, as a server applies them (`Item::ApplyEnchantment`); `None`
-    /// for an unknown id or a row whose three are all empty.
-    pub fn effects(&self, enchant_id: u32) -> Option<&[EnchantEffect; 3]> {
-        self.effects.get(&enchant_id)
-    }
-
     /// Whether applying the enchant binds the item ([`FLAG_BINDS_THE_ITEM`]); `false` for an
     /// unknown id, as the reference skips a missing row.
     pub fn binds_the_item(&self, enchant_id: u32) -> bool {
@@ -107,6 +88,14 @@ impl EnchantCatalog {
     /// Whether the item tooltip prints no line for the enchant ([`FLAG_TOOLTIP_HIDES_NAME`]).
     pub fn tooltip_hides_name(&self, enchant_id: u32) -> bool {
         self.flag(enchant_id, FLAG_TOOLTIP_HIDES_NAME)
+    }
+
+    /// The name the combat log's enchantment lines print: `None` for an id with no row, or with
+    /// `Flags & 0x2`, where both formatters return (`0x6290d3`-`0x6290e8`, `0x62922d`-`0x629242`);
+    /// a row with an empty name prints it empty.
+    pub fn logged_name(&self, enchant_id: u32) -> Option<&str> {
+        (self.has_row(enchant_id) && !self.flag(enchant_id, FLAG_TOOLTIP_HIDES_NAME))
+            .then(|| self.name(enchant_id).unwrap_or(""))
     }
 
     fn flag(&self, enchant_id: u32, bit: u32) -> bool {
@@ -129,7 +118,6 @@ impl EnchantCatalog {
             visuals,
             names,
             flags,
-            effects: HashMap::new(),
         }
     }
 
@@ -141,6 +129,11 @@ impl EnchantCatalog {
     /// How many enchants carry a glow.
     pub fn visual_count(&self) -> usize {
         self.visuals.len()
+    }
+
+    /// `(enchant id, display name)` for every row that carries one, in no order.
+    pub fn iter_names(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        self.names.iter().map(|(k, v)| (*k, v.as_str()))
     }
 
     /// How many enchants carry a name.
@@ -170,8 +163,8 @@ pub(crate) fn item_visual_effects_schema() -> Schema {
     s
 }
 
-/// `SpellItemEnchantment.dbc`: 24 fields, 96-byte records. The reference reads the enUS name at
-/// `+0x34` (field 13, `0x4960d0`), the visual at `+0x58` (field 22, `0x5d9be1`) and `Flags` at
+/// `SpellItemEnchantment.dbc`: 24 fields, 96-byte records. The reference reads the name block at
+/// `+0x34 + 4·locale` (field 13, `0x4960d0`), the visual at `+0x58` (field 22, `0x5d9be1`) and `Flags` at
 /// `+0x5c` (field 23).
 pub(crate) fn spell_item_enchantment_schema() -> Schema {
     let mut s = Schema::new("SpellItemEnchantment");
@@ -233,28 +226,20 @@ pub fn load_enchant_catalog(chain: &mut Chain) -> Result<EnchantCatalog> {
         spell_item_enchantment_schema(),
         "SpellItemEnchantment",
     )?;
+    let locale = chain.locale();
     let mut visuals = HashMap::new();
     let mut names = HashMap::new();
     let mut flags = HashMap::with_capacity(rs.records().len());
-    let mut effects = HashMap::new();
     for r in rs.records() {
         let Some(id) = u32_at(r, 0) else { continue };
-        let three: [EnchantEffect; 3] = std::array::from_fn(|i| EnchantEffect {
-            kind: u32_at(r, 1 + i).unwrap_or(0),
-            amount: i32_at(r, 4 + i).unwrap_or(0),
-            arg: u32_at(r, 10 + i).unwrap_or(0),
-        });
-        if three.iter().any(|e| e.kind != 0) {
-            effects.insert(id, three);
-        }
         // Every row, `Flags == 0` included: the keys are the row set.
         flags.insert(id, u32_at(r, 23).unwrap_or(0));
         let visual = u32_at(r, 22).unwrap_or(0) as i32;
         if visual != 0 {
             visuals.insert(id, visual);
         }
-        // `str_at` drops an empty name.
-        if let Some(name) = str_at(&rs, r, 13) {
+        // `loc_str` drops an empty name.
+        if let Some(name) = loc_str(&rs, r, 13, locale) {
             names.insert(id, name);
         }
     }
@@ -262,27 +247,12 @@ pub fn load_enchant_catalog(chain: &mut Chain) -> Result<EnchantCatalog> {
         visuals,
         names,
         flags,
-        effects,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every kind is one of the seven `ITEM_ENCHANTMENT_TYPE_*`, and the equip-spell effect (3),
-    /// how 1.12's data grants a random suffix's stats, is common and names its spell.
-    #[test]
-    fn enchant_effects_name_their_kind_and_their_spell() {
-        let data = crate::wow_data_or_skip!();
-        let mut chain = crate::open_chain(&data).expect("open chain");
-        let cat = load_enchant_catalog(&mut chain).expect("SpellItemEnchantment");
-        assert!(cat.effects.len() > 1000, "{}", cat.effects.len());
-        let all: Vec<EnchantEffect> = cat.effects.values().flatten().copied().collect();
-        assert!(all.iter().all(|e| e.kind <= 7), "a kind past 7");
-        assert!(all.iter().filter(|e| e.kind == 3 && e.arg != 0).count() > 500);
-        assert!(cat.effects(u32::MAX).is_none());
-    }
 
     #[test]
     fn real_item_visuals_join_their_effect_models() {

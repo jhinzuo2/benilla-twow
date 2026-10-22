@@ -13,15 +13,17 @@ use crate::ui_quest::QuestGiver;
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::ecs::system::SystemParam;
 
+use super::{clock_tick, ServerTime};
 use super::{
     AddonInfoMessage, CharActionResultMessage, CharListMessage, CharacterLoginFailedMessage,
     CinematicTriggeredMessage, ClientControlMessage, DisconnectedMessage, DroppedOpcodes,
-    EnteredWorldMessage, GameTime, GuidIndex, HomeBind, KnockBackMessage, LoggedOutMessage,
+    EnteredWorldMessage, GuidIndex, HomeBind, KnockBackMessage, LoggedOutMessage,
     LoginFailedMessage, LoginQueuedMessage, LoginStageMessage, NetCommands, NetHandlerApp,
     NetStatus, ObjectStore, PendingTransfer, Proficiencies, RealmListMessage, Reputations,
-    RosterFailedMessage, SelfGuid, ServerTime, ServerWallClock, TeleportMessage, WorldAuthMessage,
+    RosterFailedMessage, SelfGuid, ServerWallClock, TeleportMessage, WorldAuthMessage,
     WorldportMessage,
 };
+use benilla_world::frame_pace::FrameStep;
 
 /// Registers the session handlers.
 pub(super) fn register(app: &mut App) {
@@ -48,6 +50,9 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::TransferPending, on_transfer)
         .net_handler(K::TransferAborted, on_transfer)
         .net_handler(K::TimeSpeed, on_clock)
+        .net_handler(K::GameSpeedSet, on_clock)
+        .net_handler(K::GameTimeUpdate, on_clock)
+        .net_handler(K::GameTimeSet, on_clock)
         .net_handler(K::ServerUnixTime, on_clock)
         .net_handler(K::Reputations, on_reputations)
         .net_handler(K::ReputationDelta, on_reputation_delta)
@@ -59,7 +64,7 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::Pong, on_pong);
 }
 
-/// The edges the bridge publishes as messages, and the two resources they park in.
+/// The edges the bridge publishes as messages, and the three resources they park in.
 #[derive(SystemParam)]
 pub(crate) struct Edges<'w> {
     teleports: MessageWriter<'w, TeleportMessage>,
@@ -71,6 +76,7 @@ pub(crate) struct Edges<'w> {
     char_login_failures: MessageWriter<'w, CharacterLoginFailedMessage>,
     entered_world: MessageWriter<'w, EnteredWorldMessage>,
     addon_reply: ResMut<'w, super::AddonInfoReply>,
+    billing: ResMut<'w, super::SessionBilling>,
     logged_out: MessageWriter<'w, LoggedOutMessage>,
     knockbacks: MessageWriter<'w, KnockBackMessage>,
     login_stages: MessageWriter<'w, LoginStageMessage>,
@@ -132,11 +138,8 @@ fn on_login_edge(In(ev): In<SessionEvent>, mut e: Edges) {
             e.login_queued.write(LoginQueuedMessage { position, realm });
         }
         SessionEvent::LoginFailed {
-            refusal,
-            reason,
-            terminal,
-            dial,
-        } => login_failed(refusal, reason, terminal, dial, &mut e.login_failures),
+            refusal, reason, ..
+        } => login_failed(refusal, reason, &mut e.login_failures),
         SessionEvent::RealmList { realms, failed } => {
             e.realm_lists.write(RealmListMessage { realms, failed });
         }
@@ -163,7 +166,7 @@ fn on_character_list(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
         realm,
         cause,
         epoch,
-        generation,
+        ..
     } = ev
     {
         character_list(
@@ -171,7 +174,6 @@ fn on_character_list(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
             realm,
             cause,
             epoch,
-            generation,
             &mut b.status,
             &mut e.char_lists,
         );
@@ -182,15 +184,15 @@ fn on_connected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
     if let SessionEvent::Connected {
         self_guid: guid,
         name,
-        billing_time_rested,
+        billing,
         tutorial_flags,
         addon_info,
     } = ev
     {
+        e.billing.0 = billing;
         connected(
             guid,
             name,
-            billing_time_rested,
             tutorial_flags,
             addon_info,
             &mut e.addon_reply,
@@ -210,16 +212,27 @@ fn on_logged_out(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
             &mut b.self_guid,
             &mut e.logged_out,
         );
-        // The forced-reaction table is the character's: the core sends it only on an aura
-        // change, never at login, so one left here would colour the next character's world.
-        b.reputations.1.clear();
+        // The reference zeroes the forced table's count only in teardown `0x4d5360` (`0x4d5419`),
+        // whose one caller is `ShutdownGame 0x491180` (`0x4911dc`), never on a worldport. The
+        // session's end stands in for that shutdown: the table is the character's, and one left
+        // here would colour the next character's world. The server resends it at login for a
+        // saved aura (vmangos `Unit.cpp:3511` → `SpellAuras.cpp:2744-2745`).
+        b.reputations.clear_forced();
     }
 }
 
 /// The bridge's half of the session end; each window's own listener runs after it.
-fn on_disconnected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
+fn on_disconnected(
+    In(ev): In<SessionEvent>,
+    mut e: Edges,
+    mut b: Bridge,
+    mut released: ResMut<super::objects::Released>,
+) {
     if let SessionEvent::Disconnected { reason, end } = ev {
-        b.reputations.1.clear();
+        // The same teardown as `on_logged_out`'s.
+        b.reputations.clear_forced();
+        // Leaving the world frees the released objects with the live ones (`0x467700`).
+        released.clear();
         disconnected(
             reason,
             end,
@@ -271,6 +284,8 @@ fn on_worldport(
     mut e: Edges,
     mut b: Bridge,
     mut group: ResMut<crate::ui_party::GroupState>,
+    script: Option<NonSend<benilla_ui::script::UiScript>>,
+    mut released: ResMut<super::objects::Released>,
 ) {
     if let SessionEvent::Worldport {
         map_id,
@@ -280,7 +295,14 @@ fn on_worldport(
     } = ev
     {
         // Every streamed roster member is about to be purged; the reference deactivates each.
-        crate::ui_party::net::roster_deactivated(&mut group, &b.index, &b.stores, &b.names, &b.net);
+        crate::ui_party::net::roster_deactivated(
+            &mut group,
+            &b.index,
+            &b.stores,
+            &b.names,
+            script.as_deref(),
+            &b.net,
+        );
         worldport(
             map_id,
             position,
@@ -292,6 +314,8 @@ fn on_worldport(
             &b.transports,
             &mut e.worldports,
         );
+        // Loading a new world frees the released objects with the live ones (`0x467700`).
+        released.clear();
     }
 }
 
@@ -306,14 +330,19 @@ fn on_transfer(In(ev): In<SessionEvent>, mut e: Edges) {
     }
 }
 
-fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge) {
+/// The game clock's four messages (`SMSG_LOGIN_SETTIMESPEED`, `SMSG_GAMESPEED_SET`,
+/// `SMSG_GAMETIME_UPDATE`, `SMSG_GAMETIME_SET`) and the server's wall clock.
+fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge, step: Res<FrameStep>) {
     match ev {
-        SessionEvent::TimeSpeed {
-            hours,
-            minutes,
-            day_serial,
-            timescale,
-        } => time_speed(hours, minutes, day_serial, timescale, &mut b.server_time),
+        SessionEvent::TimeSpeed { .. }
+        | SessionEvent::GameSpeedSet { .. }
+        | SessionEvent::GameTimeUpdate { .. }
+        | SessionEvent::GameTimeSet { .. } => {
+            let lines = b.server_time.0.on_message(&ev, clock_tick(&step));
+            for line in lines.into_iter().flatten() {
+                info!("console: {line}");
+            }
+        }
         SessionEvent::ServerUnixTime { unix_time } => {
             server_unix_time(unix_time, &mut b.wall_clock)
         }
@@ -325,7 +354,7 @@ fn on_reputations(
     In(ev): In<SessionEvent>,
     mut b: Bridge,
     factions: Option<Res<crate::target::ring::Factions>>,
-    mut chat: ResMut<crate::ui_chat::ChatLog>,
+    chat: Res<crate::ui_chat::ChatLog>,
 ) {
     match ev {
         SessionEvent::Reputations { standings } => reputations(standings, &mut b.reputations),
@@ -342,7 +371,7 @@ fn on_reputations(
                     me.race,
                     me.class,
                 );
-                crate::ui_reputation::queue_standing_lines(line, f.catalog(), me.female, &mut chat);
+                crate::ui_reputation::queue_standing_lines(line, f.catalog(), me.female, &chat);
             }
             reputation_visible(list_id, &mut b.reputations)
         }
@@ -378,17 +407,28 @@ fn on_reputation_delta(
     In(ev): In<SessionEvent>,
     mut b: Bridge,
     factions: Option<Res<crate::target::ring::Factions>>,
-    mut chat_log: ResMut<crate::ui_chat::ChatLog>,
+    chat_log: Res<crate::ui_chat::ChatLog>,
     mut quest: ResMut<QuestGiver>,
+    quest_log: Option<ResMut<crate::ui_quest_log::QuestLog>>,
 ) {
     if let SessionEvent::ReputationDelta { standings } = ev {
         crate::combat_log::chat::faction_standing(
             &standings,
             &b.reputations,
             factions.as_deref(),
-            &mut chat_log,
+            &chat_log,
         );
         if let (Some(f), Some(me)) = (factions.as_deref(), self_facts(&b)) {
+            let moved = crate::ui_reputation::rank_moved(
+                &standings,
+                &b.reputations,
+                f.catalog(),
+                me.race,
+                me.class,
+            );
+            if let (true, Some(mut quest_log)) = (moved, quest_log) {
+                quest_log.note_faction_rank_move();
+            }
             let lines = crate::ui_reputation::delta_lines(
                 &standings,
                 &b.reputations,
@@ -396,12 +436,7 @@ fn on_reputation_delta(
                 me.race,
                 me.class,
             );
-            crate::ui_reputation::queue_standing_lines(
-                lines,
-                f.catalog(),
-                me.female,
-                &mut chat_log,
-            );
+            crate::ui_reputation::queue_standing_lines(lines, f.catalog(), me.female, &chat_log);
         }
         reputation_delta(standings, &mut b.reputations, &mut quest);
     }
@@ -446,20 +481,13 @@ fn login_stage(stage: benilla_protocol::LoginStage, out: &mut MessageWriter<Logi
 }
 
 /// A login failed before the roster; the IO thread is back at its pre-logon park and
-/// [`crate::login`] decides what follows.
+/// [`crate::glue_session::login`] decides what follows.
 fn login_failed(
     refusal: Option<benilla_protocol::LoginRefusal>,
     reason: String,
-    terminal: bool,
-    dial: Option<benilla_protocol::DialFailure>,
     out: &mut MessageWriter<LoginFailedMessage>,
 ) {
-    out.write(LoginFailedMessage {
-        refusal,
-        reason,
-        terminal,
-        dial,
-    });
+    out.write(LoginFailedMessage { refusal, reason });
 }
 
 /// `SMSG_CHAR_CREATE`/`SMSG_CHAR_DELETE`: the glue screen turns the code into its string.
@@ -477,7 +505,6 @@ fn character_list(
     realm: Option<benilla_protocol::RealmInfo>,
     cause: benilla_protocol::RosterCause,
     epoch: u64,
-    generation: u64,
     status: &mut NetStatus,
     char_lists: &mut MessageWriter<CharListMessage>,
 ) {
@@ -493,11 +520,10 @@ fn character_list(
         realm,
         cause,
         epoch,
-        generation,
     });
 }
 
-/// `SMSG_CHARACTER_LOGIN_FAILED`: the announced entry is void; `crate::char_select` says why.
+/// `SMSG_CHARACTER_LOGIN_FAILED`: the announced entry is void; the glue manager says why.
 fn character_login_failed(result: u8, out: &mut MessageWriter<CharacterLoginFailedMessage>) {
     warn!("net: character login refused (result {result:#04x})");
     out.write(CharacterLoginFailedMessage { result });
@@ -518,7 +544,6 @@ fn cinematic_triggered(
 fn connected(
     guid: u64,
     name: String,
-    billing_time_rested: u32,
     tutorial_flags: Option<Vec<u8>>,
     addon_info: Option<Vec<benilla_protocol::messages::AddonRecord>>,
     addon_reply: &mut crate::net::AddonInfoReply,
@@ -539,10 +564,7 @@ fn connected(
     // Set before the world-entry UI load reads it, and every login, so a silent server inherits
     // no earlier answer.
     addon_reply.0 = addon_info;
-    entered_world.write(EnteredWorldMessage {
-        billing_time_rested,
-        tutorial_flags,
-    });
+    entered_world.write(EnteredWorldMessage { tutorial_flags });
 }
 
 /// `SMSG_LOGOUT_COMPLETE`: back to character select.
@@ -667,7 +689,8 @@ fn transfer_pending(map_id: u32, transport_entry: Option<u32>, pending: &mut Pen
     });
 }
 
-/// `SMSG_TRANSFER_ABORTED`: clears the latch.
+/// `SMSG_TRANSFER_ABORTED`: clears the latch, which ends the screen the transfer raised as
+/// `0x401a11` does (`0x407e80`); the reason's line is `ui_chat`'s.
 fn transfer_aborted(reason: u8, pending: &mut PendingTransfer) {
     warn!("net: transfer aborted (reason {reason})");
     pending.0 = None;
@@ -716,47 +739,34 @@ fn worldport(
     });
 }
 
-/// `SMSG_LOGIN_SETTIMESPEED`: the game clock that drives day/night lighting.
-fn time_speed(
-    hours: u8,
-    minutes: u8,
-    day_serial: u32,
-    timescale: f32,
-    server_time: &mut ServerTime,
-) {
-    if server_time.0.is_none() {
-        info!("net: server game-time {hours:02}:{minutes:02} (drives lighting)");
-    }
-    server_time.0 = Some(GameTime::new(hours, minutes, day_serial, timescale));
-}
-
 /// `SMSG_QUERY_TIME_RESPONSE`: the server wall clock that absolute descriptor stamps (the
 /// timed-quest timer) are dated in; its skew against ours is logged once per session.
 fn server_unix_time(unix_time: u32, clock: &mut ServerWallClock) {
+    // `time(NULL)` at the sync (`0x4deef3`), whose difference is the reference's offset.
+    let local = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     if clock.0.is_none() {
-        let local = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         info!(
             "net: server wall clock {unix_time} (local clock differs by {}s)",
             local - i64::from(unix_time)
         );
     }
-    clock.sample(unix_time);
+    clock.sample(unix_time, local);
 }
 
 /// `SMSG_INITIALIZE_FACTIONS`: the login reputation store.
 fn reputations(standings: Vec<(u8, i32)>, reputations: &mut Reputations) {
     info!("net: reputation store ({} slots)", standings.len());
-    reputations.0 = standings;
+    reputations.slots = standings;
 }
 
 /// `SMSG_SET_FORCED_REACTIONS`: the server resends the table whole on every change, so it
 /// replaces the last one.
 fn forced_reactions(reactions: Vec<(u32, u32)>, reputations: &mut Reputations) {
     info!("net: forced reactions ({} factions)", reactions.len());
-    reputations.1 = reactions;
+    reputations.set_forced(reactions);
 }
 
 /// `SMSG_SET_FACTION_STANDING`: overwrites the changed slots, growing the store with flags 0,
@@ -771,12 +781,12 @@ fn reputation_delta(
         let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_STANDING") else {
             continue;
         };
-        if reputations.0.len() <= i {
-            reputations.0.resize(i + 1, (0, 0));
+        if reputations.slots.len() <= i {
+            reputations.slots.resize(i + 1, (0, 0));
         }
-        reputations.0[i].1 = standing;
-        if reputations.0[i].0 & flag::HIDDEN == 0 {
-            reputations.0[i].0 |= flag::VISIBLE;
+        reputations.slots[i].1 = standing;
+        if reputations.slots[i].0 & flag::HIDDEN == 0 {
+            reputations.slots[i].0 |= flag::VISIBLE;
         }
     }
     // Standing feeds questgiver status (`SatisfyQuestReputation`); the reference re-asks here too.
@@ -789,10 +799,10 @@ fn reputation_visible(list_id: u32, reputations: &mut Reputations) {
     let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_VISIBLE") else {
         return;
     };
-    if reputations.0.len() <= i {
-        reputations.0.resize(i + 1, (0, 0));
+    if reputations.slots.len() <= i {
+        reputations.slots.resize(i + 1, (0, 0));
     }
-    reputations.0[i].0 |= benilla_formats::faction_flags::VISIBLE;
+    reputations.slots[i].0 |= benilla_formats::faction_flags::VISIBLE;
 }
 
 /// A wire `repListId` as a store index, or `None` (logged) past the `FACTION_LIST_LEN` array
@@ -831,6 +841,8 @@ fn packet_dropped(opcode: u16, unparseable: bool, dropped: &mut DroppedOpcodes) 
     }
 }
 
+#[cfg(test)]
+mod clock_tests;
 #[cfg(test)]
 mod reputation_tests;
 
@@ -911,5 +923,75 @@ mod teardown_tests {
         assert_eq!(guid, Some(7));
         assert!(reason.is_some());
         assert!(avatar);
+    }
+}
+
+#[cfg(test)]
+mod forced_reaction_tests {
+    use super::*;
+    use crate::net::handlers::dispatch;
+    use benilla_protocol::SessionEnd;
+
+    /// The registered session handlers over the plugin's own resources.
+    fn app() -> App {
+        let mut app = App::new();
+        app.add_plugins(crate::net::NetPlugin { connect: false })
+            .init_resource::<crate::spell::Cooldowns>()
+            .init_resource::<crate::ui_chat::ChatLog>();
+        app
+    }
+
+    fn forced(app: &App) -> Vec<(u32, u32)> {
+        app.world().resource::<Reputations>().forced.clone()
+    }
+
+    fn arrive(app: &mut App, table: &[(u32, u32)]) {
+        let ev = SessionEvent::ForcedReactions {
+            reactions: table.to_vec(),
+        };
+        dispatch(app.world_mut(), vec![ev]);
+    }
+
+    /// The server resends the table whole on every change, and an aura's removal sends it empty
+    /// (vmangos `ReputationMgr::SendForceReactions`): each arrival replaces the last, and the
+    /// standings beside it stay.
+    #[test]
+    fn each_arrival_replaces_the_table_and_an_empty_one_clears_it() {
+        let mut app = app();
+        dispatch(
+            app.world_mut(),
+            vec![SessionEvent::Reputations {
+                standings: vec![(0x20, 5)],
+            }],
+        );
+        arrive(&mut app, &[(28, 4), (72, 6)]);
+        assert_eq!(forced(&app), [(28, 4), (72, 6)]);
+        arrive(&mut app, &[(28, 2)]);
+        assert_eq!(forced(&app), [(28, 2)], "replaced, not merged");
+        arrive(&mut app, &[]);
+        assert!(forced(&app).is_empty(), "an empty table clears it");
+        assert_eq!(
+            app.world().resource::<Reputations>().slots,
+            [(0x20, 5)],
+            "the standings are not the table's"
+        );
+    }
+
+    /// The table is the character's: the session's end drops it, on a logout and on a disconnect.
+    #[test]
+    fn the_session_end_clears_the_table() {
+        for end in [
+            SessionEvent::LoggedOut,
+            SessionEvent::Disconnected {
+                reason: "gone".into(),
+                end: SessionEnd::LoggedOut,
+            },
+        ] {
+            let mut app = app();
+            arrive(&mut app, &[(28, 4)]);
+            assert_eq!(forced(&app).len(), 1);
+            dispatch(app.world_mut(), vec![end.clone()]);
+            assert!(forced(&app).is_empty(), "{end:?} left the table");
+        }
     }
 }

@@ -3,8 +3,8 @@
 //! Region's categories (`0x46e300`), the sort (`0xb41f40`) and the two selection cells
 //! (`0x837e98`, `0x837e9c`). The host's glue manager seeds the holder and runs the rebuild
 //! (`0x46e510`) where `CGlueMgr::Update` does; the verbs that only read or re-sort the list answer
-//! here, firing their events as they return, and the ones that reach the network queue a
-//! [`GlueRequest`].
+//! here, firing their events as they return, and the ones that reach the network call the glue
+//! manager in place ([`super::GlueCall`]).
 //!
 //! Every category argument that crosses the Lua boundary is a 1-based ordinal over the categories
 //! holding a realm, mapped to the stored index by `0x46edf0`, which has no sentinel: an ordinal
@@ -12,8 +12,8 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::binding_abi::{bool_or_default, flag, ftol, string_arg};
-use super::glue_core::{queue, GlueRequest};
+use super::binding_abi::{bool_or_default, flag, flag_or_default, ftol, string_arg};
+use super::glue_core::{call, GlueCall};
 use super::{Model, ScriptValue};
 
 /// One realm of the holder, a `CMD_REALM_LIST` record (`0x5b2230`, stride `0x134`) as the parser
@@ -81,7 +81,7 @@ pub struct GlueRealmCells {
     /// category id from `SetPreferredInfo` (`0x46ea52`).
     pub chosen: Option<u32>,
     /// The type `SetPreferredInfo` last asked for (`[0xb41fa8]`, `[0xb41fac]`).
-    pub preferred: (bool, bool),
+    pub preferred: (i32, i32),
 }
 
 impl Default for GlueRealmCells {
@@ -95,7 +95,7 @@ impl Default for GlueRealmCells {
             ],
             category: -1,
             chosen: None,
-            preferred: (false, false),
+            preferred: (0, 0),
         }
     }
 }
@@ -115,7 +115,7 @@ impl Category {
 }
 
 /// The list the realm verbs read.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GlueRealmList {
     holder: Vec<GlueRealm>,
     /// The Region's rows; empty until seeded.
@@ -232,11 +232,19 @@ impl GlueRealmList {
 
     /// The first `Cfg_Configs` row of a realm type, `(pvp, rp)`; `(false, false)` with none, as
     /// `GetRealmInfo` (`0x46efda`) and `realm_select` (`0x46ea98`) scan it.
-    fn type_of(&self, realm_type: u32) -> (bool, bool) {
+    pub(super) fn type_of(&self, realm_type: u32) -> (bool, bool) {
         self.types
             .iter()
             .find(|t| t.realm_type == realm_type)
             .map_or((false, false), |t| (t.pvp, t.rp))
+    }
+
+    /// [`Self::type_of`] as `realm_select` holds it: two 0-or-1 words (`setne`, `0x46eacb`,
+    /// `0x46ead7`), which it compares raw with the integers the script passed (`0x46eada`,
+    /// `0x46eadf`).
+    fn type_flags(&self, realm_type: u32) -> (i32, i32) {
+        let (pvp, rp) = self.type_of(realm_type);
+        (i32::from(pvp), i32::from(rp))
     }
 
     /// The comparator (`0x46e790`) over two holder indices: the sort records in order, the first
@@ -378,9 +386,11 @@ impl GlueRealmList {
     /// `realm_select` (`0x46ea20`), `SetPreferredInfo`'s body: the first valid realm of the asked
     /// category with the asked type, else the category's first valid realm, else the first valid
     /// realm of the type in any category; `None` when there is none. "Valid" skips flag `0x01`
-    /// only (`0x46ea7c`), so a realm that is down can be suggested. Returns the pair
-    /// `SUGGEST_REALM` carries: the stored category index plus 1, and the index plus 1.
-    fn select(&mut self, stored: usize, pvp: bool, rp: bool) -> Option<(usize, usize)> {
+    /// only (`0x46ea7c`), so a realm that is down can be suggested. `pvp` and `rp` are the
+    /// integers `0x6f1c10` returned, compared raw with the type's 0 or 1: a 2 fits no realm.
+    /// Returns the pair `SUGGEST_REALM` carries: the stored category index plus 1, and the index
+    /// plus 1.
+    fn select(&mut self, stored: usize, pvp: i32, rp: i32) -> Option<(usize, usize)> {
         let cats = self.categories();
         // `cmp edi,eax ; jbe`: an index past the count reads 0; the count itself is never reached
         // through `0x46edf0`.
@@ -391,7 +401,7 @@ impl GlueRealmList {
         let valid = |list: &Self, h: usize| list.realm(h).is_some_and(|r| r.flags & 0x01 == 0);
         let fits = |list: &Self, h: usize| {
             list.realm(h)
-                .is_some_and(|r| r.flags & 0x01 == 0 && list.type_of(r.realm_type) == (pvp, rp))
+                .is_some_and(|r| r.flags & 0x01 == 0 && list.type_flags(r.realm_type) == (pvp, rp))
         };
         let own = self.buckets.get(stored).cloned().unwrap_or_default();
         if let Some(i) = own.iter().position(|&h| fits(self, h)) {
@@ -455,7 +465,7 @@ impl super::UiScript {
 }
 
 /// The `realmName` CVar's value (`0x5ab7d0`), empty when unregistered.
-fn realm_name(model: &Model) -> String {
+pub(super) fn realm_name(model: &Model) -> String {
     model
         .cvars
         .get("realmname")
@@ -519,14 +529,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "RequestRealmList",
         lua.create_function(|lua, args: MultiValue| {
             let dialog = bool_or_default(args.front(), false);
-            queue(lua, GlueRequest::RequestRealmList { dialog });
+            call(lua, GlueCall::RequestRealmList { dialog });
             Ok(())
         })?,
     )?;
     g.set(
         "CancelRealmListQuery",
         lua.create_function(|lua, _: MultiValue| {
-            queue(lua, GlueRequest::CancelRealmListQuery);
+            call(lua, GlueCall::CancelRealmListQuery);
             Ok(())
         })?,
     )?;
@@ -538,7 +548,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, _: MultiValue| {
             let on_login = cmp_folded(&model(lua).glue.screen, "login").is_eq();
             if on_login {
-                queue(lua, GlueRequest::CancelLogon);
+                call(lua, GlueCall::CancelLogon);
             }
             Ok(())
         })?,
@@ -612,7 +622,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 name
             };
             if let Some(name) = name {
-                queue(lua, GlueRequest::ChangeRealm(name));
+                call(lua, GlueCall::ChangeRealm(name));
             }
             Ok(())
         })?,
@@ -645,7 +655,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // `0x46f2c0`: the category through `0x46edf0`, the two flags through `0x6f1c10` with default
-    // 0, then `realm_select` (`0x46ea20`), which fires `SUGGEST_REALM` with `"%d%d"` or, with no
+    // 0, kept as the integers it returns, then `realm_select` (`0x46ea20`), which fires `SUGGEST_REALM` with `"%d%d"` or, with no
     // realm to suggest, `OPEN_REALM_LIST` (`0x46ec21`).
     g.set(
         "SetPreferredInfo",
@@ -654,8 +664,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(first) = number_at(lua, &args, 0) else {
                 return Err(mlua::Error::RuntimeError(USAGE.into()));
             };
-            let pvp = bool_or_default(args.get(1), false);
-            let rp = bool_or_default(args.get(2), false);
+            let pvp = flag_or_default(args.get(1), 0);
+            let rp = flag_or_default(args.get(2), 0);
             let suggested = {
                 let mut m = model(lua);
                 let list = &mut m.glue.realms;
@@ -837,7 +847,7 @@ mod tests {
         assert_eq!(fired(&s), ["OPEN_REALM_LIST nil nil"]);
         s.set_glue_realm_characters(0);
         s.run("ChangeRealm(1, 1)").unwrap();
-        let _ = s.take_glue_requests();
+        let _ = s.take_glue_calls();
         s.rebuild_glue_realms();
         assert_eq!(fired(&s), ["OPEN_REALM_LIST nil nil"], "a choice was made");
     }
@@ -1026,7 +1036,7 @@ mod tests {
         let cells = s.glue_realm_cells();
         assert_eq!(
             (cells.category, cells.chosen, cells.preferred),
-            (1, Some(5), (false, true))
+            (1, Some(5), (0, 1))
         );
         s.set_glue_realms(vec![realm("Invalid", 1, 1, 0x01, 0, 1.0)]);
         s.rebuild_glue_realms();
@@ -1044,6 +1054,46 @@ mod tests {
         );
     }
 
+    /// `SetPreferredInfo` keeps the integers `0x6f1c10` returns and `0x46ea20` compares them raw
+    /// with a type's 0 or 1 (`0x46eada`, `0x46eadf`): a 2 or a -1 fits no type, so the
+    /// category's first valid realm is suggested; a float truncates, a string goes by its first
+    /// byte, and nil is 0.
+    #[test]
+    fn set_preferred_info_compares_the_integers_raw() {
+        let mut s = vm(vec![
+            realm("Normal", 1, 0, 0, 0, 1.0),
+            realm("Pvp", 1, 1, 0, 0, 1.0),
+        ]);
+        s.rebuild_glue_realms();
+        listen(&s, &["SUGGEST_REALM", "OPEN_REALM_LIST"]);
+        let suggested = |args: &str| {
+            s.run(&format!("SetPreferredInfo(1, {args})")).unwrap();
+            fired(&s)
+        };
+        for (args, want) in [
+            ("1, 0", "SUGGEST_REALM 1 2"),
+            ("true, nil", "SUGGEST_REALM 1 2"),
+            ("1.9, 0", "SUGGEST_REALM 1 2"),
+            ("'1', 0", "SUGGEST_REALM 1 2"),
+            ("4294967297, 0", "SUGGEST_REALM 1 2"),
+            ("0, 0", "SUGGEST_REALM 1 1"),
+            ("nil, nil", "SUGGEST_REALM 1 1"),
+            ("0.9, 0", "SUGGEST_REALM 1 1"),
+            ("'0', 0", "SUGGEST_REALM 1 1"),
+            // Not 0 and not 1: nothing fits, the category's first valid realm answers.
+            ("2, 0", "SUGGEST_REALM 1 1"),
+            ("-1, 0", "SUGGEST_REALM 1 1"),
+            ("0, 2", "SUGGEST_REALM 1 1"),
+            ("1, 2", "SUGGEST_REALM 1 1"),
+            // A string is 0 or 1 by its first byte, whatever number it spells.
+            ("'2', 0", "SUGGEST_REALM 1 2"),
+        ] {
+            assert_eq!(suggested(args), [want], "SetPreferredInfo(1, {args})");
+        }
+        s.run("SetPreferredInfo(1, 2, -3)").unwrap();
+        assert_eq!(s.glue_realm_cells().preferred, (2, -3));
+    }
+
     /// `ChangeRealm` stores the category before its range check, sets `realmName`, and asks the
     /// host to connect by name.
     #[test]
@@ -1054,7 +1104,7 @@ mod tests {
         ]);
         s.rebuild_glue_realms();
         s.run("ChangeRealm(2, 7)").unwrap();
-        assert!(s.take_glue_requests().is_empty(), "no realm, no connect");
+        assert!(s.take_glue_calls().is_empty(), "no realm, no connect");
         assert_eq!(
             s.glue_realm_cells().category,
             1,
@@ -1064,8 +1114,8 @@ mod tests {
         assert_eq!(s.eval::<f64>("return GetSelectedCategory()").unwrap(), 2.0);
         s.run("ChangeRealm(2, 1)").unwrap();
         assert!(matches!(
-            s.take_glue_requests().as_slice(),
-            [GlueRequest::ChangeRealm(n)] if n == "Oz"
+            s.take_glue_calls().as_slice(),
+            [GlueCall::ChangeRealm(n)] if n == "Oz"
         ));
         assert_eq!(s.cvar("realmName").as_deref(), Some("Oz"));
         assert_eq!(s.glue_realm_cells().chosen, Some(0));
@@ -1092,31 +1142,32 @@ mod tests {
         assert_eq!(s.eval::<f64>("return GetSelectedCategory()").unwrap(), 2.0);
     }
 
-    /// The network verbs queue for the host; `RealmListDialogCancelled` only on the login screen.
+    /// The network verbs call the manager (here, with none seated, they wait for one);
+    /// `RealmListDialogCancelled` only on the login screen.
     #[test]
-    fn the_request_verbs_queue_and_the_cancel_is_screen_conditional() {
+    fn the_request_verbs_call_the_manager_and_the_cancel_is_screen_conditional() {
         let mut s = vm(Vec::new());
         s.run("RequestRealmList() RequestRealmList(1) CancelRealmListQuery()")
             .unwrap();
         assert!(matches!(
-            s.take_glue_requests().as_slice(),
+            s.take_glue_calls().as_slice(),
             [
-                GlueRequest::RequestRealmList { dialog: false },
-                GlueRequest::RequestRealmList { dialog: true },
-                GlueRequest::CancelRealmListQuery
+                GlueCall::RequestRealmList { dialog: false },
+                GlueCall::RequestRealmList { dialog: true },
+                GlueCall::CancelRealmListQuery
             ]
         ));
         s.run("SetCurrentScreen('charselect') RealmListDialogCancelled()")
             .unwrap();
         assert!(
-            s.take_glue_requests().is_empty(),
+            s.take_glue_calls().is_empty(),
             "a no-op off the login screen"
         );
         s.run("SetCurrentScreen('LOGIN') RealmListDialogCancelled()")
             .unwrap();
         assert!(matches!(
-            s.take_glue_requests().as_slice(),
-            [GlueRequest::CancelLogon]
+            s.take_glue_calls().as_slice(),
+            [GlueCall::CancelLogon]
         ));
     }
 

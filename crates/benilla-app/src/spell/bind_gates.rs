@@ -98,7 +98,7 @@ mod tests {
         store: &ObjectStore,
         types: CreatureTypeSources,
     ) -> bool {
-        static EMPTY: Reputations = Reputations(Vec::new());
+        static EMPTY: Reputations = Reputations::from_slots(Vec::new());
         let rel = TargetRelations {
             target_store: Some(store),
             target_owner_store: None,
@@ -137,7 +137,7 @@ mod tests {
             target_owner_store: None,
             self_store: None,
             factions: None,
-            reputations: &Reputations(Vec::new()),
+            reputations: &Reputations::default(),
             types: CreatureTypeSources::default(),
             group: Default::default(),
         };
@@ -187,6 +187,7 @@ mod tests {
                     pet_family: 0,
                     rank: 0,
                     type_flags: 0,
+                    pet_spell_list: 0,
                     civilian: false,
                     racial_leader: false,
                     display_id: 0,
@@ -196,6 +197,7 @@ mod tests {
         let types = CreatureTypeSources {
             names: Some(&names),
             forms: None,
+            ..Default::default()
         };
         let check = |def: &SpellDisplay, store: &ObjectStore| {
             passes_with(def, WORD_UNIT, false, store, types)
@@ -318,12 +320,17 @@ mod tests {
             spell_at(0, 21)
         }
 
-        /// A player-controlled unit of faction template 1 (`0x8`), so [`fx::factions`]' Human pair
-        /// is friendly to itself and `CanAssist` passes on its player-controlled arm. `extra`
-        /// overrides a default; health is 100 unless it says otherwise.
+        /// A player-controlled player (`OBJECT_FIELD_TYPE` 0x19, flag `0x8`) of faction template 1,
+        /// so [`fx::factions`]' Human pair is friendly to itself and `CanAssist` passes on its
+        /// player-controlled arm. `extra` overrides a default; health is 100 unless it says
+        /// otherwise.
         fn player(extra: &[(u16, u32)]) -> ObjectStore {
-            let mut fields =
-                std::collections::BTreeMap::from([(TEMPLATE, 1), (FLAGS, 0x8), (HEALTH, 100)]);
+            let mut fields = std::collections::BTreeMap::from([
+                (2, 0x19),
+                (TEMPLATE, 1),
+                (FLAGS, 0x8),
+                (HEALTH, 100),
+            ]);
             fields.extend(extra.iter().copied());
             let pairs: Vec<_> = fields.into_iter().collect();
             ObjectStore(ObjectFields::from_pairs(&pairs))
@@ -337,6 +344,7 @@ mod tests {
                 pet_family: 0,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 civilian: false,
                 racial_leader: false,
                 display_id: 0,
@@ -366,17 +374,26 @@ mod tests {
                 target_owner_store: None,
                 self_store: Some(me),
                 factions: Some(&factions),
-                reputations: &Reputations(Vec::new()),
+                reputations: &Reputations::default(),
                 types: CreatureTypeSources {
                     names: Some(&names),
                     forms: None,
+                    ..Default::default()
                 },
-                group: Default::default(),
+                group: crate::spell::group_relation::GroupInputs {
+                    self_guid: Some(ME),
+                    target_guid: Some(if selection_is_self { ME } else { THEM }),
+                    ..Default::default()
+                },
             };
             let candidates = CastCandidates {
                 selection: Some(if selection_is_self { ME } else { THEM }),
+                selection_held: true,
                 caster: Some(ME),
+                auto_self: Some(ME),
+                auto_self_store: rel.self_store,
                 main_hand_item: None,
+                long_range: false,
             };
             resolve_cast_target(Some(def), &candidates, auto_self_cast, &rel)
         }
@@ -437,8 +454,8 @@ mod tests {
             );
         }
 
-        /// Hibernate at a unit of another type binds nothing, so the enemy word refuses locally
-        /// with "Invalid target"; a Beast binds.
+        /// Hibernate at a unit of another type binds nothing, so the enemy word is refused by the
+        /// attempt's tail with "Invalid target" (`0x6e507b`); a Beast binds.
         #[test]
         fn a_creature_type_mask_refuses_the_wrong_type_locally() {
             let hibernate = SpellDisplay {
@@ -459,7 +476,7 @@ mod tests {
             for entry in [HUMANOID_ENTRY, 999] {
                 assert_eq!(
                     press(&hibernate, &creature(entry), false, true),
-                    CastWireTarget::Refused(ERR_INVALID_TARGET),
+                    CastWireTarget::RefusedAtArm(ERR_INVALID_TARGET),
                     "entry {entry}: a Humanoid, and a creature with no cached template"
                 );
             }

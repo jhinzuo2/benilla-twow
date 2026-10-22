@@ -1,8 +1,9 @@
 //! The UI error line's queues and resolvers, which `super::feed_actions` drains into
-//! [`show_messages`]; cast failures resolve in [`super::cast_fail`].
+//! [`show_messages`]; cast failures ride the cast's reports ([`crate::ui_cast::CastReports`]) and
+//! resolve in [`super::cast_fail`] and [`super::cast_lines`].
 
 use benilla_ui::messages::MessageRecord;
-use benilla_ui::script::{ScriptValue, UiScript};
+use benilla_ui::script::{InputEvents, ScriptValue, UiScript};
 use bevy::prelude::*;
 
 use crate::net::ObjectStore;
@@ -10,13 +11,10 @@ use crate::sound::MessageSounds;
 use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
 use crate::ui_items::{count_of, InventoryScope};
 
-/// Cast failures for the UI error line; the spell id lets the display key on the spell's record.
-#[derive(Resource, Default)]
-pub(crate) struct CastErrors(pub Vec<CastFail>);
-
-/// One queued cast failure. `arg` fills the message's `%s` (the arm table `0x6e1d8e`); the
-/// reference raises its local refusals with none, except the crowd-control `0x8d` (`0x6094f0`),
-/// which names the blocking aura's `SpellMechanic.dbc` id.
+/// One cast failure, as `ReportCastFailure 0x6e1a00` gets it. `arg` fills the message's `%s` (the
+/// arm table `0x6e1d8e`); the reference raises its local refusals with none, except the missing
+/// totem or reagent (`0x6e4000`), which names the item's entry, and the crowd-control `0x8d`
+/// (`0x6094f0`), which names the blocking aura's `SpellMechanic.dbc` id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CastFail {
     pub spell_id: u32,
@@ -56,42 +54,38 @@ impl CastFail {
         }
     }
 
+    /// A client-local refusal with its first argument word: the failing totem or reagent entry
+    /// (`0x6e4000` → `0x6e1a00(id, reason, entry, −1, 0)`), the crowd-control `0x8d`'s mechanic.
+    pub(crate) const fn local_arg(spell_id: u32, reason: u8, arg: u32) -> Self {
+        Self {
+            arg: Some(arg),
+            ..Self::local(spell_id, reason)
+        }
+    }
+
+    /// The server's `SMSG_CAST_RESULT` refusal, with the argument word its reason carries.
+    pub(crate) const fn server(spell_id: u32, reason: u8, arg: Option<u32>) -> Self {
+        Self {
+            arg,
+            ..Self::local(spell_id, reason)
+        }
+    }
+
+    /// The pet's `SMSG_PET_CAST_FAILED` refusal, which carries no argument word
+    /// (vmangos `Packets/Pet.cpp:127-132`).
+    pub(crate) const fn pet(spell_id: u32, reason: u8) -> Self {
+        Self {
+            caster: Caster::Pet,
+            ..Self::local(spell_id, reason)
+        }
+    }
+
     /// The same entry, marked as a [`Self::redisplay`].
     pub(crate) const fn requeued(self) -> Self {
         Self {
             redisplay: true,
             ..self
         }
-    }
-}
-
-impl CastErrors {
-    /// Queue a [`CastFail::local`] refusal.
-    pub(crate) fn push_local(&mut self, spell_id: u32, reason: u8) {
-        self.0.push(CastFail::local(spell_id, reason));
-    }
-
-    /// Queue a client-local refusal with an argument word, the crowd-control `0x8d`.
-    pub(crate) fn push_local_arg(&mut self, spell_id: u32, reason: u8, arg: u32) {
-        self.0.push(CastFail {
-            spell_id,
-            reason,
-            arg: Some(arg),
-            caster: Caster::Player,
-            redisplay: false,
-        });
-    }
-
-    /// Queue the pet's `SMSG_PET_CAST_FAILED` refusal, which carries no argument word
-    /// (vmangos `Packets/Pet.cpp:127-132`).
-    pub(crate) fn push_pet(&mut self, spell_id: u32, reason: u8) {
-        self.0.push(CastFail {
-            spell_id,
-            reason,
-            arg: None,
-            caster: Caster::Pet,
-            redisplay: false,
-        });
     }
 }
 
@@ -112,17 +106,24 @@ pub(crate) use benilla_ui::messages::MsgKind;
 
 /// One argText argument; the list is ordered and mixed because a template's specifiers are:
 /// `ERR_USE_LOCKED_WITH_SPELL_KNOWN_SI` takes a string then an integer (`0x5f34a9`).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FillArg {
     S(String),
     D(i64),
+    /// The text of the VM global of this name, read when the line is shown (`0x703bf0`, the
+    /// empty string when missing): for a line queued while the VM in hand is not the loaded
+    /// interface's, which defines none of the strings the reference reads at its own display.
+    Global(String),
+    /// `GetUnitName`'s miss: the `UNKNOWNOBJECT` global (`0x60932e`, read when the line is
+    /// shown), or `Unknown Being` (`0x860fa4`) when it is missing or empty (`0x609333`-`0x60933c`).
+    UnknownObject,
 }
 
 /// One `DisplayError` (`0x496720`) message, whatever its surface: a GlobalStrings key and the
 /// argText the reference pushes after the id, at most three strings (the guild event tail
 /// `0x5e745f`). Extra arguments are ignored and a starved specifier shows verbatim, as
 /// `SStrPrintf` does, so a short list is passed short.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UiError {
     pub key: &'static str,
     pub args: Vec<FillArg>,
@@ -131,26 +132,20 @@ pub(crate) struct UiError {
 impl UiError {
     /// A message with no arguments.
     pub(crate) fn key(key: &'static str) -> Self {
-        Self {
-            key,
-            args: Vec::new(),
-        }
+        Self::args(key, Vec::new())
     }
 
     /// One string, the `_S` family.
     pub(crate) fn s(key: &'static str, s: impl Into<String>) -> Self {
-        Self {
-            key,
-            args: vec![FillArg::S(s.into())],
-        }
+        Self::args(key, vec![FillArg::S(s.into())])
     }
 
     /// Several strings in push order, the `_SS`/`_SSS` family.
     pub(crate) fn strings(key: &'static str, args: &[&str]) -> Self {
-        Self {
+        Self::args(
             key,
-            args: args.iter().map(|s| FillArg::S((*s).to_string())).collect(),
-        }
+            args.iter().map(|s| FillArg::S((*s).to_string())).collect(),
+        )
     }
 
     /// A mixed list, for a template whose specifiers are not all `%s`.
@@ -163,7 +158,7 @@ impl UiError {
     pub(crate) fn arg_s(&self) -> Option<&str> {
         self.args.iter().find_map(|a| match a {
             FillArg::S(s) => Some(s.as_str()),
-            FillArg::D(_) => None,
+            FillArg::D(_) | FillArg::Global(_) | FillArg::UnknownObject => None,
         })
     }
 
@@ -172,15 +167,67 @@ impl UiError {
     pub(crate) fn arg_d(&self) -> Option<i64> {
         self.args.iter().find_map(|a| match a {
             FillArg::D(d) => Some(*d),
-            FillArg::S(_) => None,
+            FillArg::S(_) | FillArg::Global(_) | FillArg::UnknownObject => None,
         })
     }
 }
 
 /// Client-local refusals queued by GlobalStrings key: the `DisplayError` route for errors with no
 /// wire code and no spell record.
+///
+/// An append-only sink shared through `&self`, as [`crate::ui_chat::ChatLog`] is: a call the host
+/// applies inside a system's Lua queues its refusal while that system queues its own, in one
+/// order.
 #[derive(Resource, Default)]
-pub(crate) struct UiErrorKeys(pub Vec<UiError>);
+pub(crate) struct UiErrorKeys(std::sync::Mutex<Vec<UiError>>);
+
+impl UiErrorKeys {
+    /// The queue, held for one step; a poisoned lock still holds whole items.
+    fn q(&self) -> std::sync::MutexGuard<'_, Vec<UiError>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue one refusal.
+    pub(crate) fn push(&self, error: UiError) {
+        self.q().push(error);
+    }
+
+    /// Queue refusals in order.
+    pub(crate) fn extend(&self, errors: impl IntoIterator<Item = UiError>) {
+        self.q().extend(errors);
+    }
+
+    /// Take everything queued, in order.
+    pub(crate) fn take(&self) -> Vec<UiError> {
+        std::mem::take(&mut *self.q())
+    }
+
+    /// Whether nothing is queued, for the producers' tests.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.q().is_empty()
+    }
+
+    /// How many are queued.
+    pub(crate) fn len(&self) -> usize {
+        self.q().len()
+    }
+
+    /// Take what was queued from `start` on, leaving the earlier refusals queued.
+    pub(crate) fn take_from(&self, start: usize) -> Vec<UiError> {
+        let mut q = self.q();
+        let start = start.min(q.len());
+        q.drain(start..).collect()
+    }
+
+    /// A copy of what is queued, for the producers' tests.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Vec<UiError> {
+        self.q().clone()
+    }
+}
 
 /// Lines that arrive already resolved, with no key and no catalog record: they reach the
 /// reference's sink `0x4945b0(text, flag)` without `DisplayError`, flag 1 firing
@@ -201,21 +248,36 @@ impl UiErrorTexts {
     }
 }
 
-/// Resolve a [`UiError`] to its text, the template filled in push order. Deviation: an absent or
-/// empty result shows nothing, where the reference shows an empty line (no test of the string
-/// between `0x4967d7` and `0x496842`), because a blank line is worse than none; only a chain
-/// missing a stock key reaches it.
+/// Resolve a [`UiError`] to its text, the template filled in push order: `Some` for every key, a
+/// missing one reading as `""`, as `FrameScript_GetText` (`0x703bf0`) returns it. An empty text is
+/// still a line: `DisplayError` sounds its record before it reads the text
+/// (`0x49673d`-`0x4967ab`), and [`Shown::sink`] drops only the text.
 pub(crate) fn ui_error_text(e: &UiError, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    let args: Vec<benilla_ui::strings::Arg<'_>> = e
+    let words: Vec<String> = e
         .args
         .iter()
         .map(|a| match a {
-            FillArg::S(s) => benilla_ui::strings::Arg::S(s),
-            FillArg::D(d) => benilla_ui::strings::Arg::D(*d),
+            FillArg::Global(key) => get(key).unwrap_or_default(),
+            FillArg::UnknownObject => get("UNKNOWNOBJECT")
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "Unknown Being".to_string()),
+            FillArg::S(_) | FillArg::D(_) => String::new(),
         })
         .collect();
-    let text = benilla_ui::strings::fill(&get(e.key)?, &args);
-    (!text.is_empty()).then_some(text)
+    let args: Vec<benilla_ui::strings::Arg<'_>> = e
+        .args
+        .iter()
+        .zip(&words)
+        .map(|(a, word)| match a {
+            FillArg::S(s) => benilla_ui::strings::Arg::S(s),
+            FillArg::D(d) => benilla_ui::strings::Arg::D(*d),
+            FillArg::Global(_) | FillArg::UnknownObject => benilla_ui::strings::Arg::S(word),
+        })
+        .collect();
+    Some(benilla_ui::strings::fill(
+        &get(e.key).unwrap_or_default(),
+        &args,
+    ))
 }
 
 /// One resolved line: its text, its surface, and its catalog record, whose sound fields
@@ -224,6 +286,9 @@ pub(crate) struct Shown {
     record: Option<&'static MessageRecord>,
     kind: MsgKind,
     text: String,
+    /// The input events the message's event is signalled under: those of the verb that queued an
+    /// engine-side refusal ([`UiScript::take_ui_errors_with_input`]).
+    input: InputEvents,
 }
 
 impl Shown {
@@ -245,6 +310,7 @@ impl Shown {
             record,
             kind: record.map_or(MsgKind::Error, |r| r.kind),
             text,
+            input: InputEvents::NONE,
         }
     }
 
@@ -255,27 +321,44 @@ impl Shown {
             record: None,
             kind,
             text,
+            input: InputEvents::NONE,
         }
+    }
+
+    /// The same line, its event signalled under `input`: the reference signals it inside the verb
+    /// that failed, and the app a frame later, with the verb's events raised again.
+    pub(crate) fn under(self, input: InputEvents) -> Self {
+        Self { input, ..self }
     }
 }
 
-/// Resolve a message key against the VM's `GlobalStrings.lua` into a [`Shown`]; an absent or empty
-/// string is `None`, [`ui_error_text`]'s deviation.
+/// Resolve a message key against the VM's `GlobalStrings.lua` into a [`Shown`], `Some` for every
+/// key as [`ui_error_text`] is: a missing string reads as `""` and still sounds.
 pub(crate) fn keyed_line(script: &UiScript, key: &'static str) -> Option<Shown> {
-    let text = script.lua().globals().get::<String>(key).ok()?;
-    (!text.is_empty()).then(|| Shown::keyed(key, text))
+    let text = script
+        .lua()
+        .globals()
+        .get::<String>(key)
+        .unwrap_or_default();
+    Some(Shown::keyed(key, text))
 }
 
 /// [`keyed_line`] for a `%s` template, each argument filling the next `%s`.
 pub(crate) fn keyed_line_s(script: &UiScript, key: &'static str, args: &[&str]) -> Option<Shown> {
-    let template = script.lua().globals().get::<String>(key).ok()?;
+    let template = script
+        .lua()
+        .globals()
+        .get::<String>(key)
+        .unwrap_or_default();
     let args: Vec<benilla_ui::strings::Arg<'_>> = args
         .iter()
         .copied()
         .map(benilla_ui::strings::Arg::S)
         .collect();
-    let text = benilla_ui::strings::fill(&template, &args);
-    (!text.is_empty()).then(|| Shown::keyed(key, text))
+    Some(Shown::keyed(
+        key,
+        benilla_ui::strings::fill(&template, &args),
+    ))
 }
 
 /// The one sink for a resolved line: show it on its [`MsgKind`]'s surface and queue its catalog
@@ -289,23 +372,66 @@ pub(crate) fn show_messages(
     who: &str,
     lines: impl IntoIterator<Item = Shown>,
 ) {
-    for Shown { record, kind, text } in lines {
+    for shown in lines {
+        let input = shown.input;
+        if let Some((event, args)) = shown.sink(sink, who) {
+            script.with_input_events(input, |script| script.fire_event(event, args));
+        }
+    }
+}
+
+/// [`show_messages`] for one line shown inside the handler that adds it, as `DisplayError`
+/// (`0x496720`) shows it: a chat line's `CHAT_MSG_SYSTEM` fires now ([`ChatLog::show_now`],
+/// `0x49a870`), where [`show_messages`] queues it for the chat drain.
+pub(crate) fn show_now(script: &mut UiScript, sink: &mut MessageSink, who: &str, shown: Shown) {
+    if !matches!(shown.kind, MsgKind::Chat) || shown.text.is_empty() {
+        return show_messages(script, sink, who, [shown]);
+    }
+    let Shown {
+        record,
+        text,
+        input,
+        ..
+    } = shown;
+    debug!("{who}: message (Chat) {text:?}");
+    if let Some(record) = record {
+        sink.sounds.push(record);
+    }
+    let event = ChatEvent::text_only(ChatEventKind::System, text);
+    script.with_input_events(input, |script| sink.chat.show_now(script, &event));
+}
+
+impl Shown {
+    /// The line's world half, its sound and a chat surface's line, done now; what is left is the
+    /// VM's event, `UI_INFO_MESSAGE` or `UI_ERROR_MESSAGE` with the text.
+    pub(crate) fn sink(
+        self,
+        sink: &mut MessageSink,
+        who: &str,
+    ) -> Option<(&'static str, Vec<ScriptValue>)> {
+        let Shown {
+            record, kind, text, ..
+        } = self;
         debug!("{who}: message ({kind:?}) {text:?}");
         // The reference sounds a message beside its text, so the sound shares the display's guards.
         if let Some(record) = record {
             sink.sounds.push(record);
         }
         match kind {
+            // Deviation: an empty chat line is dropped, where the reference adds a blank one
+            // (`0x49a870` refuses only a null text, `0x49a881`), because a blank line is worse
+            // than none; only a string an addon emptied, or a chain missing a stock key, reaches
+            // it. Its sound has played.
+            MsgKind::Chat if text.is_empty() => None,
             MsgKind::Chat => {
                 sink.chat
                     .push_event(ChatEvent::text_only(ChatEventKind::System, text));
+                None
             }
-            MsgKind::Info => {
-                script.fire_event("UI_INFO_MESSAGE", vec![ScriptValue::Str(text)]);
-            }
-            MsgKind::Error => {
-                script.fire_event("UI_ERROR_MESSAGE", vec![ScriptValue::Str(text)]);
-            }
+            // `0x4945b0` drops an empty text (`0x4945b4`): no event.
+            MsgKind::Info | MsgKind::Error if text.is_empty() => None,
+            MsgKind::Info => Some(("UI_INFO_MESSAGE", vec![ScriptValue::Str(text)])),
+            MsgKind::Error => Some(("UI_ERROR_MESSAGE", vec![ScriptValue::Str(text)])),
         }
     }
 }
@@ -314,8 +440,8 @@ pub(crate) fn show_messages(
 /// because the feeds that raise messages are at Bevy's parameter limit.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct MessageSink<'w> {
-    pub(crate) chat: ResMut<'w, ChatLog>,
-    pub(crate) sounds: ResMut<'w, MessageSounds>,
+    pub(crate) chat: Res<'w, ChatLog>,
+    pub(crate) sounds: Res<'w, MessageSounds>,
 }
 
 /// The `UNIT_FIELD_FLAGS` crowd-control bits the attack-start validator refuses on, in its test
@@ -334,21 +460,20 @@ const ATTACK_FLAG_REFUSALS: [(u32, &str); 4] = [
 pub(crate) fn attack_actor_refusal(
     actor: Option<&ObjectStore>,
     self_guid: Option<u64>,
-    errors: &mut UiErrorKeys,
+    errors: &UiErrorKeys,
 ) -> bool {
     let Some(key) = attack_actor_blocked(actor, self_guid) else {
         return false;
     };
     debug!("attack refused locally by the actor's own state — {key}");
-    errors.0.push(UiError::key(key));
+    errors.push(UiError::key(key));
     true
 }
 
-/// The same ladder without the message, in the reference's gate order. The world right-click
-/// asks this: its path (`0x60bea0` to `0x5ecb70`) shows no error text and never reaches
-/// `0x612df0`, whose callers are the pet bar, Attack and TryCast (`0x6e4efb`). That path's own
-/// gate set overlaps this one but is not transcribed.
-pub(crate) fn attack_actor_blocked(
+/// The same ladder without the message, in the reference's gate order. Its callers are the Attack
+/// action, the pet bar and TryCast (`0x6e4efb`); the world right-click's path (`0x60bea0` to
+/// `0x5ecb70`) never reaches `0x612df0` and has its own gates (`creature_anim::StartGate`).
+fn attack_actor_blocked(
     actor: Option<&ObjectStore>,
     self_guid: Option<u64>,
 ) -> Option<&'static str> {
@@ -378,31 +503,25 @@ pub(crate) fn attack_actor_blocked(
 }
 
 /// The reference's pre-send check `0x6e4000`, run on every cast path before any packet: the first
-/// missing totem (a presence test), then the first short reagent (a count), refuses locally as
-/// `0x78` or `0x5c` and returns `true`. It is the only source of "Requires Mining Pick": vmangos
-/// answers a pickless cast with `ITEM_GONE` (`Spell.cpp:7301`). A missing self store skips the
-/// check, as the reference's active-player gate does.
+/// missing totem (a presence test), then the first short reagent (a count), is the refusal `0x78`
+/// or `0x5c` with that item's entry as its word (`0x6e1a00(id, reason, entry, −1, 0)`). It is the
+/// only source of "Requires Mining Pick": vmangos answers a pickless cast with `ITEM_GONE`
+/// (`Spell.cpp:7301`). A missing self store skips the check, as the reference's active-player gate
+/// does.
 pub(crate) fn reagent_totem_refusal(
     spell_id: u32,
     def: Option<&benilla_formats::SpellDisplay>,
     self_store: Option<&ObjectStore>,
     objects: &crate::net::Objects,
-    errors: &mut CastErrors,
-) -> bool {
-    let (Some(d), Some(store)) = (def, self_store) else {
-        return false;
-    };
+) -> Option<CastFail> {
+    let (d, store) = def.zip(self_store)?;
     // Totems before reagents, the reference's order.
-    let reason = if first_missing_totem(d, store, objects).is_some() {
-        0x78
-    } else if first_short_reagent(d, store, objects).is_some() {
-        0x5c
-    } else {
-        return false;
+    let (reason, entry) = match first_missing_totem(d, store, objects) {
+        Some(totem) => (0x78, totem),
+        None => (0x5c, first_short_reagent(d, store, objects)?),
     };
     debug!("cast {spell_id} refused locally — missing totem/reagent ({reason:#04x})");
-    errors.push_local(spell_id, reason);
-    true
+    Some(CastFail::local_arg(spell_id, reason, entry))
 }
 
 /// The first totem item absent from our bags: `0x6e4000`'s failing slot.
@@ -415,7 +534,7 @@ pub(super) fn first_missing_totem(
         .iter()
         .copied()
         .filter(|&t| t != 0)
-        .find(|&t| count_of(&store.0, objects, t, InventoryScope::CARRIED) == 0)
+        .find(|&t| count_of(&store.0, objects, t, InventoryScope::DEFAULT) == 0)
 }
 
 /// The first reagent we hold too few of: `0x6e4000`'s failing slot.
@@ -428,7 +547,7 @@ pub(super) fn first_short_reagent(
         .iter()
         .copied()
         .filter(|&(id, _)| id != 0)
-        .find(|&(id, n)| count_of(&store.0, objects, id, InventoryScope::CARRIED) < n)
+        .find(|&(id, n)| count_of(&store.0, objects, id, InventoryScope::DEFAULT) < n)
         .map(|(id, _)| id)
 }
 
@@ -572,9 +691,10 @@ mod ui_error_tests {
         UiError::args(key, args)
     }
 
-    /// `%s` then `%d`; an absent or empty key shows nothing.
+    /// `%s` then `%d`; a missing key reads as `""`, as `FrameScript_GetText` (`0x703bf0`) returns
+    /// it, and an empty text is still a line, whose sound plays.
     #[test]
-    fn fills_substitute_and_absent_keys_are_silent() {
+    fn fills_substitute_and_a_missing_key_reads_empty() {
         let get = |key: &str| match key {
             "REQ_S" => Some("Requires %s".to_string()),
             "REQ_SI" => Some("Requires %s %d".to_string()),
@@ -595,8 +715,26 @@ mod ui_error_tests {
             t(&UiError::key("PLAIN")).as_deref(),
             Some("Can't attack while mounted.")
         );
-        assert_eq!(t(&UiError::key("EMPTY")), None);
-        assert_eq!(t(&UiError::key("ABSENT")), None);
+        assert_eq!(t(&UiError::key("EMPTY")).as_deref(), Some(""));
+        assert_eq!(t(&UiError::key("ABSENT")).as_deref(), Some(""));
+    }
+
+    /// `GetUnitName`'s miss reads the `UNKNOWNOBJECT` global (`0x60932e`) and falls back to
+    /// `Unknown Being` (`0x860fa4`) when it is missing or empty (`0x609333`-`0x60933c`).
+    #[test]
+    fn an_unknown_object_reads_its_global_or_unknown_being() {
+        let died = UiError::args("ERR_PLAYER_DIED_S", vec![FillArg::UnknownObject]);
+        let with = |unknown: Option<&str>| {
+            let get = |key: &str| match key {
+                "ERR_PLAYER_DIED_S" => Some("%s has died.".to_string()),
+                "UNKNOWNOBJECT" => unknown.map(str::to_string),
+                _ => None,
+            };
+            ui_error_text(&died, &get)
+        };
+        assert_eq!(with(Some("Unknown")).as_deref(), Some("Unknown has died."));
+        assert_eq!(with(Some("")).as_deref(), Some("Unknown Being has died."));
+        assert_eq!(with(None).as_deref(), Some("Unknown Being has died."));
     }
 
     /// The lock-refusal keys (the use sender `0x5f33e0`) against the shipped file.
@@ -670,14 +808,14 @@ mod attack_actor_tests {
     }
 
     fn refusal(store: Option<&ObjectStore>, self_guid: Option<u64>) -> Option<&'static str> {
-        let mut errors = UiErrorKeys::default();
-        let refused = attack_actor_refusal(store, self_guid, &mut errors);
+        let errors = UiErrorKeys::default();
+        let refused = attack_actor_refusal(store, self_guid, &errors);
         assert_eq!(
             refused,
-            !errors.0.is_empty(),
+            !errors.is_empty(),
             "a refusal and a message are the same event — the ref raises one per veto"
         );
-        errors.0.first().map(|e| e.key)
+        errors.snapshot().first().map(|e| e.key)
     }
 
     /// Every gate of `0x612df0`'s Phase A, each on its own, against an otherwise-healthy actor.
@@ -796,71 +934,81 @@ mod totem_reagent_tests {
         }
     }
 
-    /// Against empty bags: a totem spell refuses `0x78`, a reagent spell `0x5c`, totems first; a
-    /// spell with neither passes, and no spell or no store skips the check.
+    /// Against empty bags: a totem spell refuses `0x78`, a reagent spell `0x5c`, totems first, each
+    /// naming the failing entry as the report's first argument (`0x6e4000`); a spell with neither
+    /// passes, and no spell or no store skips the check.
     #[test]
     fn missing_materials_refuse_with_the_refs_reasons() {
         let mut objs = objects();
         let st = store();
         let mining = spell([2901, 0], [(0, 0); 8]);
-        let mut errors = CastErrors::default();
-        assert!(reagent_totem_refusal(
-            2575,
-            Some(&mining),
-            Some(&st),
-            &objs.get(),
-            &mut errors
-        ));
-        assert_eq!(errors.0.as_slice(), &[CastFail::local(2575, 0x78)]);
+        assert_eq!(
+            reagent_totem_refusal(2575, Some(&mining), Some(&st), &objs.get()),
+            Some(CastFail::local_arg(2575, 0x78, 2901))
+        );
 
         let mut reagents = [(0, 0); 8];
         reagents[0] = (17056, 1); // Slow Fall's Light Feather
         let slow_fall = spell([0, 0], reagents);
-        let mut errors = CastErrors::default();
-        assert!(reagent_totem_refusal(
-            130,
-            Some(&slow_fall),
-            Some(&st),
-            &objs.get(),
-            &mut errors
-        ));
-        assert_eq!(errors.0.as_slice(), &[CastFail::local(130, 0x5c)]);
+        assert_eq!(
+            reagent_totem_refusal(130, Some(&slow_fall), Some(&st), &objs.get()),
+            Some(CastFail::local_arg(130, 0x5c, 17056))
+        );
 
         let both = spell([2901, 0], reagents);
-        let mut errors = CastErrors::default();
-        assert!(reagent_totem_refusal(
-            1,
-            Some(&both),
-            Some(&st),
-            &objs.get(),
-            &mut errors
-        ));
-        assert_eq!(errors.0.as_slice(), &[CastFail::local(1, 0x78)]);
+        assert_eq!(
+            reagent_totem_refusal(1, Some(&both), Some(&st), &objs.get()),
+            Some(CastFail::local_arg(1, 0x78, 2901))
+        );
 
         let plain = spell([0, 0], [(0, 0); 8]);
-        let mut errors = CastErrors::default();
-        assert!(!reagent_totem_refusal(
-            133,
-            Some(&plain),
-            Some(&st),
-            &objs.get(),
-            &mut errors
+        assert_eq!(
+            reagent_totem_refusal(133, Some(&plain), Some(&st), &objs.get()),
+            None
+        );
+        assert_eq!(
+            reagent_totem_refusal(2575, None, Some(&st), &objs.get()),
+            None
+        );
+        assert_eq!(
+            reagent_totem_refusal(2575, Some(&mining), None, &objs.get()),
+            None
+        );
+    }
+
+    /// `0x6e4000` counts the reagent with `0x622130` and finds the totem with `0x622270`, both at
+    /// mask 0: a reagent in the keyring and a totem worn in a slot are held.
+    #[test]
+    fn a_reagent_in_the_keyring_and_a_worn_totem_are_held() {
+        use benilla_protocol::field::{
+            FIELD_ITEM_STACK_COUNT, FIELD_OBJECT_ENTRY, FIELD_PLAYER_INV_SLOT_HEAD,
+        };
+        let mut objs = objects();
+        for (guid, entry, n) in [(0xA1u64, 17056u32, 3u32), (0xA2, 7005, 1)] {
+            objs.spawn(
+                guid,
+                ObjectFields::from_pairs(&[
+                    (FIELD_OBJECT_ENTRY, entry),
+                    (FIELD_ITEM_STACK_COUNT, n),
+                ]),
+            );
+        }
+        // Player slot 81 (the keyring) and slot 17 (worn).
+        let seat = |slot: u16, guid: u64| {
+            let lo = FIELD_PLAYER_INV_SLOT_HEAD + 2 * slot;
+            [(lo, guid as u32), (lo + 1, (guid >> 32) as u32)]
+        };
+        let st = ObjectStore(ObjectFields::from_pairs(
+            &[seat(81, 0xA1), seat(17, 0xA2)].concat(),
         ));
-        assert!(!reagent_totem_refusal(
-            2575,
-            None,
-            Some(&st),
-            &objs.get(),
-            &mut errors
-        ));
-        assert!(!reagent_totem_refusal(
-            2575,
-            Some(&mining),
-            None,
-            &objs.get(),
-            &mut errors
-        ));
-        assert!(errors.0.is_empty());
+        let mut reagents = [(0, 0); 8];
+        reagents[0] = (17056, 3);
+        let d = spell([0, 7005], reagents);
+        assert_eq!(first_missing_totem(&d, &st, &objs.get()), None);
+        assert_eq!(first_short_reagent(&d, &st, &objs.get()), None);
+        reagents[0] = (17056, 4);
+        let d = spell([0, 0], reagents);
+        assert_eq!(first_short_reagent(&d, &st, &objs.get()), Some(17056));
     }
 
     /// Against empty bags, the first nonzero totem and reagent.
@@ -876,5 +1024,124 @@ mod totem_reagent_tests {
         let none = spell([0, 0], [(0, 0); 8]);
         assert_eq!(first_missing_totem(&none, &st, &objs.get()), None);
         assert_eq!(first_short_reagent(&none, &st, &objs.get()), None);
+    }
+}
+
+#[cfg(test)]
+mod message_input_tests {
+    use super::*;
+
+    /// A message's event is signalled under the input events its [`Shown`] carries: a handler whose
+    /// cast is a macro's passes the gate only inside one, as in the reference where the failed
+    /// press is the key or click that is still running.
+    #[test]
+    fn a_shown_line_signals_its_event_under_the_events_it_carries() {
+        let mut script = UiScript::new().unwrap();
+        script.keep_calls();
+        script.set_spellbook(benilla_ui::script::SpellBookState {
+            tabs: vec![benilla_ui::script::SpellTabView {
+                name: "Fire".into(),
+                texture: None,
+                offset: 0,
+                num_spells: 1,
+            }],
+            slots: vec![benilla_ui::script::SpellSlotView {
+                spell_id: 133,
+                name: "Fireball".into(),
+                ..Default::default()
+            }],
+        });
+        script
+            .run(
+                r#"local f = CreateFrame("Frame")
+                   f:RegisterEvent("UI_ERROR_MESSAGE")
+                   f:SetScript("OnEvent", function() RunScript('CastSpell(1, BOOKTYPE_SPELL)') end)"#,
+            )
+            .unwrap();
+        let mut world = World::new();
+        world.init_resource::<ChatLog>();
+        world.init_resource::<MessageSounds>();
+        for (events, want) in [
+            (
+                InputEvents {
+                    binding: true,
+                    ..InputEvents::NONE
+                },
+                true,
+            ),
+            (InputEvents::NONE, false),
+        ] {
+            let mut state = bevy::ecs::system::SystemState::<MessageSink>::new(&mut world);
+            let mut sink = state.get_mut(&mut world);
+            show_messages(
+                &mut script,
+                &mut sink,
+                "test",
+                [Shown::unkeyed(MsgKind::Error, "Out of range.".into()).under(events)],
+            );
+            let casts: Vec<bool> = script
+                .take_script_calls()
+                .iter()
+                .map(|c| c.may_cast())
+                .collect();
+            assert_eq!(casts, vec![want], "events: {events:?}");
+        }
+    }
+
+    /// `DisplayError` sounds a message before it reads the key or the text (`0x49673d`-`0x4967ab`),
+    /// and `FrameScript_GetText` reads a missing global as `""` (`0x703bf0`), so an emptied or
+    /// removed string still sounds. Only the text goes: `AddErrorMessage` drops an empty one
+    /// (`0x4945b4`), and an empty chat line is the module's deviation.
+    #[test]
+    fn an_empty_or_missing_string_still_sounds_its_record() {
+        let mut script = UiScript::new().unwrap();
+        script
+            .run(
+                r#"ERR_OUT_OF_RANGE = ""
+                   ERR_NEWTAXIPATH = ""
+                   ERR_RECEIVE_ITEM_S = ""
+                   ERR_LOOT_LOCKED = nil
+                   SEEN = 0
+                   local f = CreateFrame("Frame")
+                   f:RegisterEvent("UI_ERROR_MESSAGE")
+                   f:RegisterEvent("UI_INFO_MESSAGE")
+                   f:SetScript("OnEvent", function() SEEN = SEEN + 1 end)"#,
+            )
+            .unwrap();
+        let get = |k: &str| script.lua().globals().get::<String>(k).ok();
+        let missing = UiError::key("ERR_LOOT_LOCKED");
+        let lines: Vec<Shown> = ["ERR_OUT_OF_RANGE", "ERR_NEWTAXIPATH", "ERR_RECEIVE_ITEM_S"]
+            .into_iter()
+            .filter_map(|key| keyed_line(&script, key))
+            .chain(ui_error_text(&missing, &get).map(|t| Shown::keyed(missing.key, t)))
+            .collect();
+        let mut world = World::new();
+        world.init_resource::<ChatLog>();
+        world.init_resource::<MessageSounds>();
+        let mut state = bevy::ecs::system::SystemState::<MessageSink>::new(&mut world);
+        show_messages(&mut script, &mut state.get_mut(&mut world), "test", lines);
+
+        let sounded: Vec<&str> = world
+            .resource::<MessageSounds>()
+            .queued()
+            .iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(
+            sounded,
+            [
+                "ERR_OUT_OF_RANGE",
+                "ERR_NEWTAXIPATH",
+                "ERR_RECEIVE_ITEM_S",
+                "ERR_LOOT_LOCKED"
+            ],
+            "an error, an info, a chat row and a missing string, each sounded"
+        );
+        assert_eq!(script.eval::<i64>("return SEEN").unwrap(), 0, "no event");
+        assert_eq!(
+            world.resource::<ChatLog>().pending_len(),
+            0,
+            "no blank chat line"
+        );
     }
 }

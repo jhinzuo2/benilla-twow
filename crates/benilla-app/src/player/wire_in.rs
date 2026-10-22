@@ -19,11 +19,11 @@ use crate::transport::Transport;
 use benilla_world::world_map::CurrentMap;
 
 use super::camera::FlyCam;
-use super::{movement_net, Player, SETTLE_TIMEOUT};
+use super::{movement_net, OwnControlLost, Player, SETTLE_TIMEOUT};
 
 /// What one `SMSG_CLIENT_CONTROL_UPDATE` means for us. It says whether a unit may move, not who the
 /// mover is: the server revokes a mind-controlled victim's control by naming the victim.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlVerdict {
     /// Somebody else drives our body; we stop moving it.
     Revoked,
@@ -64,6 +64,29 @@ fn yield_own_body(net_cmds: &NetCommands, player: &mut Player, self_guid: Option
     });
 }
 
+/// The control flags a verdict sets. `control_lost` is the mover we drive being unable to move:
+/// our body revoked, or our possessed creature released while feared or confused (the possession
+/// standing). `own` is only `[0xb4b3e4]` (`0x4958e0`), which `0x5fa600` writes for our own
+/// character alone (`0x5fa6d0`): a grant or a release naming another unit never touches it.
+fn track_control(player: &mut Player, own: &mut OwnControlLost, verdict: ControlVerdict) {
+    match verdict {
+        ControlVerdict::Revoked => {
+            player.control_lost = true;
+            own.0 = true;
+        }
+        ControlVerdict::Restored => {
+            player.control_lost = false;
+            own.0 = false;
+        }
+        ControlVerdict::Granted(_) => player.control_lost = false,
+        ControlVerdict::Released(guid) => {
+            if player.foreign_mover == Some(guid) {
+                player.control_lost = true;
+            }
+        }
+    }
+}
+
 /// `self_guid` is `None` before login names us, when no update can be about our body.
 fn control_verdict(mover: u64, allow_move: bool, self_guid: Option<u64>) -> ControlVerdict {
     match (self_guid == Some(mover), allow_move) {
@@ -74,8 +97,24 @@ fn control_verdict(mover: u64, allow_move: bool, self_guid: Option<u64>) -> Cont
     }
 }
 
-/// Apply this frame's server-authored movement and send each ack. Returns the forced-speed changes
-/// for the movement stream to ack, except pre-control or detached, where they are acked here.
+/// What [`apply_server_moves`] leaves the controller.
+pub(super) struct ServerMoves {
+    /// The forced-speed changes for the movement stream to ack, except pre-control or detached,
+    /// where they are acked here.
+    pub(super) speed_acks: Vec<SpeedChangeMessage>,
+    /// An ack went out that ends the mover's precast ([`ack_ends_precast`]).
+    pub(super) precast_ended: bool,
+}
+
+/// Whether a mode's ack ends the mover's precast: the water-walk and hover acks go out through
+/// `0x60e0a0` (`0x6163c0` push 0x2d0, `0x616316` and `0x616364` push 0xf6, into `0x6163cf`),
+/// which ends it ahead of each opcode it does not send at once (`0x60e15d`); the root, unroot and
+/// feather-fall acks (0xe9, 0xeb, 0x2cf) are among those (`0x60e0f1`-`0x60e137`).
+fn ack_ends_precast(mode: MoveMode) -> bool {
+    matches!(mode, MoveMode::WaterWalk | MoveMode::Hover)
+}
+
+/// Apply this frame's server-authored movement and send each ack ([`ServerMoves`]).
 /// `self_pose` is the streamed self entity's translation and yaw, the take-control target.
 // `control`'s own transports query, passed through.
 #[allow(clippy::type_complexity)]
@@ -83,6 +122,7 @@ pub(super) fn apply_server_moves(
     time: &Time,
     commands: &mut Commands,
     player: &mut Player,
+    own_control: &mut OwnControlLost,
     cam: &mut FlyCam,
     net_cmds: &NetCommands,
     teleports: &mut MessageReader<TeleportMessage>,
@@ -98,19 +138,19 @@ pub(super) fn apply_server_moves(
         (With<Transport>, Without<Embodied>, Without<FlyCam>),
     >,
     self_pose: Option<(Vec3, f32)>,
-) -> Vec<SpeedChangeMessage> {
+) -> ServerMoves {
     // A grant must be claimed: vmangos drops every `MSG_MOVE_*` for an unconfirmed mover
     // (`MovementHandler.cpp:291-293`, `Player.cpp:20257-20272`).
     for c in control_msgs.read() {
-        match control_verdict(c.mover, c.allow_move, self_guid) {
+        let verdict = control_verdict(c.mover, c.allow_move, self_guid);
+        track_control(player, own_control, verdict);
+        match verdict {
             // Park, which stops the server extrapolating a run, and say nothing else: the mover has
             // not changed hands, and `CMSG_MOVE_NOT_ACTIVE_MOVER` would strand us.
             ControlVerdict::Revoked => {
-                player.control_lost = true;
                 movement_net::park_mover(&net_cmds.0, player);
             }
             ControlVerdict::Restored => {
-                player.control_lost = false;
                 player.foreign_mover = None;
                 player.reseat = true;
                 // Re-claim ourselves, as login does (after a possession `m_clientMoverGuid` still
@@ -131,7 +171,6 @@ pub(super) fn apply_server_moves(
                 if player.foreign_mover.is_none() {
                     yield_own_body(net_cmds, player, self_guid);
                 }
-                player.control_lost = false;
                 player.foreign_mover = Some(guid);
                 player.reseat = true;
                 super::move_trace::mover_claim("SET_ACTIVE_MOVER", guid);
@@ -141,11 +180,7 @@ pub(super) fn apply_server_moves(
             // feared or confused (`Unit.cpp:11157`). As in the reference (`0x5fa600`), only the
             // unit we drive matters: we keep it but may not move it. Clearing `foreign_mover`
             // would walk our own body while the server applies our steps to the creature.
-            ControlVerdict::Released(guid) => {
-                if player.foreign_mover == Some(guid) {
-                    player.control_lost = true;
-                }
-            }
+            ControlVerdict::Released(_) => {}
         }
     }
     // Cross-map worldport: snap, bump `CurrentMap` for the terrain streamer, ack if required.
@@ -236,6 +271,7 @@ pub(super) fn apply_server_moves(
     // Root also parks the walk stream and ends the arc, as the reference's `SetRoot` (`0x7c7340`)
     // clears the direction bits and stops the fall (`0x7c6290`); moving bits beside ROOT freeze
     // the reference and raise vmangos's `CHEAT_TYPE_ROOT_MOVE`. Turn bits are not moving bits.
+    let mut precast_ended = false;
     for m in mode_msgs.read() {
         player.modes.set(m.mode, m.apply);
         if m.mode == MoveMode::Root && m.apply {
@@ -261,6 +297,7 @@ pub(super) fn apply_server_moves(
             pos: bevy_to_wow(player.pos),
             orientation: facing,
         });
+        precast_ended |= ack_ends_precast(m.mode);
         info!(
             "mover mode {:?} {} (acked)",
             m.mode,
@@ -357,7 +394,10 @@ pub(super) fn apply_server_moves(
             });
         }
     }
-    speed_acks
+    ServerMoves {
+        speed_acks,
+        precast_ended,
+    }
 }
 
 /// Apply one same-map teleport's snap (`MSG_MOVE_TELEPORT_ACK` inbound); the caller echoes it.
@@ -480,6 +520,29 @@ fn apply_self_move(
     player.wedge_still = 0;
 }
 
+/// Our own player's create gives control back (`OnActiveArrival 0x5dea50`): with the manager's
+/// `+0xc8` clear (`0x5deb49`; its constructor `0x4650e7` is the only store, so every create),
+/// `0x5fa600(1)` (`0x5deb56`) raises `[0xb4b3e4]` through `0x4958e0` (`PLAYER_CONTROL_GAINED` if it
+/// was down) and `0x4958a0` (`0x5deb5b`) stores 1 and re-claims our own mover (the claim is sent
+/// by `enter_world_on_self_create`). vmangos sends a battleground's closing `control 0` and no
+/// restore (`BattleGround.cpp:905-908`). The event is the `ui_unit::feed_player_control` edge.
+pub(crate) fn regain_control_on_arrival(
+    mut arrivals: MessageReader<crate::net::WorldEnterCascadeMessage>,
+    mut player: ResMut<Player>,
+    mut own_control: ResMut<OwnControlLost>,
+) {
+    if arrivals.read().next().is_none() {
+        return;
+    }
+    if own_control.0 || player.control_lost || player.foreign_mover.is_some() {
+        own_control.0 = false;
+        player.control_lost = false;
+        // The mover is ours again, as `ControlVerdict::Restored` seats it.
+        player.foreign_mover = None;
+        player.reseat = true;
+    }
+}
+
 /// On a `/logout` or a lost session, reset the whole resource to its boot state, so the next login
 /// owes nothing to the ended one. Whole, not by field: `/logout` roots us for the countdown
 /// (`MiscHandler.cpp:329`) and the next session never unroots, so any kept mover state persists.
@@ -488,11 +551,13 @@ pub(super) fn release_on_session_end(
     mut logouts: MessageReader<crate::net::LoggedOutMessage>,
     mut lost: MessageReader<crate::net::DisconnectedMessage>,
     mut player: ResMut<Player>,
+    mut own_control: ResMut<OwnControlLost>,
 ) {
     // `|`, not `||`: both readers must drain, or the unread one carries into the next frame.
     if logouts.read().next().is_some() | lost.read().any(|m| m.session_over) {
         // vmangos re-sends the modes the new session holds (`Player.cpp:19297-19311`).
         *player = Player::default();
+        *own_control = OwnControlLost::default();
     }
 }
 
@@ -506,6 +571,7 @@ mod session_end_tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<Player>()
+            .init_resource::<OwnControlLost>()
             .add_message::<LoggedOutMessage>()
             .add_message::<DisconnectedMessage>()
             .add_systems(Update, release_on_session_end);
@@ -514,6 +580,7 @@ mod session_end_tests {
 
     /// A session that ran: in world, moving, every mode granted, the reins in other hands.
     fn a_session_that_ran(app: &mut App) {
+        app.world_mut().resource_mut::<OwnControlLost>().0 = true;
         let mut p = app.world_mut().resource_mut::<Player>();
         p.active = true;
         p.modes = super::super::state::MoveModes {
@@ -556,6 +623,10 @@ mod session_end_tests {
             "and nothing else survives either: the session boundary returns the resource to the \
              state `player::setup` inserts at boot"
         );
+        assert!(
+            !app.world().resource::<OwnControlLost>().0,
+            "`[0xb4b3e4]` is back at its boot value, in control (`0x48f626`)"
+        );
     }
 
     /// A lost session is a different message on a different reader; the `|` draining both matters.
@@ -571,6 +642,7 @@ mod session_end_tests {
         app.update();
 
         assert!(*app.world().resource::<Player>() == Player::default());
+        assert!(!app.world().resource::<OwnControlLost>().0);
     }
 
     /// `session_over: false` (the logout's own teardown, a seamless reconnect) keeps the body ours.
@@ -718,6 +790,32 @@ mod control_tests {
         );
     }
 
+    /// A possessed creature feared or confused is released, so the mover we drive cannot move,
+    /// but `[0xb4b3e4]` is written for our own character alone (`0x5fa6d0`): the item and
+    /// cursor gates still see control.
+    #[test]
+    fn releasing_a_possessed_creature_leaves_our_own_control_alone() {
+        let (mut player, mut own) = (Player::default(), OwnControlLost::default());
+        track_control(
+            &mut player,
+            &mut own,
+            control_verdict(CREATURE, true, Some(ME)),
+        );
+        assert!(!player.control_lost);
+        player.foreign_mover = Some(CREATURE);
+        track_control(
+            &mut player,
+            &mut own,
+            control_verdict(CREATURE, false, Some(ME)),
+        );
+        assert!(player.control_lost, "the creature we drive is stuck");
+        assert!(!own.0, "our own control stands");
+        track_control(&mut player, &mut own, control_verdict(ME, false, Some(ME)));
+        assert!(own.0);
+        track_control(&mut player, &mut own, control_verdict(ME, true, Some(ME)));
+        assert!(!own.0 && !player.control_lost);
+    }
+
     #[test]
     fn an_unknown_self_guid_never_revokes_our_own_body() {
         assert_eq!(
@@ -758,5 +856,104 @@ mod teleport_tests {
         assert_eq!(player.pos, wow_to_bevy(t.position));
         assert_eq!((player.face_yaw, cam_yaw), (1.25, 1.25));
         assert!(player.settling && player.ride_abort && player.world_stale);
+    }
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::*;
+    use crate::net::WorldEnterCascadeMessage;
+
+    const ME: u64 = 0x45;
+
+    /// The control-0 packet naming us.
+    fn lose_control(app: &mut App) {
+        let mut own = std::mem::take(&mut *app.world_mut().resource_mut::<OwnControlLost>());
+        let mut player = app.world_mut().resource_mut::<Player>();
+        track_control(&mut player, &mut own, control_verdict(ME, false, Some(ME)));
+        *app.world_mut().resource_mut::<OwnControlLost>() = own;
+    }
+
+    fn harness() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Player>()
+            .init_resource::<OwnControlLost>()
+            .add_message::<WorldEnterCascadeMessage>()
+            .add_systems(Update, regain_control_on_arrival);
+        app
+    }
+
+    /// A battleground's end sends `control 0` for us and never the restore; the teleport out
+    /// creates us afresh and that create gives control back, the movement lock and the bar's
+    /// `[0xb4b3e4]` flag both.
+    #[test]
+    fn a_control_loss_does_not_survive_the_next_self_create() {
+        let mut app = harness();
+        lose_control(&mut app);
+        assert!(app.world().resource::<Player>().control_lost);
+        assert!(app.world().resource::<OwnControlLost>().0);
+        app.update();
+        assert!(
+            app.world().resource::<OwnControlLost>().0,
+            "nothing restores it without a create"
+        );
+
+        app.world_mut().write_message(WorldEnterCascadeMessage);
+        app.update();
+        assert!(
+            !app.world().resource::<OwnControlLost>().0,
+            "the bar's flag is back"
+        );
+        let player = app.world().resource::<Player>();
+        assert!(!player.control_lost, "and the controller's movement lock");
+        assert_eq!(player.foreign_mover, None);
+    }
+
+    /// The real create system feeds it: a control-0 packet's verdict, then our own player's
+    /// create (`enter_world_on_self_create`), and the lock and the flag are gone.
+    #[test]
+    fn our_own_create_system_gives_control_back() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut app = harness();
+        app.insert_resource(crate::net::NetCommands(tx))
+            .add_systems(
+                Update,
+                crate::net::enter_world_on_self_create.before(regain_control_on_arrival),
+            );
+        lose_control(&mut app);
+        app.update();
+        assert!(app.world().resource::<OwnControlLost>().0);
+
+        app.world_mut()
+            .spawn((crate::net::Guid(ME), crate::net::SelfPlayer));
+        app.update();
+        let player = app.world().resource::<Player>();
+        assert!(!app.world().resource::<OwnControlLost>().0 && !player.control_lost);
+    }
+
+    /// A possession does not outlive the world either: the create claims our own mover.
+    #[test]
+    fn a_create_ends_a_possession_too() {
+        let mut app = harness();
+        {
+            let mut player = app.world_mut().resource_mut::<Player>();
+            player.foreign_mover = Some(0x99);
+            player.control_lost = true;
+        }
+        app.world_mut().write_message(WorldEnterCascadeMessage);
+        app.update();
+        let player = app.world().resource::<Player>();
+        assert_eq!(player.foreign_mover, None);
+        assert!(!player.control_lost && player.reseat);
+    }
+
+    /// A login in control touches nothing.
+    #[test]
+    fn a_create_in_control_changes_nothing() {
+        let mut app = harness();
+        app.world_mut().write_message(WorldEnterCascadeMessage);
+        app.update();
+        assert!(!app.world().resource::<Player>().reseat);
     }
 }

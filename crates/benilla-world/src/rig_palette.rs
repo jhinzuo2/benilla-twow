@@ -5,7 +5,6 @@
 //! absolute f32 world coordinate, whose ~1 mm ULP at ~9.5 k yards shimmers every frame.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bevy::ecs::lifecycle::HookContext;
 use bevy::ecs::world::DeferredWorld;

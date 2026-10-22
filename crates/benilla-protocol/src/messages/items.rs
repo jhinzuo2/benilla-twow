@@ -125,6 +125,20 @@ impl ItemInfo {
         self.spell_charges_0 != 0 && self.spell_charges_0 != -1
     }
 
+    /// The reference's `template+0x11c != 0`: block 0 names a spell, of any trigger. The worn-item
+    /// cooldown getter runs no query without one (`0x4c8b47`).
+    pub fn has_spell_0(&self) -> bool {
+        self.spells.iter().any(|s| s.index == 0)
+    }
+
+    /// The depleted-charge gate: block 0 carries charges (`template+0x144 != 0`, -1 unlimited
+    /// included) and the instance's `ITEM_FIELD_SPELL_CHARGES[0]` is 0. The tooltip setters and the
+    /// cooldown getters then skip the cooldown query (`0x5347e3`, `0x53318a`, `0x4f9a48`,
+    /// `0x4c8b55`).
+    pub fn charges_depleted(&self, charges_left: i32) -> bool {
+        self.spell_charges_0 != 0 && charges_left == 0
+    }
+
     /// The first ON_USE spell's block ordinal, the third byte of `CMSG_USE_ITEM`; usually 0, but
     /// an item with an ON_EQUIP block 0 has its on-use in a later block.
     pub fn use_spell_index(&self) -> Option<u8> {
@@ -180,6 +194,9 @@ impl ItemInfo {
 
 /// Template bit: right-click opens a loot window, as on a clam or lockbox (`ItemPrototype.h:66`).
 pub const ITEM_FLAG_LOOTABLE: u32 = 0x0000_0004;
+/// Template bit `ITEM_FLAG_PLAYERCAST` (`ItemPrototype.h:70`): the bit a use of the item must carry
+/// to hold the in-flight slot (`0x6e501d`).
+pub const ITEM_FLAG_PLAYERCAST: u32 = 0x0000_0040;
 /// Template bit for gift wrapping (`ItemPrototype.h:73`).
 pub const ITEM_FLAG_WRAPPER: u32 = 0x0000_0200;
 /// Instance (`ITEM_FIELD_FLAGS`) bit a lockbox gains once picked or keyed open.
@@ -437,6 +454,7 @@ pub const SLOT_BAG_FIRST: u8 = 19;
 
 /// `SpellCastTargets` mask bits, vmangos `SpellDefines.h`.
 const TARGET_FLAG_GAMEOBJECT: u16 = 0x0800;
+const TARGET_FLAG_TRADE_ITEM: u16 = 0x1000;
 
 const TARGET_FLAG_UNIT: u16 = 0x0002;
 const TARGET_FLAG_DEST_LOCATION: u16 = 0x0040;
@@ -460,6 +478,11 @@ pub enum UseItemTarget {
     Dest([f32; 3]),
     /// `TARGET_FLAG_ITEM` and a packed guid: a poison, oil or stone applied to a clicked item.
     Item(u64),
+    /// `TARGET_FLAG_TRADE_ITEM` (`0x1000`) and a trade slot as the packed guid: the non-traded
+    /// slot of the partner's window, which the trade bind `0x6e6900` writes as guid `{6, 0}`
+    /// (`0x6e6915`-`0x6e6925`); vmangos resolves it to the item the partner has there
+    /// (`SpellCastTargetsInfo.cpp:131-135`).
+    TradeItem(u8),
     /// `TARGET_FLAG_SOURCE_LOCATION` and three `f32` coords (`BindLocation`, `0x6e60f0`); only
     /// items carrying spell 265, such as Martin Fury, use it. vmangos reads it before the dest.
     Source([f32; 3]),
@@ -475,10 +498,17 @@ pub fn use_item(bag_index: u8, slot: u8, spell_slot: u8, target: UseItemTarget) 
     body.push(bag_index);
     body.push(slot);
     body.push(spell_slot);
+    write_cast_targets(&mut body, target);
+    body
+}
+
+/// The targets block every cast request ends in (`0x7e4e10`, called from `SendCast 0x6e54f0`):
+/// the `u16` mask, then the packed guid or the three coords its bit asks for.
+pub(super) fn write_cast_targets(body: &mut Vec<u8>, target: UseItemTarget) {
     let guid = match target {
         UseItemTarget::SelfImplicit => {
             body.extend_from_slice(&0u16.to_le_bytes());
-            return body;
+            return;
         }
         UseItemTarget::Unit(guid) => {
             body.extend_from_slice(&TARGET_FLAG_UNIT.to_le_bytes());
@@ -492,6 +522,10 @@ pub fn use_item(bag_index: u8, slot: u8, spell_slot: u8, target: UseItemTarget) 
             body.extend_from_slice(&TARGET_FLAG_ITEM.to_le_bytes());
             guid
         }
+        UseItemTarget::TradeItem(slot) => {
+            body.extend_from_slice(&TARGET_FLAG_TRADE_ITEM.to_le_bytes());
+            u64::from(slot)
+        }
         UseItemTarget::Corpse(corpse, guid) => {
             body.extend_from_slice(&corpse.target_flag().to_le_bytes());
             guid
@@ -501,18 +535,17 @@ pub fn use_item(bag_index: u8, slot: u8, spell_slot: u8, target: UseItemTarget) 
             for c in dest {
                 body.extend_from_slice(&c.to_le_bytes());
             }
-            return body;
+            return;
         }
         UseItemTarget::Source(src) => {
             body.extend_from_slice(&TARGET_FLAG_SOURCE_LOCATION.to_le_bytes());
             for c in src {
                 body.extend_from_slice(&c.to_le_bytes());
             }
-            return body;
+            return;
         }
     };
-    crate::wire::write_packed_guid(guid, &mut body).expect("write to Vec cannot fail");
-    body
+    crate::wire::write_packed_guid(guid, body).expect("write to Vec cannot fail");
 }
 
 /// Body of `CMSG_OPEN_ITEM` (opcode 172, `Server/Packets/Spell.h:36-45`): bag index and slot, as

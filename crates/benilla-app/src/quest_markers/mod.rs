@@ -514,16 +514,23 @@ pub(crate) struct QuestMarkersPlugin;
 
 impl Plugin for QuestMarkersPlugin {
     fn build(&self, app: &mut App) {
+        // After the Net stage: a run between the drain's spawns and the self tag would see the
+        // creatures but no self.
         app.add_systems(
             Update,
             (
-                query_statuses,
+                // After the roster publish, whose party slots the questgivers' reactions read.
+                query_statuses.after(crate::spell::group_relation::publish_group_roster),
                 sync_markers,
                 build_markers,
                 pose_markers,
                 bake_seat_scale,
             )
-                .chain(),
+                .chain()
+                .after(benilla_world::schedule::WorldStage::Net)
+                // After the VM pass: the markers read the group roster its feeds publish, and a
+                // script call reads no marker's transform.
+                .after(crate::vm_pass::VmPass::End),
         )
         .add_systems(
             PostUpdate,

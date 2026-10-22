@@ -1,4 +1,4 @@
-//! Every unit's aura list but the player's, one per guid, and the unit-token resolver's inputs
+//! Every unit's aura list, the player's too, one per guid, and the unit-token resolver's inputs
 //! (`0x515970`, [`UnitGuids`]) that `UnitBuff 0x519500` and `UnitDebuff 0x5198f0` read them through:
 //! the guid globals, the group tables, and each held unit a `target` chain can reach. A list is the
 //! live unit's slots, gated as any unit's; a group member or pet with no live object diverts to its
@@ -9,47 +9,11 @@
 use std::collections::hash_map::{Entry, HashMap};
 
 use benilla_formats::SpellCatalog;
-use benilla_ui::script::{AuraState, UiScript, UnitGuids};
+use benilla_ui::script::{UiScript, UnitAuraList, UnitGuids};
 
-use super::{aura_list, other_unit_inputs, record_inputs, AuraInput};
+use super::{aura_list, other_unit_inputs, record_inputs, AuraInput, RaidFilter};
 use crate::net::ObjectStore;
-use crate::ui_party::{
-    raid_row_guids, GroupState, PARTY_PET_TOKENS, PARTY_TOKENS, RAID_PET_TOKENS, RAID_TOKENS,
-};
-
-/// The tokens `UNIT_AURA` fires for besides `"player"`, in firing order: [`EVENT_UNITS`], then the
-/// group's, each resolved by [`event_guid`].
-const EVENT_UNITS: [&str; 3] = ["pet", "target", "targettarget"];
-
-const EVENT_TOKEN_COUNT: usize = EVENT_UNITS.len()
-    + PARTY_TOKENS.len()
-    + PARTY_PET_TOKENS.len()
-    + RAID_TOKENS.len()
-    + RAID_PET_TOKENS.len();
-
-fn event_tokens() -> impl Iterator<Item = &'static str> {
-    EVENT_UNITS
-        .into_iter()
-        .chain(PARTY_TOKENS)
-        .chain(PARTY_PET_TOKENS)
-        .chain(RAID_TOKENS)
-        .chain(RAID_PET_TOKENS)
-}
-
-/// The guid [`event_tokens`]' `i`-th names, 0 for nobody.
-fn event_guid(g: &UnitGuids, i: usize) -> u64 {
-    let at = |t: &[u64], i: usize| t.get(i).copied().unwrap_or(0);
-    match i {
-        0 => g.pet,
-        1 => g.target,
-        // One hop, as the resolver's `target` loop makes it: off a held target only.
-        2 => g.held.get(&g.target).copied().unwrap_or(0),
-        3..=6 => g.party[i - 3],
-        7..=10 => g.party_pets[i - 7],
-        11..=50 => at(&g.raid, i - 11),
-        _ => at(&g.raid_pets, i - 51),
-    }
-}
+use crate::ui_party::{raid_row_guids, GroupState};
 
 /// The group tables of [`UnitGuids`]: `party1..4` are the own subgroup's slots and `partypetN`
 /// their pets (`0x4e81d0`); `raidN` is `GetRaidRosterInfo` row N, as every other raid-token reader
@@ -57,7 +21,6 @@ fn event_guid(g: &UnitGuids, i: usize) -> u64 {
 fn fill_group<'a>(
     g: &mut UnitGuids,
     group: Option<&GroupState>,
-    me: u64,
     held: impl Fn(u64) -> Option<&'a ObjectStore>,
 ) {
     g.party = [0; 4];
@@ -72,7 +35,7 @@ fn fill_group<'a>(
         g.party[i] = m.guid;
         g.party_pets[i] = group.party_pet_guid(m.guid, live(m.guid)).unwrap_or(0);
     }
-    g.raid = raid_row_guids(group, Some(me));
+    g.raid = raid_row_guids(group);
     g.raid_pets.extend(
         g.raid
             .iter()
@@ -83,9 +46,9 @@ fn fill_group<'a>(
 /// What [`UnitAuras::feed`] reads this frame.
 pub(super) struct Inputs<'g, 'a, H, V> {
     pub(super) group: Option<&'g GroupState>,
-    /// Our guid, and whether the player's list moved this frame: a token naming us reads the
-    /// player's list, which the caller pushes.
-    pub(super) me: (u64, bool),
+    /// Our guid, whose slots list as any held unit's: `UnitBuff("player")` walks the fields, not
+    /// the buff cache (`0x51960f`).
+    pub(super) me: u64,
     /// `pet`, `target`, `mouseover` and `npc`'s guids, 0 for none.
     pub(super) pet: u64,
     pub(super) target: u64,
@@ -98,13 +61,15 @@ pub(super) struct Inputs<'g, 'a, H, V> {
     pub(super) catalog: Option<&'a SpellCatalog>,
     /// The spell catalog was replaced, so every list is rebuilt.
     pub(super) catalog_moved: bool,
+    /// Each aura's `raidFilter` verdict.
+    pub(super) raid: &'a RaidFilter,
 }
 
 /// One guid's list, shared by every token naming it.
 struct GuidList {
     /// What the list was built from; the list is rebuilt only when these move.
     inputs: Vec<AuraInput>,
-    list: Vec<AuraState>,
+    list: UnitAuraList,
     /// Taken from [`UnitAuras::versions`] each time the list changes.
     version: u64,
     /// The frame that last read it; an entry no token can name this frame is dropped.
@@ -119,12 +84,8 @@ pub(super) struct UnitAuras {
     by_guid: HashMap<u64, GuidList>,
     /// Each list version the VM holds, by guid.
     pushed: HashMap<u64, u64>,
-    /// Each event token's last `(guid, version)`, by [`event_tokens`] index.
-    fired: Vec<Option<(u64, u64)>>,
     /// The last version handed out; every list change takes the next, so none repeats.
     versions: u64,
-    /// The player's list version, for a token naming us.
-    player_version: u64,
     catalog_present: bool,
     frame: u64,
     /// Kept to save the allocations: the inputs being read, and the walk over the guids a token
@@ -135,20 +96,20 @@ pub(super) struct UnitAuras {
 
 impl UnitAuras {
     /// Build the resolver's inputs and every nameable guid's list, push what moved, and return
-    /// the tokens `UNIT_AURA` fires for: every event token naming a unit whose list moved
-    /// (`0x515e50`), or that names a new unit. A token clearing fires nothing.
+    /// the guids whose list the VM was handed. Pushing fires nothing: `UNIT_AURA` is the aura
+    /// fields' watches and the stats packet's record diff (`crate::field_watch`).
     pub(super) fn feed<'a, H, V>(
         &mut self,
         script: &mut UiScript,
         inputs: Inputs<'_, 'a, H, V>,
-    ) -> Vec<&'static str>
+    ) -> Vec<u64>
     where
         H: Fn(u64) -> Option<&'a ObjectStore>,
         V: Fn(u64, &ObjectStore) -> bool,
     {
         let Inputs {
             group,
-            me: (me, player_moved),
+            me,
             pet,
             target,
             mouseover,
@@ -157,24 +118,20 @@ impl UnitAuras {
             buffs_visible,
             catalog,
             catalog_moved,
+            raid,
         } = inputs;
         self.frame += 1;
         if catalog_moved || catalog.is_some() != self.catalog_present {
             self.catalog_present = catalog.is_some();
             self.by_guid.clear();
         }
-        if player_moved || self.player_version == 0 {
-            self.versions += 1;
-            self.player_version = self.versions;
-        }
-
         // The resolver's inputs and the lists, in one walk over every guid a token can name: the
         // bases, then each held unit their `target` chains reach. A group token's guid lists off
         // its roster record while out of view; any other lists only while held.
         let mut g = std::mem::take(&mut self.guids);
         let mut walk = std::mem::take(&mut self.walk);
         (g.player, g.pet, g.target, g.mouseover, g.npc) = (me, pet, target, mouseover, npc);
-        fill_group(&mut g, group, me, &held);
+        fill_group(&mut g, group, &held);
         g.held.clear();
         walk.clear();
         walk.extend([me, pet, target, mouseover, npc].map(|g| (g, false)));
@@ -190,9 +147,7 @@ impl UnitAuras {
                 g.held.insert(guid, next);
                 walk.push((next, false));
             }
-            if guid != me {
-                self.refresh(guid, store, record_ok, group, &buffs_visible, catalog);
-            }
+            self.refresh(guid, store, record_ok, group, &buffs_visible, catalog, raid);
         }
         script.set_unit_guids(&g);
         self.guids = g;
@@ -200,9 +155,11 @@ impl UnitAuras {
         let frame = self.frame;
         self.by_guid.retain(|_, e| e.frame == frame);
 
+        let mut handed = Vec::new();
         for (&guid, e) in &self.by_guid {
             if self.pushed.insert(guid, e.version) != Some(e.version) {
                 script.set_unit_auras(guid, Some(e.list.clone()));
+                handed.push(guid);
             }
         }
         let by_guid = &self.by_guid;
@@ -214,32 +171,18 @@ impl UnitAuras {
             keep
         });
 
-        self.fired.resize(EVENT_TOKEN_COUNT, None);
-        let mut fire = Vec::new();
-        for (i, token) in event_tokens().enumerate() {
-            let guid = event_guid(&self.guids, i);
-            let cur = match guid {
-                0 => None,
-                g if g == me => Some((g, self.player_version)),
-                g => self.by_guid.get(&g).map(|e| (g, e.version)),
-            };
-            if cur != self.fired[i] && cur.is_some() {
-                fire.push(token);
-            }
-            self.fired[i] = cur;
-        }
-        fire
+        handed
     }
 
     /// `guid`'s list as last built, `None` for a unit with none.
-    pub(super) fn list(&self, guid: u64) -> Option<&[AuraState]> {
-        self.by_guid.get(&guid).map(|e| e.list.as_slice())
+    pub(super) fn list(&self, guid: u64) -> Option<&UnitAuraList> {
+        self.by_guid.get(&guid).map(|e| &e.list)
     }
 
-    /// Rebuild `guid`'s list this frame if what it is built from moved: the live unit's gated
-    /// slots (`store`, the object manager's answer), else, for a guid a group token names, the
-    /// roster record's block. A guid neither held nor a group token's gets no list, as
-    /// `UnitBuff`'s roster walk finds nothing for it.
+    /// Rebuild `guid`'s list this frame if what it is built from moved: the live unit's slots
+    /// (`store`, the object manager's answer) with its unit gate, else, for a guid a group token
+    /// names, the roster record's block, which has none (`0x519735`). A guid neither held nor a
+    /// group token's gets no list, as `UnitBuff`'s roster walk finds nothing for it.
     fn refresh(
         &mut self,
         guid: u64,
@@ -248,6 +191,7 @@ impl UnitAuras {
         group: Option<&GroupState>,
         buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
         catalog: Option<&SpellCatalog>,
+        raid: &RaidFilter,
     ) {
         if self
             .by_guid
@@ -257,27 +201,34 @@ impl UnitAuras {
             return;
         }
         self.scratch.clear();
-        match store {
-            Some(store) => self.scratch.extend(other_unit_inputs(
-                store,
-                catalog,
-                buffs_visible(guid, store),
-            )),
+        let gate = match store {
+            Some(store) => {
+                self.scratch.extend(other_unit_inputs(store, catalog, raid));
+                buffs_visible(guid, store)
+            }
             None if record_ok => {
                 if let Some(group) = group {
-                    self.scratch
-                        .extend(record_inputs(group.roster_aura_slots(guid), catalog));
+                    self.scratch.extend(record_inputs(
+                        group.roster_aura_slots(guid),
+                        catalog,
+                        raid,
+                    ));
                 }
+                true
             }
             None => return,
-        }
+        };
+        let build = |inputs: &[AuraInput]| UnitAuraList {
+            auras: aura_list(catalog, inputs),
+            buffs_visible: gate,
+        };
         match self.by_guid.entry(guid) {
             Entry::Occupied(mut e) => {
                 let e = e.get_mut();
                 e.frame = self.frame;
-                if e.inputs != self.scratch {
+                if e.inputs != self.scratch || e.list.buffs_visible != gate {
                     std::mem::swap(&mut e.inputs, &mut self.scratch);
-                    let list = aura_list(catalog, &e.inputs);
+                    let list = build(&e.inputs);
                     if list != e.list {
                         e.list = list;
                         self.versions += 1;
@@ -288,7 +239,7 @@ impl UnitAuras {
             Entry::Vacant(e) => {
                 self.versions += 1;
                 let inputs = self.scratch.clone();
-                let list = aura_list(catalog, &inputs);
+                let list = build(&inputs);
                 e.insert(GuidList {
                     inputs,
                     list,
@@ -308,7 +259,7 @@ mod tests {
     use benilla_ui::script::UiScript;
     use bevy::prelude::*;
 
-    use crate::char_select::ClientState;
+    use crate::client_state::ClientState;
     use crate::net::{Guid, GuidIndex, NetCommands, ObjectStore, Reputations, SelfPlayer};
     use crate::ui_party::GroupState;
 
@@ -342,10 +293,7 @@ mod tests {
                 SEEN = {}
                 local f = CreateFrame("Frame")
                 f:RegisterEvent("UNIT_AURA")
-                -- The group's tokens only: the player's list fires on the first frame too.
-                f:SetScript("OnEvent", function()
-                    if arg1 ~= "player" then table.insert(SEEN, arg1) end
-                end)
+                f:SetScript("OnEvent", function() table.insert(SEEN, arg1) end)
             "#,
             )
             .unwrap();
@@ -425,6 +373,101 @@ mod tests {
             .unwrap()
     }
 
+    /// The player's slots list under its guid as any held unit's: `UnitBuff("player")` walks the
+    /// fields in slot order (`0x51960f`), where the buff cache keeps the order auras arrived in.
+    #[test]
+    fn the_player_token_reads_the_slots_in_slot_order() {
+        let mut app = party_app();
+        let me = app.world().resource::<GuidIndex>().0[&ME];
+        let seat = |app: &mut App, fields: &[(u16, u32)]| {
+            app.world_mut()
+                .entity_mut(me)
+                .insert(ObjectStore(ObjectFields::from_pairs(fields)));
+            app.update();
+        };
+        // Stance lands first, in slot 1; then Mark, in slot 0.
+        seat(
+            &mut app,
+            &[(FLAGS, 0x0800_0000), (AURA + 1, 2457), (AURAFLAGS, 0x90)],
+        );
+        seat(
+            &mut app,
+            &[
+                (FLAGS, 0x0800_0000),
+                (AURA, 1126),
+                (AURA + 1, 2457),
+                (AURAFLAGS, 0x99),
+            ],
+        );
+        assert_eq!(listed(&mut app, "player", false), [1126, 2457]);
+        let cache = &app
+            .world()
+            .resource::<super::super::PlayerAuraCache>()
+            .auras;
+        assert_eq!(
+            cache.iter().map(|c| c.spell_id).collect::<Vec<_>>(),
+            [2457, 1126],
+            "the cache keeps arrival order"
+        );
+    }
+
+    /// A set `raidFilter` counts the buffs the player could cast, off the books as they stand: a
+    /// spell learnt rebuilds the verdicts (`0x4b2603`).
+    #[test]
+    fn a_raid_filter_follows_the_book() {
+        let mut app = party_app();
+        let row = |id: u32| {
+            (
+                id,
+                benilla_formats::SpellDisplay {
+                    id,
+                    icon: Some(format!("Spell_{id}")),
+                    ..Default::default()
+                },
+            )
+        };
+        app.world_mut().insert_resource(crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays([row(1243), row(1126)].into()),
+            ..crate::ui_action::Spells::empty_for_tests()
+        });
+        let mut actions = crate::ui_action::PlayerActions::default();
+        actions.spells.insert(1243);
+        app.world_mut().insert_resource(actions);
+        stream(
+            &mut app,
+            MEMBER,
+            &[
+                (FLAGS, 0x0800_0000),
+                (AURA, 1126),
+                (AURA + 1, 1243),
+                (AURAFLAGS, 0x0000_0088),
+            ],
+        );
+        let kept = |app: &mut App| {
+            app.world_mut()
+                .non_send_resource::<UiScript>()
+                .eval::<Vec<String>>(
+                    r#"local t = {}
+                       for i = 1, 32 do
+                           local icon = UnitBuff("party1", i, 1)
+                           if not icon then break end
+                           table.insert(t, icon)
+                       end
+                       return t"#,
+                )
+                .unwrap()
+        };
+        app.update();
+        assert_eq!(kept(&mut app), ["Spell_1243"]);
+        assert_eq!(listed(&mut app, "party1", false), [1126, 1243]);
+        app.world_mut()
+            .resource_mut::<crate::ui_action::PlayerActions>()
+            .spells
+            .insert(1126);
+        app.update();
+        assert_eq!(kept(&mut app), ["Spell_1126", "Spell_1243"]);
+    }
+
     /// A live member reads its own `UNIT_FIELD_AURA` slots; `UnitBuff` keeps the unit gate, open
     /// here through `UNIT_FLAG_AURAS_VISIBLE` (`0x5195bc`), and a stale slot stays out.
     #[test]
@@ -460,7 +503,6 @@ mod tests {
             listed(&mut app, "party2", true).is_empty(),
             "no second member"
         );
-        assert_eq!(seen(&mut app), ["party1"]);
     }
 
     /// With no live object, both bindings walk the record's block (`0x519735`, `0x519b25`), with
@@ -491,7 +533,6 @@ mod tests {
             .eval::<i64>(r#"local _, count = UnitDebuff("party1", 1) return count"#)
             .unwrap();
         assert_eq!(count, 1);
-        assert_eq!(seen(&mut app), ["party1"]);
 
         stats(
             &mut app,
@@ -576,7 +617,6 @@ mod tests {
             },
         );
         app.update();
-        let _ = seen(&mut app);
         // A later aura in a lower slot, then a debuff, as two deltas.
         stats(
             &mut app,
@@ -597,7 +637,6 @@ mod tests {
         app.update();
         assert_eq!(listed(&mut app, "party1", false), [21562, 1126]);
         assert_eq!(listed(&mut app, "party1", true), [589, 770]);
-        assert_eq!(seen(&mut app), ["party1"]);
 
         // Slot 5 falls off: the delta names it with a 0, and only it goes.
         stats(
@@ -611,19 +650,6 @@ mod tests {
         app.update();
         assert_eq!(listed(&mut app, "party1", false), [21562]);
         assert_eq!(listed(&mut app, "party1", true), [589, 770]);
-        assert_eq!(seen(&mut app), ["party1"]);
-
-        // A delta that moves no aura fires nothing.
-        stats(
-            &mut app,
-            false,
-            PartyMemberStatsInfo {
-                cur_hp: Some(7),
-                ..Default::default()
-            },
-        );
-        app.update();
-        assert!(seen(&mut app).is_empty());
     }
 
     /// `partypetN` names the member's `CHARM`, else `SUMMON`, while the member is held, else the
@@ -647,7 +673,6 @@ mod tests {
         assert_eq!(listed(&mut app, "partypet1", false), [1126]);
         assert_eq!(listed(&mut app, "partypet1", true), [770]);
         assert!(listed(&mut app, "partypet2", true).is_empty());
-        assert_eq!(seen(&mut app), ["party1", "partypet1"]);
 
         // A pet-aura delta moves the pet's list and fires for its token alone.
         stats(
@@ -660,7 +685,6 @@ mod tests {
         );
         app.update();
         assert_eq!(listed(&mut app, "partypet1", true), [589]);
-        assert_eq!(seen(&mut app), ["partypet1"]);
 
         // Member and pet in view: the pet guid comes off the member's SUMMON, the list off the
         // pet's own slots.
@@ -677,24 +701,22 @@ mod tests {
         app.update();
         assert_eq!(listed(&mut app, "partypet1", true), [11976]);
         assert!(listed(&mut app, "partypet1", false).is_empty());
-        assert!(seen(&mut app).contains(&"partypet1".to_string()));
     }
 
     // == The raid tokens ==
 
-    /// In our subgroup, so `party1` and `raid2`.
+    /// In our subgroup, so `party1` and `raid1`.
     const MATE: u64 = 0x2001;
-    /// Subgroup 2, `raid5` only.
+    /// Subgroup 2, `raid4` only.
     const FAR: u64 = 0x2004;
     const FAR_PET: u64 = 0xF140_0000_0000_0099;
 
-    /// A raid of five: us (row 1, subgroup 1), `MATE` (subgroup 1), two in subgroup 2 and `FAR`
-    /// in subgroup 3, in wire order, none streamed and none with a record.
+    /// A raid of five: `MATE` (subgroup 1), two in subgroup 2 and `FAR` in subgroup 3 in wire
+    /// order, then us (row 5, subgroup 1); none streamed and none with a record.
     fn raid_app() -> App {
         let mut app = party_app();
         relist_raid(&mut app, member_status::ONLINE);
         app.update();
-        let _ = seen(&mut app);
         app
     }
 
@@ -746,12 +768,11 @@ mod tests {
             ],
         );
         app.update();
-        assert_eq!(listed(&mut app, "raid5", true), [589]);
+        assert_eq!(listed(&mut app, "raid4", true), [589]);
         assert!(
-            listed(&mut app, "raid5", false).is_empty(),
+            listed(&mut app, "raid4", false).is_empty(),
             "no factions, so `CanAssist` fails and the gate drops the buffs"
         );
-        assert_eq!(seen(&mut app), ["raid5"]);
         for token in ["party1", "party2", "raid6"] {
             assert!(listed(&mut app, token, true).is_empty(), "{token}");
         }
@@ -774,51 +795,38 @@ mod tests {
             },
         );
         app.update();
-        assert_eq!(listed(&mut app, "raid5", true), [589, 11976]);
+        assert_eq!(listed(&mut app, "raid4", true), [589, 11976]);
         let count = app
             .world_mut()
             .non_send_resource::<UiScript>()
-            .eval::<i64>(r#"local _, count = UnitDebuff("raid5", 1) return count"#)
+            .eval::<i64>(r#"local _, count = UnitDebuff("raid4", 1) return count"#)
             .unwrap();
         assert_eq!(count, 1);
-        assert_eq!(listed(&mut app, "raidpet5", false), [1126]);
-        assert_eq!(listed(&mut app, "raidpet5", true), [770]);
-        assert_eq!(seen(&mut app), ["raid5", "raidpet5"]);
+        assert_eq!(listed(&mut app, "raidpet4", false), [1126]);
+        assert_eq!(listed(&mut app, "raidpet4", true), [770]);
         assert!(
-            listed(&mut app, "raidpet4", true).is_empty(),
+            listed(&mut app, "raidpet3", true).is_empty(),
             "a petless member's raidpet token names nobody"
         );
     }
 
-    /// `UNIT_AURA` fires for every token naming a unit whose list moved (`0x515e50`), and for
-    /// nothing else; a delta that moves no aura fires nothing.
+    /// The feed pushes each moved list and fires nothing: `UNIT_AURA` is the aura fields' watches
+    /// and the stats packet's record diff (`crate::field_watch`), so neither a record's new block
+    /// nor a token's first look at one reaches a handler from here.
     #[test]
-    fn unit_aura_fires_for_each_token_naming_the_member_whose_list_moved() {
+    fn the_feed_pushes_each_moved_list_and_fires_nothing() {
         let mut app = raid_app();
         stats_of(&mut app, MATE, true, online(vec![(32, 589)]));
         stats_of(&mut app, FAR, true, online(vec![(32, 770)]));
         app.update();
-        let mut first = seen(&mut app);
-        first.sort();
-        assert_eq!(first, ["party1", "raid2", "raid5"]);
+        assert!(seen(&mut app).is_empty());
+        assert_eq!(listed(&mut app, "raid4", true), [770]);
 
         stats_of(&mut app, MATE, false, online(vec![(33, 11976)]));
         app.update();
-        assert_eq!(seen(&mut app), ["party1", "raid2"]);
-        assert_eq!(listed(&mut app, "raid2", true), [589, 11976]);
-        assert_eq!(listed(&mut app, "party1", true), [589, 11976]);
-
-        stats_of(
-            &mut app,
-            FAR,
-            false,
-            PartyMemberStatsInfo {
-                cur_hp: Some(7),
-                ..Default::default()
-            },
-        );
-        app.update();
         assert!(seen(&mut app).is_empty());
+        assert_eq!(listed(&mut app, "raid1", true), [589, 11976]);
+        assert_eq!(listed(&mut app, "party1", true), [589, 11976]);
     }
 
     /// The raid roster's twin of the list write (`0x4ba947`-`0x4ba960`): a status-only raid list
@@ -829,17 +837,17 @@ mod tests {
         let mut app = raid_app();
         stats_of(&mut app, MATE, true, online(vec![(32, 589)]));
         app.update();
-        assert_eq!(listed(&mut app, "raid2", true), [589]);
+        assert_eq!(listed(&mut app, "raid1", true), [589]);
         assert_eq!(listed(&mut app, "party1", true), [589]);
 
         relist_raid(&mut app, member_status::OFFLINE);
         app.update();
-        assert!(listed(&mut app, "raid2", true).is_empty());
+        assert!(listed(&mut app, "raid1", true).is_empty());
         assert!(listed(&mut app, "party1", true).is_empty());
 
         relist_raid(&mut app, member_status::ONLINE);
         app.update();
-        assert_eq!(listed(&mut app, "raid2", true), [589]);
+        assert_eq!(listed(&mut app, "raid1", true), [589]);
         assert_eq!(listed(&mut app, "party1", true), [589]);
     }
 
@@ -872,12 +880,12 @@ mod tests {
             },
         );
         app.update();
-        for token in ["raid5", "raidpet5", "raid6", "raid40", "raidpet40"] {
+        for token in ["raid4", "raidpet4", "raid6", "raid40", "raidpet40"] {
             assert!(listed(&mut app, token, true).is_empty(), "{token}");
         }
     }
 
-    /// Row 1 is us: the player's own list, as `"player"` answers it.
+    /// The last row, 5, is us: the player's own list, as `"player"` answers it.
     #[test]
     fn our_raid_row_mirrors_the_player_list() {
         let mut app = raid_app();
@@ -889,8 +897,7 @@ mod tests {
             ]));
         app.update();
         assert_eq!(listed(&mut app, "player", true), [589]);
-        assert_eq!(listed(&mut app, "raid1", true), [589]);
-        assert_eq!(seen(&mut app), ["raid1"]);
+        assert_eq!(listed(&mut app, "raid5", true), [589]);
     }
 
     /// A frame where nothing moved builds no list: the feed compares the inputs, not the lists.
@@ -1006,17 +1013,13 @@ mod tests {
         );
     }
 
-    /// `UNIT_AURA` fires for the tokens it fired for before, never for a chain or the mouseover,
-    /// which the reference's fan-out (`0x515c50`) does not list.
+    /// A chain's or the mouseover's list moving is pushed, and fires nothing.
     #[test]
-    fn unit_aura_still_fires_for_the_fixed_tokens_alone() {
+    fn a_chains_list_is_pushed_and_fires_nothing() {
         let mut app = chain_app();
-        let mut first = seen(&mut app);
-        first.sort();
-        assert_eq!(first, ["party1", "pet", "target", "targettarget"]);
+        assert!(seen(&mut app).is_empty(), "a first look fires nothing");
 
-        // `ADD`'s list moves: it is the mouseover, party1's target and three hops off ours, and
-        // no token that fires names it.
+        // `ADD`'s list moves: it is the mouseover, party1's target and three hops off ours.
         let add = app.world().resource::<GuidIndex>().0[&ADD];
         let mut fields = unit_fields(0x9, ME, 770);
         fields.push((AURA + 33, 589));
@@ -1075,13 +1078,13 @@ mod tests {
     fn a_raid_members_target_reads_whatever_the_guid_holds() {
         let mut app = raid_app();
         stats_of(&mut app, FAR, true, online(vec![(32, 589)]));
-        // `raid3` is 0x2002, in view and targeting `FAR`, which is not.
+        // `raid2` is 0x2002, in view and targeting `FAR`, which is not.
         stream(&mut app, 0x2002, &unit_fields(0x19, FAR, 770));
         app.update();
-        assert_eq!(listed(&mut app, "raid3", true), [770]);
-        assert_eq!(listed(&mut app, "raid3target", true), [589]);
-        assert_eq!(listed(&mut app, "raid5", true), [589]);
-        assert!(listed(&mut app, "raid5target", true).is_empty());
-        assert!(listed(&mut app, "raid3targettarget", true).is_empty());
+        assert_eq!(listed(&mut app, "raid2", true), [770]);
+        assert_eq!(listed(&mut app, "raid2target", true), [589]);
+        assert_eq!(listed(&mut app, "raid4", true), [589]);
+        assert!(listed(&mut app, "raid4target", true).is_empty());
+        assert!(listed(&mut app, "raid2targettarget", true).is_empty());
     }
 }

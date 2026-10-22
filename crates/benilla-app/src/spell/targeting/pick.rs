@@ -260,9 +260,13 @@ mod tests {
             target_owner_store: None,
             self_store: Some(&me),
             factions: Some(&factions),
-            reputations: &Reputations(Vec::new()),
+            reputations: &Reputations::default(),
             types: Default::default(),
-            group: Default::default(),
+            group: GroupInputs {
+                self_guid: Some(1),
+                target_guid: Some(if is_self { 1 } else { 2 }),
+                ..Default::default()
+            },
         };
         PickFlags::of(word).admits(is_self, &rel, in_party)
     }
@@ -364,9 +368,13 @@ mod tests {
             target_owner_store: None,
             self_store: Some(&me),
             factions: Some(&factions),
-            reputations: &Reputations(Vec::new()),
+            reputations: &Reputations::default(),
             types: Default::default(),
-            group: Default::default(),
+            group: GroupInputs {
+                self_guid: Some(1),
+                target_guid: Some(2),
+                ..Default::default()
+            },
         };
         assert!(!PickFlags::of(UNIT).admits(false, &rel, || false));
         assert!(PickFlags::of(UNIT | DEAD_ONLY).admits(false, &rel, || true));
@@ -446,7 +454,7 @@ mod tests {
         world.init_resource::<GroupRoster>();
         world.init_resource::<SpellTargeting>();
         world.insert_resource(fx::factions());
-        world.insert_resource(Reputations(Vec::new()));
+        world.insert_resource(Reputations::default());
         world.init_resource::<GuidIndex>();
         world.init_resource::<crate::ui_party::GroupState>();
         world.insert_resource(SelfGuid(Some(1)));

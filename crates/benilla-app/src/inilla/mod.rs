@@ -46,7 +46,7 @@ use inilla_core::profiles::Launcher;
 use inilla_core::settings::InillaSettings;
 use inilla_core::touch::TouchLayout;
 
-use crate::char_select::ClientState;
+use crate::client_state::ClientState;
 
 pub(crate) use session::world_address;
 
@@ -127,25 +127,8 @@ impl Plugin for InillaPlugin {
         )
         .add_systems(OnEnter(ClientState::InWorld), synth::release_all)
         .add_systems(OnExit(ClientState::InWorld), synth::release_all)
-        .add_systems(Last, save_when_changed)
-        .add_systems(Update, follow_data_language);
+        .add_systems(Last, save_when_changed);
     }
-}
-
-/// The game data's language, handed to the two places that report it: the logon challenge (so
-/// the server sends its quests, items and NPC names in it) and `GetLocale()` (so addons such as
-/// pfQuest pick their own translation). Once, as soon as the archives are open.
-fn follow_data_language(mut done: Local<bool>) {
-    if *done {
-        return;
-    }
-    let Some(locale) = benilla_formats::data_locale() else {
-        return;
-    };
-    *done = true;
-    benilla_protocol::auth::set_client_locale(locale);
-    benilla_ui::script::set_locale(locale);
-    info!("inilla: the game data is {locale}");
 }
 
 /// The `PreUpdate` systems that produce synthetic input (touch, controller) — ahead of

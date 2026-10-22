@@ -6,7 +6,7 @@
 //! It runs in [`WorldStage::Net`], before `Input`, so a server teleport snaps, streams and covers
 //! in one frame. Coordinates cross from WoW into Bevy space here (`wow_to_bevy`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use benilla_protocol::{
@@ -20,17 +20,24 @@ use crossbeam_channel::{Receiver, Sender};
 use benilla_world::schedule::WorldStage;
 
 mod apply;
+mod game_time;
 pub(crate) mod handlers;
 pub(crate) mod io;
-mod motion;
+pub(crate) mod motion;
 mod objects;
-pub(crate) use objects::tear_down;
+#[cfg(test)]
+pub(crate) use objects::wire;
+pub(crate) use objects::Listed;
+pub(crate) use objects::{release_unheld, ReleasePending};
 mod session;
 mod world;
 
 pub(crate) use apply::apply_net_updates;
 pub(crate) use apply::enter_world_on_self_create;
 use apply::tag_self_player;
+#[cfg(test)]
+pub(crate) use game_time::GameTime;
+pub(crate) use game_time::{clock_tick, ServerTime};
 pub(crate) use handlers::NetHandlerApp;
 
 pub(crate) use io::LoginRequest;
@@ -41,13 +48,9 @@ use motion::{
 // `pub(crate)`: `creature_anim` reads the shuffle latch it produces, and a test runs both.
 pub(crate) use motion::drive_display_facing;
 pub(crate) use motion::{
-    ground_derived, grounded_y, jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline,
-    SplineStopped, UnitMoveModes,
+    grounded_y, jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline, SplineStopped,
+    UnitMoveModes,
 };
-// Only the ground-census probe reads this, so a build without the instruments leaves it unused.
-// Not a `cfg`: seam knowledge lives in three fixed places, and this file is not one of them.
-#[allow(unused_imports)]
-pub(crate) use motion::GroundClamped;
 
 /// The net subsystem: spawns the background IO threads and drives the per-frame event drain.
 pub(crate) struct NetPlugin {
@@ -71,11 +74,7 @@ impl Plugin for NetPlugin {
         if !self.connect {
             app.insert_resource(NetOffline);
         }
-        // In the net stage: the lighting resolve runs after it and reads this frame's clock.
-        app.add_systems(
-            Update,
-            publish_world_time.in_set(benilla_world::schedule::WorldStage::Net),
-        );
+        game_time::register(app);
         world::register(app);
         session::register(app);
         objects::register(app);
@@ -84,13 +83,13 @@ impl Plugin for NetPlugin {
             .insert_resource(NetCommands(handles.commands))
             .insert_resource(CharPick(handles.pick))
             .insert_resource(RealmChoice(handles.realm))
-            .insert_resource(RosterPolicy(handles.screen_asks_roster))
             .insert_resource(LoginSubmit(handles.login))
             .insert_resource(LoginAbandon(handles.login_abandon))
             .insert_resource(PingShared(handles.ping))
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
             .init_resource::<AddonInfoReply>()
+            .init_resource::<SessionBilling>()
             .init_resource::<PendingTransfer>()
             .init_resource::<NetStatus>()
             .init_resource::<DroppedOpcodes>()
@@ -106,6 +105,8 @@ impl Plugin for NetPlugin {
             .init_resource::<crate::world_state::WorldStates>()
             .add_message::<TeleportMessage>()
             .add_message::<FieldChanged>()
+            .add_message::<crate::item_watch::ItemNotice>()
+            .init_resource::<crate::field_watch::NoticeLane>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
             .add_message::<ClientControlMessage>()
@@ -140,6 +141,9 @@ impl Plugin for NetPlugin {
                     apply_net_updates,
                     tag_self_player,
                     enter_world_on_self_create,
+                    // The create gives control back (`0x5deb56`), in the Net stage ahead of
+                    // `control`'s read of the flags.
+                    crate::player::regain_control_on_arrival.in_set(crate::player::ControlRestore),
                     sample_splines,
                     // Swim state from the water at the feet (the wire never carries it for
                     // creatures), before the clamp so a swimmer is exempt the same frame.
@@ -252,14 +256,20 @@ impl ObjectStore {
     }
 }
 
-/// One descriptor dword moved on a streamed object, the reference's `CMirrorHandler` edge: the
-/// values notifier (`0x465330`) diffs live against a shadow copy and passes the old value
-/// (`0x465570`). A first create fires nothing; a re-create of a live guid fires like a delta.
+/// One descriptor dword moved on a streamed object, the reference's `CMirrorHandler` edge: an
+/// update packet's notify pass (`0x465330`) diffs the object against the copy its last write in
+/// the packet took (`0x46664b`) and passes the old value (`0x465570`). A first create fires
+/// nothing; a create of an object shown before fires every dword it moved, an omitted one cleared.
 ///
 /// `kind` is the store's class from its create block, since a raw index differs per class (`36`
 /// is a unit's `BYTES_0` and a corpse's `DYNAMIC_FLAGS`).
+///
+/// `at` is the edge's place among what the packets queue ([`crate::lanes::stamp`]), taken as the
+/// handler writes it, so a line a later system words off the edge fires where the reference's
+/// field callback wrote it, inside the update's handler.
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FieldChanged {
+    pub at: crate::lanes::Stamp,
     pub entity: Entity,
     pub guid: u64,
     pub kind: benilla_protocol::messages::ObjectType,
@@ -278,54 +288,31 @@ impl FieldChanged {
     pub fn unit_field(&self, index: u16) -> bool {
         self.is_unit() && self.index == index
     }
+    /// A unit's alive-to-dead edge, signed as the health watcher compares it (`0x6046f0`:
+    /// `0x604774 jg` on the old health, `0x604778 jle` on the new), which runs `OnDied`.
+    pub fn unit_died(&self) -> bool {
+        self.unit_field(benilla_protocol::field::FIELD_UNIT_HEALTH)
+            && self.old as i32 > 0
+            && self.new as i32 <= 0
+    }
     /// The edge's slot in a unit-block array of `len` dwords at `base` (`UNIT_FIELD_AURA[48]`).
     pub fn unit_array_slot(&self, base: u16, len: u16) -> Option<u16> {
         (self.is_unit() && (base..base + len).contains(&self.index)).then(|| self.index - base)
     }
 }
 
-/// The field edges one feed saw this run, by guid and index: the reference fans a moved field out
-/// to every unit token naming the unit (`0x515e50`).
-#[derive(Default)]
-pub(crate) struct FieldEdges(HashSet<(u64, u16)>);
-
-impl FieldEdges {
-    pub fn collect(reader: &mut MessageReader<FieldChanged>) -> Self {
-        Self(reader.read().map(|e| (e.guid, e.index)).collect())
-    }
-    pub fn moved(&self, guid: u64, index: u16) -> bool {
-        self.0.contains(&(guid, index))
-    }
-    #[cfg(test)]
-    pub fn of(edges: &[(u64, u16)]) -> Self {
-        Self(edges.iter().copied().collect())
-    }
-}
-
-/// Merge a descriptor update into a store and emit its [`FieldChanged`] edges; the drain and the
-/// test harness share it.
-pub(crate) fn merge_store_fields(
-    store: &mut ObjectFields,
-    delta: ObjectFields,
-    entity: Entity,
-    guid: u64,
-    mut emit: impl FnMut(FieldChanged),
-) {
-    let Some(kind) = store.created_as() else {
-        // A bare delta with no create: nothing for the reference to notify on; the fields land.
+/// A block's write into a held store (`0x466590` with its copy flag clear): a create's delta
+/// replaces the store, clearing what it omits (`0x466582`); a values delta lands on top. The
+/// dwords it moved come back as `(index, old, new)`. A store no create made has no type to
+/// notify by, and the fields land with none.
+pub(crate) fn write_fields(store: &mut ObjectFields, delta: ObjectFields) -> Vec<(u16, u32, u32)> {
+    let mut moved = Vec::new();
+    if store.created_as().is_none() {
         store.merge(delta);
-        return;
-    };
-    store.merge_diff(delta, |index, old, new| {
-        emit(FieldChanged {
-            entity,
-            guid,
-            kind,
-            index,
-            old,
-            new,
-        });
-    });
+    } else {
+        store.merge_diff(delta, |index, old, new| moved.push((index, old, new)));
+    }
+    moved
 }
 
 /// Apply a descriptor update the way the drain does. The first one must be
@@ -335,7 +322,20 @@ pub(crate) fn apply_fields_for_test(world: &mut World, entity: Entity, delta: Ob
     let guid = world.get::<Guid>(entity).map_or(0, |g| g.0);
     let mut edges = Vec::new();
     match world.get_mut::<ObjectStore>(entity) {
-        Some(mut store) => merge_store_fields(&mut store.0, delta, entity, guid, |e| edges.push(e)),
+        Some(mut store) => {
+            let moved = write_fields(&mut store.0, delta);
+            if let Some(kind) = store.0.created_as() {
+                edges.extend(moved.into_iter().map(|(index, old, new)| FieldChanged {
+                    at: crate::lanes::stamp(),
+                    entity,
+                    guid,
+                    kind,
+                    index,
+                    old,
+                    new,
+                }));
+            }
+        }
         None => {
             assert!(
                 delta.created_as().is_some(),
@@ -380,12 +380,11 @@ pub(crate) struct ActiveMover;
 pub(crate) struct NetEvents(Receiver<SessionEvent>);
 
 /// The outbound command channel.
-#[derive(Resource)]
+#[derive(Resource, Debug)]
 pub(crate) struct NetCommands(pub(crate) Sender<ClientCommand>);
 
 /// The character-select channel to the IO thread parked at select: create and delete are served
-/// in place, re-emitting the roster (under the native policy), until an [`CharRequest::Enter`]
-/// moves into the world.
+/// in place until an [`CharRequest::Enter`] moves into the world.
 #[derive(Resource)]
 pub(crate) struct CharPick(pub(crate) ParkSender<CharRequest>);
 
@@ -486,14 +485,6 @@ pub(crate) enum CharRequest {
     Enumerate,
 }
 
-/// Whether the screen asks for its roster (the stock glue screens' `GetCharacterListUpdate`)
-/// instead of the IO thread fetching it on reaching the character park (the native screens'). Set
-/// by the UI session as it installs the VM that runs: true with the stock glue VM up, false
-/// otherwise, so a run whose stock VM did not build still gets its roster. The IO thread reads it
-/// as each park is entered.
-#[derive(Resource, Clone)]
-pub(crate) struct RosterPolicy(pub(crate) std::sync::Arc<std::sync::atomic::AtomicBool>);
-
 /// The realm channel: the answer to each [`RealmListMessage`]. Two parks listen, the login-side
 /// one and the character one, since the reference's realm list is a dialog over either screen
 /// (`RealmList.xml` is `frameStrata="DIALOG"`).
@@ -525,7 +516,7 @@ pub(crate) enum RealmRequest {
     Leave,
 }
 
-/// The credentials channel to the IO thread's pre-logon park, sent by [`crate::login`].
+/// The credentials channel to the IO thread's pre-logon park, sent by [`crate::glue_session::login`].
 #[derive(Resource)]
 pub(crate) struct LoginSubmit(pub(crate) Sender<io::LoginRequest>);
 
@@ -564,11 +555,15 @@ impl Objects<'_, '_> {
 
     /// A streamed object's merged descriptor fields, found as `0x468460` does, by guid.
     pub fn object(&self, guid: u64) -> Option<&ObjectFields> {
+        self.store(guid).map(|s| &s.0)
+    }
+
+    /// [`Self::object`] with its component.
+    pub(crate) fn store(&self, guid: u64) -> Option<&ObjectStore> {
         self.index
             .0
             .get(&guid)
             .and_then(|&e| self.stores.get(e).ok())
-            .map(|s| &s.0)
     }
 
     /// Every streamed object, items included.
@@ -582,6 +577,11 @@ impl Objects<'_, '_> {
     /// Our own player, once in the world.
     pub fn player(&self) -> Option<Entity> {
         self.me.single().ok()
+    }
+
+    /// Our own player's descriptor fields, once in the world.
+    pub(crate) fn player_fields(&self) -> Option<&ObjectFields> {
+        self.stores.get(self.player()?).ok().map(|s| &s.0)
     }
 
     /// An item object's countdown cells.
@@ -622,27 +622,6 @@ pub(crate) struct DropTally {
     pub(crate) unparseable: u64,
 }
 
-/// The in-game clock (`SMSG_LOGIN_SETTIMESPEED`), advanced by its timescale.
-#[derive(Resource, Default)]
-pub(crate) struct ServerTime(pub(crate) Option<GameTime>);
-
-/// Publish the session clock into [`benilla_world::lighting::WorldTime`] each frame; with no
-/// server, its default (noon).
-pub(crate) fn publish_world_time(
-    server: Res<ServerTime>,
-    mut world_time: ResMut<benilla_world::lighting::WorldTime>,
-) {
-    *world_time = match server.0 {
-        Some(gt) => benilla_world::lighting::WorldTime {
-            minute: gt.minute_of_day(),
-            minute_f: gt.minute_of_day_f32(),
-            day: gt.day_continuous(),
-            live: true,
-        },
-        None => benilla_world::lighting::WorldTime::default(),
-    };
-}
-
 /// The server's unix wall clock (`SMSG_QUERY_TIME_RESPONSE`), advanced monotonically. Descriptor
 /// deadlines are absolute server stamps (a timed quest's is `time(nullptr) + limitTime`, vmangos
 /// `Player::AddQuest`), so a countdown reads this, never the local clock.
@@ -655,15 +634,32 @@ pub(crate) struct WallClockSample {
     /// The server's `time(nullptr)` at `received`.
     base_unix: u32,
     received: Instant,
+    /// The responses of the session so far, this one included.
+    count: u64,
+    /// Whether the local clock read the server's second exactly, where the reference's offset
+    /// `G = local - server` would be 0 and is stored as 1 (`0x4def00`, `0x4def02`).
+    zero_offset: bool,
 }
 
 impl ServerWallClock {
     /// Take a fresh sample; it reads about RTT/2 behind, below a countdown's one-second grain.
-    pub(crate) fn sample(&mut self, unix_time: u32) {
+    pub(crate) fn sample(&mut self, unix_time: u32, local_unix: i64) {
         self.0 = Some(WallClockSample {
             base_unix: unix_time,
             received: Instant::now(),
+            count: self.samples() + 1,
+            zero_offset: local_unix == i64::from(unix_time),
         });
+    }
+
+    /// Whether the last sample found the local clock on the server's second (`0x4def02`).
+    pub(crate) fn zero_offset(&self) -> bool {
+        self.0.is_some_and(|s| s.zero_offset)
+    }
+
+    /// The responses sampled so far.
+    pub(crate) fn samples(&self) -> u64 {
+        self.0.map_or(0, |s| s.count)
     }
 
     /// Server unix seconds now, fractional.
@@ -703,18 +699,53 @@ pub(crate) fn send_query_time(
     }
 }
 
-/// Our `(flags, standing)` per slot, indexed by `Faction.dbc`'s `reputationIndex`. The standing
-/// excludes the DBC race/class base, which consumers add before ranking. Filled by
-/// `SMSG_INITIALIZE_FACTIONS`, kept current by `SMSG_SET_FACTION_STANDING` (which also reveals)
-/// and `SMSG_SET_FACTION_VISIBLE`. Flag bit `0x08` marks a pane header.
-#[derive(Resource, Default)]
-pub(crate) struct Reputations(
-    pub(crate) Vec<(u8, i32)>,
-    /// The forced-reaction table (`SMSG_SET_FORCED_REACTIONS`): `(Faction.dbc id, reaction rank)`.
-    /// A faction listed here answers with that rank whatever its templates or our standing say;
-    /// empty unless a `SPELL_AURA_FORCE_REACTION` aura is on us.
-    pub(crate) Vec<(u32, u32)>,
-);
+/// Our reputation state: the `(flags, standing)` per slot and the forced-reaction table.
+///
+/// `slots` is indexed by `Faction.dbc`'s `reputationIndex`. The standing excludes the DBC
+/// race/class base, which consumers add before ranking. Filled by `SMSG_INITIALIZE_FACTIONS`, kept
+/// current by `SMSG_SET_FACTION_STANDING` (which also reveals) and `SMSG_SET_FACTION_VISIBLE`.
+/// Flag bit `0x08` marks a pane header.
+///
+/// `forced` is `SMSG_SET_FORCED_REACTIONS` (`0x4d59a0`): `(Faction.dbc id, reaction rank)` per
+/// faction a `SPELL_AURA_FORCE_REACTION` aura forces, which answers with that rank whatever its
+/// templates or our standing say. Both halves live on one resource so a change to either wakes the
+/// unit feed and the questgiver-marker re-query that read reactions.
+#[derive(Resource, Default, Clone)]
+pub(crate) struct Reputations {
+    pub(crate) slots: Vec<(u8, i32)>,
+    pub(crate) forced: Vec<(u32, u32)>,
+    /// How many forced tables have arrived. The reference's handler fires `UNIT_FACTION` on every
+    /// arrival, a resend of the same table included, so a feed counts arrivals, not table diffs.
+    forced_arrivals: u64,
+}
+
+impl Reputations {
+    /// A store holding only `slots`, with nothing forced.
+    #[cfg(test)]
+    pub(crate) const fn from_slots(slots: Vec<(u8, i32)>) -> Self {
+        Self {
+            slots,
+            forced: Vec::new(),
+            forced_arrivals: 0,
+        }
+    }
+
+    /// `SMSG_SET_FORCED_REACTIONS`: the table replaces the last whole (`0x4d59a0`).
+    pub(crate) fn set_forced(&mut self, table: Vec<(u32, u32)>) {
+        self.forced = table;
+        self.forced_arrivals += 1;
+    }
+
+    /// Drops the table: the reference's teardown zeroes the count (`0x4d5419`).
+    pub(crate) fn clear_forced(&mut self) {
+        self.forced.clear();
+    }
+
+    /// The tables that have arrived so far.
+    pub(crate) fn forced_arrivals(&self) -> u64 {
+        self.forced_arrivals
+    }
+}
 
 /// The hearthstone bind point (`SMSG_BINDPOINTUPDATE`): the AreaTable id the tooltip's `$z`
 /// token names.
@@ -730,47 +761,6 @@ pub(crate) struct PlayedTimeAnswer(pub(crate) Option<(u32, u32)>);
 /// bitmask, the client's `0xc4d4a0[class]` store.
 #[derive(Resource, Default)]
 pub(crate) struct Proficiencies(pub(crate) std::collections::HashMap<u32, u32>);
-
-/// The in-game clock from `SMSG_LOGIN_SETTIMESPEED`: the server's `localtime()`, advancing at
-/// `timescale` game-minutes per real second (vmangos about `0.01667`, real time).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct GameTime {
-    /// Minute of the game day (`0..1440`) at `received`.
-    base_minute: u32,
-    /// Day serial of the packed date, `year*372 + month*31 + day`; only differences matter.
-    base_day: u32,
-    timescale: f32,
-    received: Instant,
-}
-
-impl GameTime {
-    pub(crate) fn new(hours: u8, minutes: u8, day_serial: u32, timescale: f32) -> Self {
-        Self {
-            base_minute: hours as u32 * 60 + minutes as u32,
-            base_day: day_serial,
-            timescale,
-            received: Instant::now(),
-        }
-    }
-
-    /// Current minute of the game day (`0..1440`).
-    pub(crate) fn minute_of_day(&self) -> u32 {
-        self.minute_of_day_f32() as u32
-    }
-
-    /// Current fractional minute of the game day, so the sky bodies move without steps.
-    pub(crate) fn minute_of_day_f32(&self) -> f32 {
-        let elapsed = self.received.elapsed().as_secs_f32() * self.timescale;
-        (self.base_minute as f32 + elapsed).rem_euclid(1440.0)
-    }
-
-    /// Days and day fraction since the serial epoch, unwrapped, for the moon phase
-    /// `(dayCounter + todPhase) mod 1.7` (`0x6d41b9`); `f64` for sub-minute grain at ~12k days.
-    pub(crate) fn day_continuous(&self) -> f64 {
-        let elapsed = self.received.elapsed().as_secs_f64() * self.timescale as f64;
-        self.base_day as f64 + (self.base_minute as f64 + elapsed) / 1440.0
-    }
-}
 
 // ── Outbound commands + one-shot inbound events ──────────────────────────────────────────────────
 
@@ -903,7 +893,7 @@ pub(crate) static CAST_TRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("WOW_CAST_TRACE").is_ok());
 
 /// A message to the server through the write thread, carrying any pose it needs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ClientCommand {
     /// A self-movement packet. Each tail is written iff its flag is set (`JUMPING`, `SWIMMING`,
     /// `ON_TRANSPORT`): a flag without its tail desyncs the server's parse.
@@ -1078,6 +1068,10 @@ pub(crate) enum ClientCommand {
         slot: u8,
         count: u8,
     },
+    /// `CMSG_EMOTE`: a one-shot emote, the wave a placed bid sends (`0x4cc5dd`-`0x4cc60c`).
+    Emote {
+        emote: u32,
+    },
     /// `CMSG_TEXT_EMOTE`; our own sound and animation ride the `SMSG_TEXT_EMOTE` echo.
     TextEmote {
         text_id: u32,
@@ -1130,6 +1124,14 @@ pub(crate) enum ClientCommand {
         pet_guid: u64,
         packed: u32,
         target_guid: u64,
+    },
+    /// `CMSG_PET_CAST_SPELL`: a cast the ladder sent with the pet or a possessed unit as its
+    /// caster (`SendCast 0x6e54f0`, `0x6e5816`), the bar's client-targeted and possessed presses
+    /// (`0x4bd385`). A refusal comes back as `SMSG_PET_CAST_FAILED`.
+    PetCastSpell {
+        caster_guid: u64,
+        spell_id: u32,
+        target: benilla_protocol::messages::UseItemTarget,
     },
     /// `CMSG_PET_SET_ACTION`: one or two `(position, word)` pairs. The bar's autocast toggle is
     /// one entry with bit 30 flipped.
@@ -1198,11 +1200,12 @@ pub(crate) enum ClientCommand {
     GossipHello {
         guid: u64,
     },
-    /// `CMSG_GOSSIP_SELECT_OPTION` with the line's `index`. No code is ever sent: coded options
-    /// are not selectable.
+    /// `CMSG_GOSSIP_SELECT_OPTION` with the line's `index`, and the code a coded option was
+    /// given.
     GossipSelectOption {
         guid: u64,
         option: u32,
+        code: Option<Vec<u8>>,
     },
     /// `CMSG_NPC_TEXT_QUERY`, asked once per `text_id` on menu receipt.
     NpcTextQuery {
@@ -1262,6 +1265,25 @@ pub(crate) enum ClientCommand {
     },
     /// `CMSG_GMTICKET_GETTICKET`: `GetGMTicket()`.
     GmTicketGet,
+    /// `CMSG_SKILL_BUY_STEP`: `BuySkillTier`, the skill line id.
+    SkillBuyStep {
+        skill_id: u32,
+    },
+    /// `CMSG_LOTTERY_QUERY_OBSOLETE`: `GetLastLotteryNumbers()`.
+    LotteryQuery,
+    /// `CMSG_BUY_LOTTERY_TICKET_OBSOLETE`: `BuyRandomPicks` is `(count, 0)`, `SubmitNumbers`
+    /// `(0, mask)`.
+    BuyLotteryTicket {
+        first: u32,
+        second: u32,
+    },
+    /// `CMSG_GMSURVEY_SUBMIT`: `GMSurveySubmit()`, the survey id, each answered question as
+    /// `(question id, rating, comment)` and the overall comment.
+    GmSurveySubmit {
+        survey: u32,
+        answers: Vec<(u32, u8, String)>,
+        comment: String,
+    },
     /// `CMSG_GMTICKET_DELETETICKET`.
     GmTicketDelete,
     /// `CMSG_GMTICKET_SYSTEMSTATUS`: `GetGMStatus()`.
@@ -1469,6 +1491,12 @@ pub(crate) enum ClientCommand {
         spell_id: u32,
         item_guid: u64,
     },
+    /// A cast at the partner's trade slot `slot` (`TARGET_FLAG_TRADE_ITEM`, the bind of
+    /// `0x6e6900`).
+    CastSpellTradeItem {
+        spell_id: u32,
+        slot: u8,
+    },
     /// `CMSG_LOOT` on a unit; the server rejects a GameObject guid, which loots by `GameObjUse`.
     Loot {
         guid: u64,
@@ -1601,6 +1629,7 @@ pub(crate) enum ClientCommand {
     MailCreateTextItem {
         mailbox: u64,
         mail_id: u32,
+        template_id: u32,
     },
     /// `CMSG_ITEM_TEXT_QUERY`, once per mail with a nonzero `item_text_id`.
     ItemTextQuery {
@@ -1688,8 +1717,10 @@ pub(crate) enum ClientCommand {
     /// `CMSG_BUSY_TRADE` (`0x118`, sent by `0x5d4150`): five of the ladder's eight refusal legs;
     /// vmangos sends `TRADE_STATUS_BUSY` to both. The player's own No is [`Self::CancelTrade`].
     BusyTrade,
-    /// `CMSG_ACCEPT_TRADE`: the Trade button.
-    AcceptTrade,
+    /// `CMSG_ACCEPT_TRADE`: the Trade button, with the partner's last extended-status flag.
+    AcceptTrade {
+        flag: u32,
+    },
     /// `CMSG_UNACCEPT_TRADE`: drop our accept, stay in the trade.
     UnacceptTrade,
     /// `CMSG_CANCEL_TRADE`.
@@ -1852,6 +1883,10 @@ pub(crate) enum ClientCommand {
     GroupUninvite {
         name: String,
     },
+    /// `CMSG_GROUP_UNINVITE_GUID`, leader only: the kick for a player whose object is not held.
+    GroupUninviteGuid {
+        guid: u64,
+    },
     /// `CMSG_GROUP_SET_LEADER`, leader only.
     GroupSetLeader {
         guid: u64,
@@ -1876,6 +1911,9 @@ pub(crate) enum ClientCommand {
         icon: u8,
         guid: u64,
     },
+    /// `MSG_RAID_TARGET_UPDATE` with the byte 0xff alone, the request for every icon, which a raid
+    /// list sends on finding no roster held (`0x4babf4`-`0x4bac33`).
+    RequestRaidTargets,
     /// `MSG_MINIMAP_PING`, raw world `(x, y)`. The server relays it to the rest of the group and
     /// ignores it solo, so our own marker is drawn locally.
     MinimapPing {
@@ -1900,9 +1938,9 @@ pub(crate) enum ClientCommand {
     },
     /// `MSG_RAID_READY_CHECK` with an empty body, leader only.
     ReadyCheckStart,
-    /// `MSG_RAID_READY_CHECK` with one byte.
+    /// `MSG_RAID_READY_CHECK` with one byte, the status.
     ReadyCheckAnswer {
-        ready: bool,
+        status: u8,
     },
     /// `CMSG_REQUEST_RAID_INFO`.
     RequestRaidInfo,
@@ -1928,6 +1966,11 @@ pub(crate) enum ClientCommand {
     SetLookingForGroup {
         slots: [u32; 3],
         comment: String,
+    },
+    /// `MSG_LOOKING_FOR_GROUP`: `LFGQuery`'s inquiry.
+    LfgQuery {
+        criterion: u32,
+        class: u32,
     },
     /// `CMSG_DEL_FRIEND`.
     DelFriend {
@@ -1957,6 +2000,32 @@ pub(crate) enum ClientCommand {
     ToggleHelm,
     /// `CMSG_TOGGLE_CLOAK`, as [`Self::ToggleHelm`].
     ToggleCloak,
+    // ── The console's own sends ── (vmangos acts on them for administrators alone)
+    /// `MSG_MOVE_TELEPORT_CHEAT`: the `port x y` command.
+    TeleportCheat {
+        pos: [f32; 3],
+        facing: f32,
+    },
+    /// `CMSG_TELEPORT_TO_UNIT`: the `port <name>` command's whole argument text.
+    TeleportToUnit {
+        text: String,
+    },
+    /// `CMSG_MOVE_SET_RAW_POSITION`: the `setrawpos` command.
+    SetRawPosition {
+        pos: [f32; 3],
+        facing: f32,
+    },
+    /// `CMSG_WORLD_TELEPORT`: the `worldport` command, with the client's millisecond clock.
+    WorldTeleport {
+        time_ms: u32,
+        map: u32,
+        pos: [f32; 3],
+        facing: f32,
+    },
+    /// `CMSG_WHOIS`: the `whois` command's whole argument text.
+    Whois {
+        text: String,
+    },
     // ── Guild ──
     // Members by name; rank 0 is the guild master. A change is answered by a fresh
     // `SMSG_GUILD_ROSTER`, never applied at the send; a refusal by `SMSG_GUILD_COMMAND_RESULT`.
@@ -2111,8 +2180,7 @@ pub(crate) struct RealmListMessage {
     pub(crate) failed: bool,
 }
 
-/// The character roster (`SMSG_CHAR_ENUM`); the IO thread waits for [`crate::char_select`] to
-/// pick. `realm` is the realm this session connected to.
+/// The character roster (`SMSG_CHAR_ENUM`); the IO thread waits for the select screen to pick. `realm` is the realm this session connected to.
 #[derive(Message)]
 pub(crate) struct CharListMessage {
     pub(crate) characters: Vec<benilla_protocol::Character>,
@@ -2121,8 +2189,6 @@ pub(crate) struct CharListMessage {
     pub(crate) cause: benilla_protocol::RosterCause,
     /// The world session that sent it ([`WorldAuthMessage::epoch`]).
     pub(crate) epoch: u64,
-    /// The abandon generation of the attempt that dialed that session.
-    pub(crate) generation: u64,
 }
 
 /// The world server accepted the authentication: the world connect to `realm` is done and the IO
@@ -2168,7 +2234,7 @@ pub(crate) struct CharRenameMessage {
 }
 
 /// `SMSG_CHARACTER_LOGIN_FAILED`: the picked character was refused. `result` is the raw reason,
-/// read by [`crate::char_select::char_login_refusal_text`].
+/// read by the glue manager ([`crate::ui_script::glue_mgr`]).
 #[derive(Message, Clone, Copy)]
 pub(crate) struct CharacterLoginFailedMessage {
     pub(crate) result: u8,
@@ -2177,8 +2243,6 @@ pub(crate) struct CharacterLoginFailedMessage {
 /// We entered the world.
 #[derive(Message)]
 pub(crate) struct EnteredWorldMessage {
-    /// Rested billing minutes from `SMSG_AUTH_RESPONSE`, the only time they arrive.
-    pub(crate) billing_time_rested: u32,
     /// The tutorial flags, if `SMSG_TUTORIAL_FLAGS` came during the login handshake.
     pub(crate) tutorial_flags: Option<Vec<u8>>,
 }
@@ -2194,6 +2258,12 @@ pub(crate) struct WorldEnterCascadeMessage;
 /// rewritten on every login from the reply its link got.
 #[derive(Resource, Default)]
 pub(crate) struct AddonInfoReply(pub(crate) Option<Vec<benilla_protocol::messages::AddonRecord>>);
+
+/// The connection's billing group, from its authentication alone (`0x5b41b0`); a resource for the
+/// same reason as [`AddonInfoReply`], rewritten at every login. The in-game `GetBillingTimeRested`
+/// and [`crate::ui_billing`]'s warning read it.
+#[derive(Resource, Default, Clone, Copy)]
+pub(crate) struct SessionBilling(pub(crate) benilla_protocol::messages::Billing);
 
 /// `SMSG_TRIGGER_CINEMATIC`: a `CinematicSequences.dbc` id; [`crate::cinematic`] plays and acks it.
 #[derive(Message)]
@@ -2255,16 +2325,11 @@ impl DisconnectedMessage {
 }
 
 /// A login attempt failed before the roster; the IO thread is back at its pre-logon park.
-/// `terminal` is a failure retrying cannot fix (the server requires Warden, say): never resubmit.
 #[derive(Message, Clone)]
 pub(crate) struct LoginFailedMessage {
     /// Which server refused us, with which byte; `None` on a transport failure.
     pub(crate) refusal: Option<benilla_protocol::LoginRefusal>,
     pub(crate) reason: String,
-    pub(crate) terminal: bool,
-    /// The dial that never opened a socket, so the screen can tell an unknown name from a host
-    /// that does not answer.
-    pub(crate) dial: Option<benilla_protocol::DialFailure>,
 }
 
 /// A same-map teleport of our player: snap, then ack. Read by the controller in `Input`.
@@ -2421,7 +2486,8 @@ pub(crate) struct PetDismissSoundMessage {
 mod tests {
     use super::*;
 
-    /// A re-create of a live object notifies like a delta.
+    /// The write's edges: one per moved dword, none for a first create; a re-create replaces the
+    /// store, clearing what it omits (`0x466582`).
     #[test]
     fn the_merge_emits_one_edge_per_moved_dword_and_none_for_a_first_create() {
         use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL};
@@ -2451,9 +2517,11 @@ mod tests {
             unit,
             ObjectFields::from_pairs(&[(FIELD_UNIT_LEVEL, 9), (FIELD_UNIT_HEALTH, 0)]),
         );
+        let edges = drain(&mut world);
         assert_eq!(
-            drain(&mut world),
+            edges,
             vec![FieldChanged {
+                at: edges[0].at,
                 entity: unit,
                 guid: 0xF130_0000_0000_0042,
                 kind: ObjectType::Unit,

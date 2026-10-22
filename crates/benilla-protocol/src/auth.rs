@@ -34,22 +34,10 @@ const fn client_os() -> u32 {
         OS_WINDOWS
     }
 }
-const LOCALE_EN_US: u32 = 0x656e_5553; // "enUS"
 
-/// iNilla: the locale the logon challenge reports — the game data's language. realmd stores it on
-/// the account and mangosd picks the text it sends by it (quests, items, creatures from its
-/// `locales_*` tables), so a German install gets the server's German too.
-static CLIENT_LOCALE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(LOCALE_EN_US);
-
-/// iNilla: report `locale` (`deDE`, four ASCII letters) at the next logon. Anything else is ignored.
-pub fn set_client_locale(locale: &str) {
-    if let Ok(b) = <[u8; 4]>::try_from(locale.as_bytes()) {
-        if b.iter().all(u8::is_ascii_alphabetic) {
-            CLIENT_LOCALE.store(u32::from_be_bytes(b), std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
+/// The enUS locale tag, for the tools that log in with no install of their own to read one from;
+/// the client sends its install's ([`write_logon_challenge`]).
+pub const LOCALE_TAG_EN_US: u32 = u32::from_be_bytes(*b"enUS");
 
 /// A non-success auth result byte, typed so the app can map it to its `AUTH_*` glue string; it
 /// survives [`crate::logon`]'s `anyhow` contexts via `downcast_ref`. vmangos answers an unknown
@@ -60,6 +48,15 @@ pub struct AuthReject {
     pub code: u8,
     /// Which reply carried it: the reference handles a byte by its reply, swallowing a proof's
     /// `0x0A` (`0x5bada2`) where a challenge's reaches the patch state.
+    ///
+    /// Deviation: the patch state downloads no patch and starts no updater, because benilla runs
+    /// no code a server sends. There the reference takes the server's transfer into
+    /// `wow-patch.mpq` (`0x474610`), runs the archive's `prepatch.lst`, whose `execute` lines start
+    /// its programs (`0x474820`), and quits (`0x46b870`). The rule covers the system survey
+    /// ([`read_proof_reply`]) and Warden ([`crate::WorldSession::recv`]) too: each is native code
+    /// the server picks for the original client, which benilla cannot run on its three platforms
+    /// and would not run if it could. A fork that wants any of them builds it on top of the
+    /// decoded wire.
     pub reply: LogonReply,
 }
 
@@ -96,11 +93,14 @@ pub struct ChallengeReply {
 }
 
 /// Send `CMD_AUTH_LOGON_CHALLENGE_Client`. `account_name` must be uppercased, as the SRP6 hashes
-/// use it; `build` is 5875.
+/// use it; `build` is 5875. `locale` is the client's locale tag, `[0xc2a2a4]` (`0x5b2115`): the
+/// configured string packed big-endian, written like the other tags as a little-endian dword, so
+/// "enGB" reaches the wire as `B G n e`.
 pub fn write_logon_challenge(
     w: &mut impl Write,
     account_name: &str,
     build: u16,
+    locale: u32,
 ) -> std::io::Result<()> {
     // Everything after the 2-byte size field, assembled first so we can prefix its length.
     let mut body = Vec::with_capacity(34 + account_name.len());
@@ -111,11 +111,7 @@ pub fn write_logon_challenge(
     body.extend_from_slice(&build.to_le_bytes());
     body.extend_from_slice(&PLATFORM_X86.to_le_bytes());
     body.extend_from_slice(&client_os().to_le_bytes());
-    body.extend_from_slice(
-        &CLIENT_LOCALE
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .to_le_bytes(),
-    );
+    body.extend_from_slice(&locale.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // utc_timezone_offset
     body.extend_from_slice(&Ipv4Addr::LOCALHOST.octets()); // client_ip_address (network order)
     body.push(account_name.len() as u8);
@@ -286,6 +282,10 @@ pub fn read_proof_reply(r: &mut impl Read) -> Result<Option<[u8; 20]>> {
         .into());
     }
     let server_proof = read_array::<20>(r)?;
+    // Deviation: the survey id is read and dropped, and no survey runs, where the reference keeps
+    // it on the link (`0x5bad53`) for the `Survey.dll` it downloads and calls (`GetSurveyId
+    // 0x5ab620`, passed at `0x47404f`). benilla runs no code a server sends
+    // ([`AuthReject::reply`] gives the rule).
     let _hardware_survey_id = read_u32_le(r)?;
     Ok(Some(server_proof))
 }
@@ -306,9 +306,25 @@ pub(crate) const MAGIC_POPULATIONS: [(u32, u32, u8); 3] = [
     (0x43c8_0000, 0x4100_0000, 0x80), // 400.0 → 8.0,   Full
 ];
 
+/// The characters the realm record fill (`0x5b2230`) turns into spaces in a realm name: those
+/// `0x5b2450` maps to the case that stores a space (`0x5b2391`).
+const NAME_FORBIDDEN: &str = "\"*/:<>?\\|";
+
+/// A realm name as the record fill leaves it: each of [`NAME_FORBIDDEN`] becomes a space
+/// (`0x5b2376`-`0x5b2391`), then the trailing spaces and dots are cut (`0x5b23a6`-`0x5b23c5`,
+/// through `0x5b24b0` with its trailing flag set).
+fn clean_realm_name(name: &str) -> String {
+    let spaced: String = name
+        .chars()
+        .map(|c| if NAME_FORBIDDEN.contains(c) { ' ' } else { c })
+        .collect();
+    spaced.trim_end_matches([' ', '.']).to_string()
+}
+
 /// Read `CMD_REALM_LIST_Server` into the advertised realms, rewriting [`MAGIC_POPULATIONS`] here
 /// as the reference parser does: the realm-list screen averages every realm's population, and an
-/// unswapped Recommended `600.0` would skew that mean for every row.
+/// unswapped Recommended `600.0` would skew that mean for every row. Each name is cleaned
+/// ([`clean_realm_name`]) before anything shows it.
 pub fn read_realm_list(r: &mut impl Read) -> Result<Vec<RealmInfo>> {
     let opcode = read_u8(r)?;
     if opcode != CMD_REALM_LIST {
@@ -336,7 +352,7 @@ pub fn read_realm_list(r: &mut impl Read) -> Result<Vec<RealmInfo>> {
             flags |= bit;
         }
         realms.push(RealmInfo {
-            name,
+            name: clean_realm_name(&name),
             address,
             population,
             characters,
@@ -364,6 +380,30 @@ mod tests {
         assert_eq!(spelled(OS_WINDOWS), "Win");
         assert_eq!(spelled(OS_MACOS), "OSX");
         assert_eq!(spelled(PLATFORM_X86), "x86");
+    }
+
+    /// The whole challenge for account `AB` on an enGB install: the locale tag as `0x5b2115` loads
+    /// it, `0x656e4742`, goes out little-endian like `'WoW'` and `'x86'` (benilla-re
+    /// `net/login#logon-challenge`).
+    #[test]
+    fn the_challenge_carries_the_locale_tag() {
+        let mut out = Vec::new();
+        write_logon_challenge(&mut out, "AB", 5875, u32::from_be_bytes(*b"enGB")).unwrap();
+        let mut want = vec![
+            0x00, 0x03, 0x20, 0x00, // command, protocol 3, 32 bytes follow
+            b'W', b'o', b'W', 0x00, // game
+            1, 12, 1, // version
+            0xf3, 0x16, // build 5875
+            b'6', b'8', b'x', 0x00, // platform
+        ];
+        want.extend_from_slice(&client_os().to_le_bytes());
+        want.extend_from_slice(&[
+            b'B', b'G', b'n', b'e', // locale "enGB"
+            0, 0, 0, 0, // time zone
+            127, 0, 0, 1, // address
+            2, b'A', b'B', // account
+        ]);
+        assert_eq!(out, want);
     }
 
     #[test]
@@ -490,5 +530,63 @@ mod tests {
         let plain = one(1.5);
         assert_eq!(plain.flags, 0x02);
         assert_eq!(plain.population, 1.5);
+    }
+
+    /// A one-realm `CMD_REALM_LIST_Server` named `name`, whose address is `127.0.0.1:8085`.
+    fn realm_named(name: &[u8]) -> RealmInfo {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(0);
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend_from_slice(b"127.0.0.1:8085\0");
+        body.extend_from_slice(&1.5f32.to_le_bytes());
+        body.extend_from_slice(&[0, 1, 0]);
+        let mut packet = vec![CMD_REALM_LIST];
+        packet.extend_from_slice(&(body.len() as u16 + 3).to_le_bytes());
+        packet.extend_from_slice(&0u32.to_le_bytes());
+        packet.push(1);
+        packet.extend_from_slice(&body);
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        read_realm_list(&mut packet.as_slice()).unwrap().remove(0)
+    }
+
+    /// The realm record fill (`0x5b2230`) turns each of `"*/:<>?\|` in a name into a space
+    /// (`0x5b2376`-`0x5b2391`, the table `0x5b2450`) and leaves every other character: the other
+    /// punctuation, the dot and the space inside a name, and bytes past `0x7c`.
+    #[test]
+    fn a_realm_name_loses_the_nine_characters_a_file_name_cannot_hold() {
+        for c in "\"*/:<>?\\|".chars() {
+            assert_eq!(
+                realm_named(format!("A{c}B").as_bytes()).name,
+                "A B",
+                "{c:?}"
+            );
+        }
+        let kept = "A!#$%&'()+,-;=@[]^_`{}~B C.D";
+        assert_eq!(realm_named(kept.as_bytes()).name, kept);
+        assert_eq!(realm_named("Königreich Å".as_bytes()).name, "Königreich Å");
+    }
+
+    /// Trailing spaces and dots are cut (`0x5b23a6`-`0x5b23c5` through `0x5b24b0` with its
+    /// trailing flag set), after the nine characters became spaces: `Test:Realm.` lists as
+    /// `Test Realm`, and a name of nothing but those characters lists empty.
+    #[test]
+    fn a_realm_name_loses_its_trailing_spaces_and_dots() {
+        let cleaned = |name: &str| realm_named(name.as_bytes()).name;
+        assert_eq!(cleaned("Test:Realm."), "Test Realm");
+        assert_eq!(cleaned("Realm. . "), "Realm");
+        assert_eq!(cleaned("Realm:"), "Realm");
+        assert_eq!(cleaned("A:."), "A");
+        assert_eq!(cleaned("Königreich:"), "Königreich");
+        assert_eq!(cleaned("..."), "");
+        assert_eq!(cleaned("*|"), "");
+        assert_eq!(cleaned(" Lead.dot"), " Lead.dot", "only the end is cut");
+    }
+
+    /// Only the name is cleaned: the address keeps its colon, so the dial still has its port.
+    #[test]
+    fn the_address_is_not_cleaned() {
+        assert_eq!(realm_named(b"R").address, "127.0.0.1:8085");
     }
 }

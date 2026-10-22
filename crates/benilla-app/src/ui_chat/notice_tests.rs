@@ -17,14 +17,14 @@ const BOB: u64 = 0x12;
 
 /// A world holding everything [`super::feed::feed_chat`] reads, the stock chat stack in its VM,
 /// `ChatFrame1` carrying `Mychan`, and our slots `World`, `Trade - City` and `Mychan` (3).
-struct Feed {
-    world: World,
+pub(super) struct Feed {
+    pub(super) world: World,
     /// The outbound side of `NetCommands`, where the name queries land.
     sent: crossbeam_channel::Receiver<crate::net::ClientCommand>,
 }
 
 impl Feed {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let s = chat_vm();
         s.run(SPY).unwrap();
         s.run(
@@ -47,7 +47,7 @@ impl Feed {
 
         let mut channels = super::edit::ChannelState::default();
         for name in ["World", "Trade - City", "Mychan"] {
-            channels.claim_slot(name);
+            channels.claim_slot(name, channels.channels.zone_channel_id(name));
         }
         let (tx, sent) = crossbeam_channel::unbounded();
 
@@ -66,6 +66,7 @@ impl Feed {
         world.insert_resource(crate::world_state::WorldStates::default());
         world.insert_resource(super::language::ChatLanguages::default());
         world.insert_resource(crate::items::Items::default());
+        world.insert_resource(crate::go_templates::GameObjectTemplates::default());
         world.insert_resource(crate::text_filter::TextFilter::default());
         world.insert_resource(crate::text_filter::TextFilterSwitches::default());
         Feed { world, sent }
@@ -84,11 +85,11 @@ impl Feed {
     }
 
     /// One frame of the drain.
-    fn drain(&mut self) {
+    pub(super) fn drain(&mut self) {
         self.world.run_system_once(super::feed::feed_chat).unwrap();
     }
 
-    fn script(&self) -> &UiScript {
+    pub(super) fn script(&self) -> &UiScript {
         self.world.non_send_resource::<UiScript>()
     }
 
@@ -250,4 +251,40 @@ fn our_own_join_notice_is_unchanged() {
     );
     assert_eq!(f.lines(), before + 1);
     assert_eq!(f.last_added(), "Joined Channel: [3. Mychan]");
+}
+
+/// A chat line and a channel notice look their names up with the callback `0x49ccc0` at their
+/// packet (`0x49d77f`, `0x49c50d`); the drains they wait through read. A refused name is asked
+/// by no drain after it, only by the next packet that names its player.
+#[test]
+fn a_refused_chat_name_is_asked_by_the_next_packet_never_by_a_drain() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut f = Feed::new();
+    let packets = |f: &mut Feed| {
+        f.world.resource_mut::<super::ChatLog>().push_wire(
+            benilla_protocol::messages::ChatMessage {
+                chat_type: 0x00,
+                language: 0,
+                sender_guid: ANN,
+                target_guid: 0,
+                sender_name: None,
+                channel: None,
+                text: "hello".into(),
+                chat_tag: 0,
+            },
+        );
+        f.push(n::JOINED, "Mychan", ChannelNoticeTail::Guid(BOB));
+        f.drain();
+    };
+    let asked = |f: &Feed| crate::query_cache::queries(&f.sent).len();
+    packets(&mut f);
+    assert_eq!(asked(&f), 2, "the speaker and the joiner");
+    f.name(ANN, "");
+    f.name(BOB, "");
+    for _ in 0..600 {
+        f.drain();
+    }
+    assert_eq!(asked(&f), 0, "no drain asks a refusal");
+    packets(&mut f);
+    assert_eq!(asked(&f), 2, "the next packets ask again");
 }

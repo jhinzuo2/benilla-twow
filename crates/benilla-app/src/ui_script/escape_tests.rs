@@ -15,8 +15,12 @@ fn one_item_backpack() -> ContainerState {
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
+            bonding: 0,
+            use_spell: 0,
             bar_placeable: true,
             consumable: false,
             durability: None,
@@ -31,12 +35,17 @@ fn one_item_backpack() -> ContainerState {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     ContainerState {
-        name: Some("Backpack".into()),
+        name: None,
         num_slots: 16,
         slots,
     }
@@ -48,6 +57,7 @@ fn one_item_backpack() -> ContainerState {
 fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // `LOOT_UI` whole: a missing `ItemButtonTemplate` is only a load warning, so it fails silently.
     for file in super::test_ui::production_order(&[
@@ -70,7 +80,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     s.run("MainMenuBarBackpackButton:Click()").unwrap();
     s.set_loot(Some(LootState {
         source_unit: false,
-        fishing: false,
+        has_money: false,
         master_candidates: Vec::new(),
         rows: vec![Some(LootRow {
             item_id: 0,
@@ -113,8 +123,9 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
         !s.eval::<bool>("return LootFrame:IsVisible()").unwrap(),
         "ESC hid the loot window"
     );
-    assert!(
-        s.take_loot_close(),
+    assert_eq!(
+        s.take_loot_calls(),
+        vec![benilla_ui::script::LootCall::Close { failed: false }],
         "closing the loot fired the release (OnHide → CloseLoot)"
     );
     // Stock `ToggleGameMenu` has no `ClearCursor` arm, so the held item survives ESC.
@@ -176,6 +187,7 @@ fn escape_is_consumed_by_a_focused_editbox_and_leaves_windows_open() {
 fn escape_closes_the_options_window_before_opening_the_menu() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
@@ -259,8 +271,12 @@ fn escape_closes_an_open_stack_split_frame() {
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
+            bonding: 0,
+            use_spell: 0,
             bar_placeable: true,
             consumable: false,
             durability: None,
@@ -275,14 +291,19 @@ fn escape_closes_an_open_stack_split_frame() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -315,6 +336,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
 
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -343,7 +365,10 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
     );
 
     // Press 0, mid-cast with a dropdown open: `CloseMenus` eats it.
-    s.set_casting(true);
+    s.set_cast_view(benilla_ui::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     // Stock `DropDownList` `OnShow` sizes its buttons from `maxWidth`, which
     // `UIDropDownMenu_Initialize` normally sets (`UIDropDownMenuTemplates.xml:237-245`).
     s.run("DropDownList1.maxWidth = 100 DropDownList1:Show()")
@@ -365,7 +390,10 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
     assert!(!s.take_target_clear());
 
     // Press 1, mid-cast: `SpellStopCasting` eats it.
-    s.set_casting(true);
+    s.set_cast_view(benilla_ui::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     s.run("ToggleGameMenu()").unwrap();
     assert!(
         bag_open(&s, 0),
@@ -381,7 +409,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
     );
 
     // Press 2, the cast over: `CloseAllWindows` eats it.
-    s.set_casting(false);
+    s.set_cast_view(Default::default());
     s.run("ToggleGameMenu()").unwrap();
     assert!(
         !bag_open(&s, 0),
@@ -415,11 +443,13 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
 }
 
 /// The `SpellStopTargeting` rung (`UIParent.lua:1490`) sits after the cast rung and before the
-/// windows; idle, both answer nil.
+/// windows; idle, both answer nil. The app pushes casting while the cursor is up, so the cast rung
+/// answers first there; press 1 is the script's state with only targeting set.
 #[test]
 fn escape_ladder_targeting_rung_after_cast_before_windows() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -457,8 +487,12 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
         "ESC while targeting must NOT also close windows"
     );
 
-    // Press 2, casting and targeting both (a state the app never pushes): the cast rung is first.
-    s.set_casting(true);
+    // Press 2, casting and targeting both (the state the app pushes while the cursor is up, the
+    // targeting spell being in flight): the cast rung is first.
+    s.set_cast_view(benilla_ui::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     s.run("ToggleGameMenu()").unwrap();
     assert!(s.take_spell_stop(), "the cast rung eats first");
     assert!(
@@ -467,7 +501,7 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
     );
 
     // Press 3, idle: both rungs answer nil and `CloseAllWindows` eats it.
-    s.set_casting(false);
+    s.set_cast_view(Default::default());
     s.set_spell_targeting(false);
     s.run("ToggleGameMenu()").unwrap();
     assert!(!s.take_stop_targeting(), "no stray trigger when idle");
@@ -484,6 +518,7 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
 fn an_addon_frame_registered_in_uispecialframes_closes_on_escape() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");

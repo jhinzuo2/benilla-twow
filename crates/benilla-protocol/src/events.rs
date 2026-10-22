@@ -14,7 +14,7 @@ use crate::messages::{
     QuestGiverList, QuestOfferReward, QuestRequestItems, QuestShareMsg, QuestTemplate,
     SpellDamageLog, SpellDispelLog, SpellEnergizeLog, SpellHealLog, SpellInstaKillLog,
     SpellLogExecute, SpellLogMiss, SpellOutcomeLog, StabledPet, TaxiMask, TradeStatus,
-    TradeStatusExtended, TrainerSpell, TransportPose, VendorItem, WhoResults, XpGain,
+    TradeStatusExtended, TrainerSpell, TransportPose, VendorItem, WhoResults, WowTime, XpGain,
 };
 
 /// Coarse entity classification, free of wire types, carried on [`SessionEvent::ObjectCreate`].
@@ -78,14 +78,12 @@ pub enum LoginStage {
 /// What a roster was fetched for. The screen takes a reply as its own only when it asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterCause {
-    /// The IO thread's own enumeration on reaching the character park, which the native screens
-    /// wait for; the stock screens ask for theirs instead.
-    Park,
+    /// A roster no ask of the screen's fetched: an `SMSG_CHAR_ENUM` the world stream carried on its
+    /// own.
+    Unasked,
     /// The reply to a roster request from the screen (`CMSG_CHAR_ENUM` for
     /// `GetCharacterListUpdate`, `0x5aabb0`).
     Asked,
-    /// A create or delete changed the roster; re-sent before the action's result.
-    Changed,
 }
 
 /// How a world session ended. On a loss the reference fires `DISCONNECTED_FROM_SERVER` and
@@ -121,6 +119,17 @@ impl LoginRefusal {
             LoginRefusal::Logon(b) | LoginRefusal::LogonProof(b) | LoginRefusal::World(b) => b,
         }
     }
+}
+
+/// The block an [`SessionEvent::ObjectNotify`] stands for in the notify pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotifyBlock {
+    /// A values block: the fields its mask sent, ascending (`0x465330`).
+    Values(Vec<u16>),
+    /// An item's or a container's create block (`0x465c50`).
+    ItemCreate,
+    /// A placed object's create block (`0x465c50`).
+    Create(EntityKind),
 }
 
 /// One decoded world-stream event; its fieldless twin [`SessionEventKind`] keys the handler table.
@@ -166,12 +175,10 @@ pub enum SessionEvent {
         position: Option<u32>,
         realm: Option<String>,
     },
-    /// A login failed before the roster; `refusal` is `None` for a transport failure. A `terminal`
-    /// one ([`crate::WardenRequired`]) no retry can fix: show `reason` and stop.
+    /// A login failed before the roster; `refusal` is `None` for a transport failure.
     LoginFailed {
         refusal: Option<LoginRefusal>,
         reason: String,
-        terminal: bool,
         /// `Some` only when the socket never opened: which dial failure, and the address.
         dial: Option<crate::DialFailure>,
     },
@@ -198,8 +205,8 @@ pub enum SessionEvent {
     Connected {
         self_guid: u64,
         name: String,
-        /// Rested billing minutes for `GetBillingTimeRested()`, sent once, at auth.
-        billing_time_rested: u32,
+        /// The connection's billing group, from its authentication alone.
+        billing: crate::messages::Billing,
         /// `SMSG_TUTORIAL_FLAGS` if it came during the handshake; `None` if it comes in-world.
         tutorial_flags: Option<Vec<u8>>,
         /// The `SMSG_ADDON_INFO` records. `None` is no reply at all, where the reference's
@@ -278,10 +285,25 @@ pub enum SessionEvent {
         jump: Option<JumpInfo>,
         transport: Option<TransportPose>,
     },
-    /// A descriptor `Values` delta, only the changed fields; never empty (the codec drops those).
+    /// A descriptor `Values` block: the fields it sends, possibly none.
     ObjectValues { guid: u64, fields: ObjectFields },
-    /// Left view range (`OutOfRange`); the reference keeps them in a staging table for re-create.
+    /// Left view range (`OutOfRange`), only as a packet's first block (`0x4651e1`); the reference
+    /// keeps them in a released table, fields and all, for a later block to bring back
+    /// (`0x464920`).
     ObjectsRemoved(Vec<u64>),
+    /// A near-objects block's guids of one pass: names the server sends as near, which brings a
+    /// released one back (`0x467230`).
+    ObjectsNear(Vec<u64>),
+    /// A first-pass block's place in the notify pass, which reads every block in packet order
+    /// (`0x46522d`): the values or create block of a top-nibble 6 or 8 guid
+    /// ([`crate::guid::first_pass`]), which the first pass wrote ahead of the packet's other
+    /// blocks, or no pass wrote, with the header byte clear.
+    ObjectNotify { guid: u64, block: NotifyBlock },
+    /// The end of one `SMSG_UPDATE_OBJECT`, plain or compressed: the object events since the last
+    /// one are its blocks, in the order its passes write them (`0x4651a0`): an out-of-range list
+    /// that comes first, the first pass's blocks, then the rest. The reference writes every block
+    /// of a packet before it notifies any.
+    ObjectUpdateEnd,
     /// `SMSG_DESTROY_OBJECT`: the reference frees it at once, no fade; a respawn is a fresh create.
     ObjectDestroyed(u64),
     /// `SMSG_TRIGGER_CINEMATIC`. Until `CMSG_COMPLETE_CINEMATIC` vmangos anchors visibility to the
@@ -332,14 +354,15 @@ pub enum SessionEvent {
     },
     /// `SMSG_TRANSFER_ABORTED`: the announced transfer is off (map full, no instance).
     TransferAborted { reason: u8 },
-    /// The server in-game clock (`SMSG_LOGIN_SETTIMESPEED`): drives time-of-day lighting.
-    TimeSpeed {
-        hours: u8,
-        minutes: u8,
-        /// `year·372 + month·31 + day` of the packed server date; the moon phase's input.
-        day_serial: u32,
-        timescale: f32,
-    },
+    /// The login clock (`SMSG_LOGIN_SETTIMESPEED`): the date the clock is set to and its rate,
+    /// as sent.
+    TimeSpeed { time: WowTime, speed: f32 },
+    /// `SMSG_GAMESPEED_SET`: the clock's rate, as sent.
+    GameSpeedSet { speed: f32 },
+    /// `SMSG_GAMETIME_UPDATE`: the date the clock syncs to.
+    GameTimeUpdate { time: WowTime },
+    /// `SMSG_GAMETIME_SET`: the date the clock is set to.
+    GameTimeSet { time: WowTime },
     /// The server's wall clock in unix seconds (`SMSG_QUERY_TIME_RESPONSE`), the base of absolute
     /// descriptor stamps: a timed quest's deadline is `time(nullptr) + limitTime`.
     ServerUnixTime { unix_time: u32 },
@@ -441,6 +464,8 @@ pub enum SessionEvent {
         rank: u32,
         /// Bit `0x10` hides the tooltip's faction-name line.
         type_flags: u32,
+        /// `CreatureSpellData.dbc` id of a tamed one's abilities, `0` for none.
+        pet_spell_list: u32,
         /// `CreatureDisplayInfo.dbc` id, to draw a creature with no world object (a stabled pet).
         display_id: u32,
         /// The tooltip's green CIVILIAN line.
@@ -449,7 +474,7 @@ pub enum SessionEvent {
         racial_leader: bool,
     },
     /// `SMSG_GAMEOBJECT_QUERY_RESPONSE`, keyed by template `entry`; `data` is the type-specific
-    /// raw tail. An unknown entry still fires, every field zero or empty.
+    /// raw tail.
     GameObjectInfo {
         entry: u32,
         type_id: u32,
@@ -457,6 +482,9 @@ pub enum SessionEvent {
         name: String,
         data: [i32; 24],
     },
+    /// `SMSG_GAMEOBJECT_QUERY_RESPONSE` for an entry the server does not know: the lone `entry`
+    /// with its top bit set, the refusal the template cache frees a node on (`0x5588e0`).
+    GameObjectUnknown { entry: u32 },
     /// `SMSG_GAMEOBJECT_CUSTOM_ANIM`: the reference arms substate `8 + anim_id`, AnimationData
     /// 153..156 (Custom0..3), and rejects `anim_id >= 4`. A fishing bobber's bite sends 0.
     GameObjectCustomAnim { guid: u64, anim_id: u32 },
@@ -624,7 +652,7 @@ pub enum SessionEvent {
         spell_id: u32,
         cast_flags: u16,
         hits: Vec<u64>,
-        misses: Vec<(u64, u8)>,
+        misses: Vec<crate::messages::SpellGoMiss>,
         target: Option<u64>,
         /// The GameObject an open-lock cast targets (`TARGET_FLAG_GAMEOBJECT`), a chest or door.
         go_target: Option<u64>,
@@ -634,6 +662,10 @@ pub enum SessionEvent {
         ammo_display_id: Option<u32>,
         /// The cast item when the first guid is not the caster; the item cooldown keys on it.
         item_caster: Option<u64>,
+        /// The packet's second guid as written, the caster unit (`m_casterUnit`): 0 for a
+        /// GameObject's cast (vmangos `Spell.cpp:4491`), where `caster` falls back to the first.
+        /// The miss list's reflect leg names it (`0x6e7dfd`).
+        unit_caster: u64,
     },
     /// A channeled beam's hops (`SMSG_SPELL_UPDATE_CHAIN_TARGETS`), consumed once by the next chain
     /// `CharProc`; the reference fills that `unit+0xd44` array from spell-go hits too (`0x6e800d`).
@@ -687,7 +719,7 @@ pub enum SessionEvent {
     ChannelUpdate { remaining_ms: u32 },
     /// Time left on one of our auras by `UNIT_FIELD_AURA` slot (`SMSG_UPDATE_AURA_DURATION`),
     /// never for a permanent one. It arrives before the delta naming the slot's spell.
-    AuraDuration { slot: u8, remaining_ms: u32 },
+    AuraDuration { slot: u8, remaining_ms: i32 },
     /// A spell-visual kit outside the cast sequence (`SMSG_PLAY_SPELL_VISUAL`), such as eat/drink.
     PlaySpellVisual { unit: u64, kit_id: u32 },
     /// Spell damage dealt (`SMSG_SPELLNONMELEEDAMAGELOG`).
@@ -854,8 +886,9 @@ pub enum SessionEvent {
     LootMoneyNotify { amount: u32 },
     /// The coin line disappears for every current looter (`SMSG_LOOT_CLEAR_MONEY`).
     LootClearMoney,
-    /// The loot window closes (`SMSG_LOOT_RELEASE_RESPONSE`), answering our `CMSG_LOOT_RELEASE`.
-    LootReleaseResponse { guid: u64 },
+    /// A loot release (`SMSG_LOOT_RELEASE_RESPONSE`), answering a `CMSG_LOOT_RELEASE`; `result`
+    /// is the wire byte, which the client reads as a gate.
+    LootReleaseResponse { guid: u64, result: u8 },
     /// A group roll opened on one drop (`SMSG_LOOT_START_ROLL`); its `rollID` is client-allocated.
     LootStartRoll(LootStartRoll),
     /// A vote or dice (`SMSG_LOOT_ROLL`); `LootRoll::is_dice`/`vote` split the overloaded pair.
@@ -906,6 +939,9 @@ pub enum SessionEvent {
     },
     /// Corpse reclaim delay (`SMSG_CORPSE_RECLAIM_DELAY`): 30 s, 60 or 120 s on repeated deaths.
     CorpseReclaimDelay { delay_ms: u32 },
+    /// An enemy took our insignia (`SMSG_PLAYER_SKINNED`): `PLAYER_SKINNED` with the byte's truth
+    /// (`0x5e7d40` → `0x48f400`).
+    PlayerSkinned { free_repop: bool },
     /// The 10% death durability loss (`SMSG_DURABILITY_DAMAGE_DEATH`, empty body): the red line.
     DurabilityDamageDeath,
     /// A resurrect offer (`SMSG_RESURRECT_REQUEST`), answered by `CMSG_RESURRECT_RESPONSE`.
@@ -1085,6 +1121,9 @@ pub enum SessionEvent {
         nearest_node: u32,
         known_mask: TaxiMask,
     },
+    /// `SMSG_SHOWTAXINODES` in mode 0, which names no flight master: the known nodes for the
+    /// console, and no map (`0x5ecf7f`).
+    TaxiNodesListed { known_mask: TaxiMask },
     /// Whether the flight master's nearest node is known (`SMSG_TAXINODE_STATUS`); also sent with
     /// [`Self::NewTaxiPath`] on a first visit (vmangos `SendLearnNewTaxiNode`).
     TaxiNodeStatus { guid: u64, known: bool },

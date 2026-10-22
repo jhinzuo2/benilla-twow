@@ -1,6 +1,5 @@
 //! The world handshake over a real socket against a fake server: packets may precede
-//! `SMSG_AUTH_RESPONSE`. Deviation: `SMSG_WARDEN_DATA` refuses the login, because benilla cannot
-//! answer Warden and the server kicks a client that stays silent about 30 s later.
+//! `SMSG_AUTH_RESPONSE`, `SMSG_WARDEN_DATA` among them, which benilla reads past unanswered.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -83,59 +82,46 @@ fn packets_ahead_of_the_auth_response_are_skipped() {
     assert!(WorldSession::connect(&addr, "one", SESSION_KEY).is_ok());
 }
 
+/// A Warden request ahead of the auth response is read past, unanswered, and the connect
+/// completes; the session remembers it was asked.
 #[test]
-fn a_warden_data_packet_does_not_end_the_handshake() {
+fn warden_data_ahead_of_the_auth_response_is_read_past() {
     let addr = fake_server(vec![(opcode::SMSG_WARDEN_DATA, vec![0u8; 16])]);
-    assert!(
-        WorldSession::connect(&addr, "one", SESSION_KEY).is_ok(),
-        "SMSG_WARDEN_DATA alone must not refuse the handshake — TurtleWoW sends it without enforcing it"
-    );
+    let session = WorldSession::connect(&addr, "one", SESSION_KEY).expect("the connect completes");
+    assert!(session.warden_asked());
 }
 
-/// Every packet the observer saw, with the thread that wrote it: the tests of this file share one
-/// process, so each filters for its own thread.
-static SEEN: std::sync::Mutex<Vec<(thread::ThreadId, u16, usize)>> =
-    std::sync::Mutex::new(Vec::new());
-
-fn record(opcode: u16, len: usize) {
-    SEEN.lock()
-        .unwrap()
-        .push((thread::current().id(), opcode, len));
-}
-
-/// A packet sent before the session splits (the handshake's `CMSG_AUTH_SESSION`, the world entry's
-/// `CMSG_PLAYER_LOGIN`) reaches the observer in write order, ahead of the writer's own.
+/// A queued login as vmangos writes it: the billing group on the first `AUTH_WAIT_QUEUE`
+/// (`World.cpp:374-381`), then a position and the closing `AUTH_OK` without it
+/// (`WorldSession.cpp:961-976`). The session keeps the group the queue gave.
 #[test]
-fn sends_before_the_split_are_observed_in_order() {
-    benilla_protocol::observe_sends(record);
-    let addr = fake_server(vec![]);
-    let mut session = WorldSession::connect(&addr, "one", SESSION_KEY).unwrap();
-    session.player_login(0x2a).unwrap();
-    let (_reader, mut writer) = session.into_split().unwrap();
-    writer.complete_cinematic().unwrap();
-    let me = thread::current().id();
-    let mine: Vec<(u16, usize)> = SEEN
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(t, ..)| *t == me)
-        .map(|&(_, op, len)| (op, len))
-        .collect();
-    let auth_len = messages::auth_session(
-        u32::from(benilla_protocol::CLIENT_BUILD),
-        "ONE",
-        0,
-        &[0; 20],
-        &messages::STOCK_SECURE_ADDONS,
-    )
-    .len();
+fn the_billing_group_of_the_queue_outlasts_the_bare_auth_ok() {
+    let addr = fake_server(vec![
+        (
+            opcode::SMSG_AUTH_RESPONSE,
+            // 45 minutes left, trial and restricted, 90 minutes rested, second in line.
+            [
+                &[messages::AUTH_WAIT_QUEUE][..],
+                &45u32.to_le_bytes(),
+                &[0x44],
+                &90u32.to_le_bytes(),
+                &2u32.to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        (
+            opcode::SMSG_AUTH_RESPONSE,
+            vec![messages::AUTH_WAIT_QUEUE, 0x01, 0x00, 0x00, 0x00],
+        ),
+    ]);
+    let session = WorldSession::connect(&addr, "one", SESSION_KEY).expect("the connect completes");
     assert_eq!(
-        mine,
-        [
-            (opcode::CMSG_AUTH_SESSION, auth_len),
-            (opcode::CMSG_PLAYER_LOGIN, messages::full_guid(0x2a).len()),
-            (opcode::CMSG_COMPLETE_CINEMATIC, 0),
-        ]
+        session.billing(),
+        messages::Billing {
+            time_remaining: 45,
+            plan_flags: 0x44,
+            time_rested: 90,
+        }
     );
 }
 

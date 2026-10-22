@@ -18,7 +18,7 @@ fn recipe(
         icon: Some(format!("Interface\\Icons\\Spell_{spell_id}")),
         min_made: 1,
         max_made: 1,
-        cooldown_secs: None,
+        cooldown: None,
         product_item: spell_id + 10_000,
         product_inv_type: 20, // Robe: folds to the Chest slot bit (4)
         // 0 everywhere, so ties fall through to the name; the ItemLevel test sets it.
@@ -233,10 +233,16 @@ fn do_trade_skill_and_getters_no_op_on_a_header_index() {
     assert!(s
         .eval::<bool>("return GetTradeSkillIcon(1) == nil")
         .unwrap());
+    // But the made counts, which answer 1, 1 on a header and past the last row (`0x4fdd13`).
     assert_eq!(
         s.eval::<(i64, i64)>("return GetTradeSkillNumMade(1)")
             .unwrap(),
-        (0, 0)
+        (1, 1)
+    );
+    assert_eq!(
+        s.eval::<(i64, i64)>("return GetTradeSkillNumMade(99)")
+            .unwrap(),
+        (1, 1)
     );
     assert!(s
         .eval::<bool>("return GetTradeSkillCooldown(1) == nil")
@@ -255,21 +261,95 @@ fn do_trade_skill_and_getters_no_op_on_a_header_index() {
         s.take_trade_skill_dos().is_empty(),
         "a header index queues no craft"
     );
+}
 
-    // A header index leaves the selection as it was.
-    s.run("SelectTradeSkill(2)").unwrap(); // "Alpha Bolt", row 2
-    assert_eq!(
+/// `SelectTradeSkill` (`0x4fd9b0` → `0x4fc9b0`) stores the row's spell id, and 0 when that id is
+/// not above 0 (`jg` at `0x4fc9c9`), so a header row (spell -1) clears the selection; so does an
+/// index past the rows, compared unsigned after `trunc(n) - 1` (`jae` at `0x4fc9b6`), 0 and a
+/// negative included.
+#[test]
+fn select_trade_skill_on_a_header_or_past_the_rows_clears_the_selection() {
+    let mut s = UiScript::new().unwrap();
+    s.set_trade_skill(Some(state()));
+    let selected = |s: &UiScript| {
         s.eval::<i64>("return GetTradeSkillSelectionIndex()")
-            .unwrap(),
-        2
-    );
-    s.run("SelectTradeSkill(1)").unwrap(); // row 1 is a header
-    assert_eq!(
-        s.eval::<i64>("return GetTradeSkillSelectionIndex()")
-            .unwrap(),
-        2,
-        "a header index never clears or changes the selection"
-    );
+            .unwrap()
+    };
+    // Rows 1 and 4 are the "Bolts" and "Armor Kit" headers; there are 10 rows.
+    for call in [
+        "SelectTradeSkill(1)",
+        "SelectTradeSkill(4)",
+        "SelectTradeSkill(0)",
+        "SelectTradeSkill(-1)",
+        "SelectTradeSkill(11)",
+    ] {
+        s.run("SelectTradeSkill(2)").unwrap(); // "Alpha Bolt"
+        assert_eq!(selected(&s), 2);
+        s.run(call).unwrap();
+        assert_eq!(selected(&s), 0, "{call}");
+    }
+    // A numeric string truncates as `_ftol` does: "3.9" is row 3, "Beta Bolt".
+    s.run("SelectTradeSkill('3.9')").unwrap();
+    assert_eq!(selected(&s), 3);
+    // The header cleared the spell id (`0xbde044`) itself, so a re-push brings nothing back.
+    s.run("SelectTradeSkill(1)").unwrap();
+    s.set_trade_skill(Some(state()));
+    assert_eq!(selected(&s), 0);
+}
+
+/// The fold verbs (`0x5000c0`, `0x500140`) read `trunc(index) - 1`: below 0 (`jns` at `0x5000f5`
+/// and `0x500175`) folds or unfolds every group; otherwise `0x4fd650` must find a header row
+/// there, and a recipe row or an index past the rows raises the verb's own line (`0x84e890`,
+/// `0x84e8e8`) before any update.
+#[test]
+fn the_fold_verbs_raise_on_a_row_that_is_no_header_and_fold_every_group_below_one() {
+    use crate::script::tick::heard;
+    let mut s = UiScript::new().unwrap();
+    s.set_trade_skill(Some(state()));
+    heard::listen(&s, &["TRADE_SKILL_UPDATE"], None);
+    let err = |s: &UiScript, call: &str| {
+        s.eval::<String>(&format!(
+            "local ok, e = pcall(function() {call} end) return ok and 'ok' or tostring(e)"
+        ))
+        .unwrap()
+    };
+    let rows = |s: &UiScript| s.eval::<i64>("return GetNumTradeSkills()").unwrap();
+    // Row 2 is "Alpha Bolt"; there are 10 rows.
+    for (call, text) in [
+        (
+            "CollapseTradeSkillSubClass(2)",
+            "Bad sub class in CollapseTradeSkillSubClass",
+        ),
+        (
+            "CollapseTradeSkillSubClass(11)",
+            "Bad sub class in CollapseTradeSkillSubClass",
+        ),
+        (
+            "ExpandTradeSkillSubClass(2)",
+            "Bad skill line in ExpandTradeSkillSubClass",
+        ),
+        (
+            "ExpandTradeSkillSubClass(11)",
+            "Bad skill line in ExpandTradeSkillSubClass",
+        ),
+    ] {
+        let e = err(&s, call);
+        assert!(e.contains(text), "{call}: {e}");
+    }
+    assert!(heard::take(&s).is_empty(), "a raise signals nothing");
+    assert_eq!(rows(&s), 10);
+
+    // 0, a negative and a fraction below 1 are every group: the 4 headers remain.
+    for index in ["0", "-1", "-7.5", "0.5"] {
+        assert_eq!(
+            err(&s, &format!("CollapseTradeSkillSubClass({index})")),
+            "ok"
+        );
+        assert_eq!(rows(&s), 4, "collapse {index}");
+        assert_eq!(err(&s, &format!("ExpandTradeSkillSubClass({index})")), "ok");
+        assert_eq!(rows(&s), 10, "expand {index}");
+    }
+    assert_eq!(heard::take(&s).len(), 8);
 }
 
 #[test]
@@ -473,6 +553,30 @@ fn do_trade_skill_drains_spell_id_and_count() {
     assert!(s.take_trade_skill_dos().is_empty());
 }
 
+/// The craft is `TryCastSpell`'s, behind the gate's tag 2 (`0x500314` → `0x6e4bc1`), but the repeat is
+/// armed ahead of it (`0x500307`), so a macro's call outside an input event arms the repeat and
+/// casts nothing, and the same call inside a key's body casts.
+#[test]
+fn do_trade_skill_arms_the_repeat_and_casts_only_inside_an_input_event() {
+    let mut s = UiScript::new().unwrap();
+    s.set_trade_skill(Some(two_recipe_state()));
+    s.run("SelectTradeSkill(3)").unwrap();
+
+    s.run(r#"RunScript("DoTradeSkill(3, 5)")"#).unwrap();
+    assert!(
+        s.take_trade_skill_dos().is_empty(),
+        "no input event: the cast is refused, silently"
+    );
+    assert_eq!(
+        s.eval::<i64>("return GetTradeskillRepeatCount()").unwrap(),
+        5,
+        "the repeat was armed before the gate"
+    );
+
+    s.run_binding(r#"RunScript("DoTradeSkill(3, 5)")"#).unwrap();
+    assert_eq!(s.take_trade_skill_dos(), vec![(2963, 5)]);
+}
+
 #[test]
 fn no_snapshot_shapes_unknown_line_and_nil_info() {
     let mut s = UiScript::new().unwrap();
@@ -492,7 +596,7 @@ fn no_snapshot_shapes_unknown_line_and_nil_info() {
     assert_eq!(
         s.eval::<(i64, i64)>("return GetTradeSkillNumMade(1)")
             .unwrap(),
-        (0, 0)
+        (1, 1)
     );
     assert!(s
         .eval::<bool>("return GetTradeSkillCooldown(1) == nil")
@@ -513,9 +617,18 @@ fn no_snapshot_shapes_unknown_line_and_nil_info() {
     s.run("DoTradeSkill(1, 1)").unwrap();
     assert!(s.take_trade_skill_dos().is_empty(), "no window, no intent");
 
-    s.run("CollapseTradeSkillSubClass(0) ExpandTradeSkillSubClass(1) SelectTradeSkill(1)")
+    s.run("CollapseTradeSkillSubClass(0) SelectTradeSkill(1)")
         .unwrap();
     assert_eq!(s.eval::<i64>("return GetNumTradeSkills()").unwrap(), 0);
+    // Row 1 is past an empty list, so `0x4fd650` finds no header and the fold raises.
+    let e = s
+        .run("ExpandTradeSkillSubClass(1)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("Bad skill line in ExpandTradeSkillSubClass"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -713,6 +826,70 @@ fn filter_getters_treat_a_non_positive_index_as_all_and_raise_past_the_end() {
     raises(&s, "GetTradeSkillSubClassFilter(1)", "Bad sub class");
 }
 
+/// The two filter setters check their arguments in the reference's order before touching state
+/// (`0x4ffc70`, `0x4ffe60`): a bad index raises, an `on` that is not a number raises, and an
+/// index at or below 0 sets everything on without reading `on`.
+#[test]
+fn filter_setters_raise_on_a_bad_index_and_a_missing_on_off() {
+    let mut s = UiScript::new().unwrap();
+    s.set_trade_skill(Some(state()));
+    let err = |s: &UiScript, call: &str| {
+        s.eval::<String>(&format!(
+            "local ok, e = pcall(function() {call} end) return ok and 'ok' or tostring(e)"
+        ))
+        .unwrap()
+    };
+    // Four groups and two present inventory types: index 5 and 3 are past the end.
+    assert!(err(&s, "SetTradeSkillSubClassFilter(5, 1)")
+        .contains("Bad sub class in SetTradeSkillSubClassFilter"));
+    assert!(err(&s, "SetTradeSkillInvSlotFilter(3, 1)")
+        .contains("Bad inv slot in SetTradeSkillInvSlotFilter"));
+    assert!(err(&s, "SetTradeSkillSubClassFilter(2)")
+        .contains("Missing on//off parameter in SetTradeSkillSubClassFilter"));
+    assert!(err(&s, "SetTradeSkillSubClassFilter(2, true)").contains("Missing on//off parameter"));
+    assert!(err(&s, "SetTradeSkillInvSlotFilter(1)")
+        .contains("Missing on//off parameter in SetTradeSkillInvSlotFilter"));
+    assert!(err(&s, "SetTradeSkillSubClassFilter()")
+        .contains("Usage: SetTradeSkillSubClassFilter(index [, on\\off, exclusive])"));
+    assert!(err(&s, "SetTradeSkillInvSlotFilter(nil, 1)")
+        .contains("Usage: SetTradeSkillInvSlotFilter(index [, on\\off, exclusive])"));
+    // The index is checked before `on`: a bad index with no `on` is the bad-index error.
+    assert!(err(&s, "SetTradeSkillSubClassFilter(9)").contains("Bad sub class"));
+    // None of the raises touched the list.
+    assert_eq!(s.eval::<i64>("return GetNumTradeSkills()").unwrap(), 10);
+
+    // An index at or below 0 is "all" and reads no `on`; so is a non-numeric string (tonumber 0).
+    s.run("SetTradeSkillSubClassFilter(2, 1, 1)").unwrap();
+    assert_eq!(s.eval::<i64>("return GetNumTradeSkills()").unwrap(), 3);
+    for call in [
+        "SetTradeSkillSubClassFilter(-3)",
+        "SetTradeSkillSubClassFilter(-0.5)",
+        "SetTradeSkillSubClassFilter('x')",
+    ] {
+        s.run("SetTradeSkillSubClassFilter(2, 1, 1)").unwrap();
+        assert_eq!(err(&s, call), "ok", "{call}");
+        assert_eq!(
+            s.eval::<i64>("return GetNumTradeSkills()").unwrap(),
+            10,
+            "{call}"
+        );
+    }
+    s.run("SetTradeSkillInvSlotFilter(1, 1, 1)").unwrap();
+    assert_eq!(err(&s, "SetTradeSkillInvSlotFilter(-2)"), "ok");
+    assert_eq!(
+        s.eval::<i64>("return GetTradeSkillInvSlotFilter(0)")
+            .unwrap(),
+        1
+    );
+
+    // A numeric `on` of 0 hides the class; a fractional one truncates to 0 as `_ftol` does.
+    assert_eq!(err(&s, "SetTradeSkillSubClassFilter(2, 0.9)"), "ok");
+    assert!(s
+        .eval::<Option<i64>>("return GetTradeSkillSubClassFilter(2)")
+        .unwrap()
+        .is_none());
+}
+
 /// Stand-in slot strings named after their tokens (`0x84dd70`): `SECONDARYHANDSLOT`,
 /// `INVTYPE_SHIELD` and `INVTYPE_WEAPONOFFHAND` all read "Off Hand" in enUS, so only the token
 /// shows which one a bit reaches.
@@ -771,6 +948,34 @@ fn invslot_filter_drops_recipes_and_emptied_groups() {
 
     s.run("SetTradeSkillInvSlotFilter(0, 1, 1)").unwrap();
     assert_eq!(s.eval::<i64>("return GetNumTradeSkills()").unwrap(), 10);
+}
+
+/// Each slot name is a `_G` read (`0x703bf0`), so an `__index` that calls a verb runs inside
+/// `GetTradeSkillInvSlots`; the Model must be free for it.
+#[test]
+fn inv_slot_names_are_read_with_the_model_free() {
+    let mut s = UiScript::new().unwrap();
+    let mut st = state();
+    st.recipes
+        .iter_mut()
+        .find(|r| r.name == "Wind Cloak")
+        .unwrap()
+        .product_inv_type = 16;
+    s.set_trade_skill(Some(st));
+    s.run(
+        r#"setmetatable(getfenv(0), { __index = function(t, k)
+               if string.find(k, "SLOT$") then
+                   CreateFrame("Frame"):SetWidth(10)
+                   return "<" .. k .. ">"
+               end
+           end })"#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<(String, String)>("return GetTradeSkillInvSlots()")
+            .unwrap(),
+        ("<CHESTSLOT>".to_string(), "<BACKSLOT>".to_string())
+    );
 }
 
 /// A one-hand weapon (InventoryType 13, `0x18000`) lists both hand slots and passes either.
@@ -939,49 +1144,41 @@ fn the_repeat_counts_down_on_our_casts_and_ends_silently() {
     );
 }
 
-/// ItemLevel (`record+0x14`) sorts between tier and name.
+/// Within a group the comparator (`0x4fd380`) orders by tier ascending (`0x4fd4ad`), then the
+/// product's ItemLevel (`row+0x14`) descending, answering "after" when the first row's is the
+/// smaller (`setl` at `0x4fd4e6`), then the name ascending (`0x4fd4d6`).
 #[test]
-fn same_tier_recipes_order_by_product_item_level_before_name() {
+fn same_tier_recipes_order_by_product_item_level_highest_first_before_name() {
     let mut s = UiScript::new().unwrap();
-    let mut aaa = recipe(
-        100,
-        "Aaa Robe",
-        TradeSkillDifficulty::Medium,
-        1,
-        Some((2, 1, "Cloth")),
-    );
-    aaa.product_item_level = 30;
-    let mut zzz = recipe(
-        101,
-        "Zzz Robe",
-        TradeSkillDifficulty::Medium,
-        1,
-        Some((2, 1, "Cloth")),
-    );
-    zzz.product_item_level = 10;
-    let mut mid = recipe(
-        102,
-        "Mmm Robe",
-        TradeSkillDifficulty::Medium,
-        1,
-        Some((2, 1, "Cloth")),
-    );
-    mid.product_item_level = 10;
+    let robe = |spell_id, name, difficulty, item_level| {
+        let mut r = recipe(spell_id, name, difficulty, 1, Some((2, 1, "Cloth")));
+        r.product_item_level = item_level;
+        r
+    };
     s.set_trade_skill(Some(TradeSkillState {
         line: 197,
         line_name: "Tailoring".into(),
         rank: 57,
         max_rank: 75,
-        recipes: vec![aaa, zzz, mid],
+        recipes: vec![
+            robe(100, "Aaa Robe", TradeSkillDifficulty::Medium, 10),
+            robe(101, "Zzz Robe", TradeSkillDifficulty::Medium, 10),
+            robe(102, "Mmm Robe", TradeSkillDifficulty::Medium, 30),
+            robe(103, "Low Robe", TradeSkillDifficulty::Optimal, 5),
+        ],
     }));
-    // Header, then: Mmm(10) before Zzz(10) by name, both before Aaa(30) despite the alphabet.
-    let names: Vec<String> = (1..=4)
+    // The orange row first whatever its level; then Mmm (30) ahead of the two level-10 robes,
+    // which fall to the name.
+    let names: Vec<String> = (1..=5)
         .map(|i| {
             s.eval::<String>(&format!("local n = GetTradeSkillInfo({i}) return n"))
                 .unwrap()
         })
         .collect();
-    assert_eq!(names, ["Cloth", "Mmm Robe", "Zzz Robe", "Aaa Robe"]);
+    assert_eq!(
+        names,
+        ["Cloth", "Low Robe", "Mmm Robe", "Aaa Robe", "Zzz Robe"]
+    );
 }
 
 /// The two link verbs' shapes (`0x4ff410`, `0x4ff800`).
@@ -1061,4 +1258,79 @@ fn the_link_verbs_answer_the_clients_shapes() {
         "{err}"
     );
     assert!(s.run("GetTradeSkillItemLink('x')").is_err());
+}
+
+/// `GetTradeSkillCooldown` (`0x4fda20`) derives the seconds left at the call from the pushed
+/// start and duration: the pushed state stays put while the clock runs, and the answer turns nil
+/// once the cooldown is over.
+#[test]
+fn the_cooldown_left_is_read_off_the_clock_at_the_call() {
+    let mut s = UiScript::new().unwrap();
+    let mut state = two_recipe_state();
+    // Started at 100 s on the GetTime clock, for an hour.
+    state.recipes[0].cooldown = Some((100_000, 3_600_000, true));
+    s.set_trade_skill(Some(state));
+    // The row the bolt sorts to, and the robe's.
+    let row = |s: &UiScript, name: &str| -> i64 {
+        s.eval(&format!(
+            "for i = 1, GetNumTradeSkills() do if GetTradeSkillInfo(i) == {name:?} then return i end end"
+        ))
+        .unwrap()
+    };
+    let (bolt, robe) = (row(&s, "Bolt of Linen Cloth"), row(&s, "Simple Robe"));
+    let left = |s: &UiScript| -> f64 {
+        s.eval(&format!("return GetTradeSkillCooldown({bolt})"))
+            .unwrap()
+    };
+    s.set_now(160.0);
+    assert_eq!(left(&s), 3540.0);
+    s.set_now(160.5);
+    assert_eq!(left(&s), 3539.5);
+    s.set_now(3700.0);
+    assert!(s
+        .eval::<bool>(&format!("return GetTradeSkillCooldown({bolt}) == nil"))
+        .unwrap());
+    assert!(
+        s.eval::<bool>(&format!("return GetTradeSkillCooldown({robe}) == nil"))
+            .unwrap(),
+        "a recipe not cooling down"
+    );
+}
+
+/// `IsCurrentAction`'s tradeskill arm (`0x4e54fe`-`0x4e5549`): a profession opener's slot is
+/// checked while its window is open, by the trade skill's line (`[0xbde040]`) or the craft's type
+/// (`[0xbdcfb8]`), and not once a close, `CloseTradeSkill()` included, zeroes the marker.
+#[test]
+fn a_profession_openers_slot_is_current_while_its_window_is_open() {
+    use crate::script::{ActionState, Profession};
+    let mut s = UiScript::new().unwrap();
+    let slot = |profession| ActionState {
+        spell: Some(3908),
+        profession: Some(profession),
+        ..Default::default()
+    };
+    s.set_action_state(3, Some(slot(Profession::TradeSkill(197))));
+    s.set_action_state(4, Some(slot(Profession::TradeSkill(164))));
+    s.set_action_state(5, Some(slot(Profession::Craft(3))));
+    let current = |s: &UiScript, action: u32| {
+        s.eval::<bool>(&format!("return IsCurrentAction({action}) == 1"))
+            .unwrap()
+    };
+    assert!(!current(&s, 3), "closed");
+    s.set_trade_skill(Some(two_recipe_state()));
+    assert!(current(&s, 3), "Tailoring's window, line 197");
+    assert!(!current(&s, 4), "another line");
+    assert!(!current(&s, 5), "no craft is open");
+    s.run("CloseTradeSkill()").unwrap();
+    assert!(!current(&s, 3), "the close zeroes the marker");
+    s.set_craft(Some(crate::script::craft::CraftState {
+        name: "Enchanting".into(),
+        rank: 1,
+        max_rank: 75,
+        craft_type: 3,
+        recipes: Vec::new(),
+    }));
+    assert!(current(&s, 5), "the craft of type 3");
+    s.set_craft(None);
+    assert!(!current(&s, 5));
 }

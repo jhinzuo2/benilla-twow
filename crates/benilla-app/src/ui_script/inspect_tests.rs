@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use benilla_ui::script::{
-    InspectView, InvSlotView, InventorySlots, QuadContent, SoundRequest, UiScript, UnitGuids,
-    UnitReach, UnitState,
+    InvSlotView, InventorySlots, QuadContent, SoundRequest, UiScript, UnitGuids, UnitReach,
+    UnitState,
 };
 
 /// The inspected player's guid, which `"target"` resolves to and the reach map is keyed by.
@@ -65,19 +65,15 @@ fn foreign_slot(entry: u32, icon: &str, name: &str) -> InvSlotView {
     }
 }
 
-/// The inspected unit's equipment: a helm in the head slot (id 1) and nothing else.
-fn inspect_view(unit: &str) -> InspectView {
+/// The inspected player's visible items: a helm in the head slot (id 1) and nothing else.
+fn inspect_slots() -> InventorySlots {
     let mut slots: InventorySlots = Default::default();
     slots[1] = Some(foreign_slot(
         7365,
         "Interface\\Icons\\INV_Helmet_09",
         "Mighty Helm",
     ));
-    InspectView {
-        unit: unit.into(),
-        guid: 0x0000_0000_0000_0042,
-        slots,
-    }
+    slots
 }
 
 /// Our own equipment: a different helm in the same slot, so a doll reading the wrong source shows.
@@ -130,7 +126,7 @@ fn armed() -> UiScript {
     s.run("InspectFrame_LoadUI()").unwrap();
     s.set_unit("target", Some(target_unit()));
     s.set_unit_guids(&target_guids());
-    s.set_inspect(Some(inspect_view("target")));
+    s.set_visible_equipment(TARGET, Some(inspect_slots()));
     // 4 yards away (d² = 16), inside the 10-yard gate (100.0).
     s.set_unit_reach(HashMap::from([(TARGET, reach(16.0))]));
     s
@@ -316,12 +312,13 @@ fn inventory_bindings_route_by_unit_token() {
     assert!(s
         .eval::<bool>(r#"return GetInventoryItemTexture("party2", 1) == nil"#)
         .unwrap());
-    // The view answers only for the token it was built for.
-    s.set_inspect(Some(inspect_view("party1")));
+    // The view answers only for the player it was pushed for.
+    s.set_visible_equipment(TARGET, None);
+    s.set_visible_equipment(0x0000_0000_0000_0042, Some(inspect_slots()));
     assert!(
         s.eval::<bool>(r#"return GetInventoryItemTexture("target", 1) == nil"#)
             .unwrap(),
-        "a view built for \"party1\" must not answer for \"target\""
+        "another player's view must not answer for \"target\""
     );
 }
 
@@ -371,14 +368,14 @@ fn shipped_inspect_frame_drives_end_to_end() {
         "an empty slot falls back to its own paper-doll art"
     );
 
-    // The feed pushes a changed view and fires the event the slot buttons filter on `arg1`.
-    let mut swapped = inspect_view("target");
-    swapped.slots[1] = Some(foreign_slot(
+    // A changed view, and the visible-item bridge's event the slot buttons filter on `arg1`.
+    let mut swapped = inspect_slots();
+    swapped[1] = Some(foreign_slot(
         7366,
         "Interface\\Icons\\INV_Helmet_22",
         "Better Helm",
     ));
-    s.set_inspect(Some(swapped));
+    s.set_visible_equipment(TARGET, Some(swapped));
     s.fire_event(
         "UNIT_INVENTORY_CHANGED",
         vec![benilla_ui::script::ScriptValue::Str("target".into())],
@@ -388,9 +385,9 @@ fn shipped_inspect_frame_drives_end_to_end() {
         "UNIT_INVENTORY_CHANGED for the inspected unit repaints the slot"
     );
 
-    let mut other = inspect_view("target");
-    other.slots[1] = Some(foreign_slot(1, "Interface\\Icons\\INV_Helmet_ZZ", "Nope"));
-    s.set_inspect(Some(other));
+    let mut other = inspect_slots();
+    other[1] = Some(foreign_slot(1, "Interface\\Icons\\INV_Helmet_ZZ", "Nope"));
+    s.set_visible_equipment(TARGET, Some(other));
     s.fire_event(
         "UNIT_INVENTORY_CHANGED",
         vec![benilla_ui::script::ScriptValue::Str("party4".into())],
@@ -474,9 +471,9 @@ fn the_active_tab_is_inert_and_toggle_inspect_closes() {
 }
 
 /// Re-opening through `ToggleInspect` after a close raises, as in the reference:
-/// `InspectFrame_OnHide` clears `this.unit`, so `OnShow` runs with no token, and
-/// `SetPortraitTexture` (`0x519ef0`) raises its usage error at its `lua_isstring` gate
-/// (`0x519fb4`), before the portrait is touched. Stock 1.12 has no inspect binding and no caller
+/// `InspectFrame_OnHide` clears `this.unit`, so `OnShow` runs with no token, and `SetUnit`
+/// (`0x505dfc`) and `SetPortraitTexture` (`0x519ef0`) raise their usage errors at their
+/// `lua_isstring` gates (`0x519fb4` for the portrait), before anything is touched. Stock 1.12 has no inspect binding and no caller
 /// outside the hidden window's own tabs, so only an addon or a macro gets here.
 #[test]
 fn toggle_inspect_reopens_after_a_close_and_raises_like_the_reference() {
@@ -494,17 +491,32 @@ fn toggle_inspect_reopens_after_a_close_and_raises_like_the_reference() {
     );
     // Two raises: `InspectPaperDollFrame` and `InspectFrame` each run their own `OnShow` under
     // their own pcall, the page first, since the show cascade notifies children before their
-    // parent (`0x76aed5`, then `0x76aef5`): the page dies at `UnitLevel`'s gate, the window at
-    // the portrait's.
+    // parent (`0x76aed5`, then `0x76aef5`): the page dies at its first line, its pane's
+    // `SetUnit(InspectFrame.unit)` gate (`0x505dfc`), the window at the portrait's.
     let errors = s.errors();
     assert_eq!(errors.len(), 2, "one raise per OnShow handler: {errors:?}");
     assert!(
-        errors[0].contains(r#"Usage: UnitLevel("unit")"#),
-        "the paper doll's own handler, dying at its first getter: {errors:?}"
+        errors[0].contains(r#"Usage: SetUnit("unit")"#),
+        "the paper doll's own handler, dying at its first line: {errors:?}"
     );
     assert!(
         errors[1].contains(r#"Usage: SetPortraitTexture(texture, "unit")"#),
         "then the window's, at the portrait's gate, before the name line is ever reached: \
          {errors:?}"
     );
+}
+
+/// `InspectPaperDollFrame_OnShow` binds the pane to the inspected unit
+/// (`InspectModelFrame:SetUnit(InspectFrame.unit)`), not to the player.
+#[test]
+fn the_inspect_pane_binds_the_inspected_unit() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let s = armed();
+    s.run(r#"InspectUnit("target")"#).unwrap();
+    let pane = s
+        .character_pane(s.frame_handle("InspectModelFrame").unwrap())
+        .expect("a character pane");
+    assert_eq!(pane.guid, TARGET);
+    assert!(pane.pending(), "the shown pane asks for its copy");
+    assert!(s.errors().is_empty(), "errors: {:?}", s.errors());
 }

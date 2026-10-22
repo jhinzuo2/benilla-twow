@@ -19,10 +19,9 @@
 
 use mlua::{Lua, MultiValue, Table, Value};
 
-use super::binding_abi::flag;
+use super::binding_abi::{self, flag};
 use super::tooltip_spell::{spell_view_of, TalentLines};
 use super::Model;
-use crate::script::binding_abi::Idx;
 
 /// One talent page, a `TalentTab.dbc` row: `GetTalentTabInfo`'s source.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -31,6 +30,9 @@ pub struct TalentTabView {
     /// The `Interface\TalentFrame\<base>-` art base, the tuple's `fileName`.
     pub background: String,
     pub points_spent: u32,
+    /// The tab's `SpellIcon.dbc` path (`TalentTab.dbc` `SpellIconID`, `0x4f30d0`-`0x4f30f1`), the
+    /// tuple's `texture`; `None` pushes nil (`0x4f30f8`).
+    pub texture: Option<String>,
 }
 
 /// One prerequisite edge, a `GetTalentPrereqs` triplet.
@@ -127,18 +129,23 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // `texture` is nil: the stock frame never reads it. Out of range answers nil, nil, 0, nil
-    // (`0x4f3132`).
+    // Name, the tab's `SpellIcon.dbc` path (nil for an id the table lacks), points spent and the
+    // background (`0x4f30cb`-`0x4f3121`). Out of range answers nil, nil, 0, nil (`0x4f3132`).
     g.set(
         "GetTalentTabInfo",
-        lua.create_function(|lua, Idx(i): Idx| {
+        lua.create_function(|lua, i: Value| {
+            // `is-number` else `Usage: GetTalentTabInfo(index)` (`0x84cdd4`, `0x4f3059`).
+            let i = binding_abi::index_arg(lua, i, "Usage: GetTalentTabInfo(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(tab) = i.checked_sub(1).and_then(|n| model.talents.tabs.get(n)) else {
                 return Ok(super::binding_abi::tuple(&[None, None, Some(0), None]));
             };
             Ok(MultiValue::from_vec(vec![
                 Value::String(lua.create_string(&tab.name)?),
-                Value::Nil,
+                match &tab.texture {
+                    Some(texture) => Value::String(lua.create_string(texture)?),
+                    None => Value::Nil,
+                },
                 Value::Integer(i64::from(tab.points_spent)),
                 Value::String(lua.create_string(&tab.background)?),
             ]))
@@ -147,7 +154,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetNumTalents",
-        lua.create_function(|lua, Idx(tab): Idx| {
+        lua.create_function(|lua, tab: Value| {
+            // `is-number` else `Usage: GetNumTalents(tabIndex)` (`0x84cdf4`, `0x4f3177`).
+            let tab = binding_abi::index_arg(lua, tab, "Usage: GetNumTalents(tabIndex)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let n = tab
                 .checked_sub(1)
@@ -159,7 +168,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTalentInfo",
-        lua.create_function(|lua, (Idx(tab), Idx(i)): (Idx, Idx)| {
+        lua.create_function(|lua, (tab, i): (Value, Value)| {
+            // Both `is-number` else `Usage: GetTalentInfo(tabIndex, talentIndex)` (`0x84ce14`,
+            // `0x4f34ae`).
+            let tab =
+                binding_abi::index_arg(lua, tab, "Usage: GetTalentInfo(tabIndex, talentIndex)")?;
+            let i = binding_abi::index_arg(lua, i, "Usage: GetTalentInfo(tabIndex, talentIndex)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(t) = talent_at(&model, tab, i) else {
                 // `0x4f3454`: nil, nil, 1, 1, 0, 0, nil, nil.
@@ -194,7 +208,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // Flat (tier, column, isLearnable) triplets, as `Blizzard_TalentUI.lua:385` walks them.
     g.set(
         "GetTalentPrereqs",
-        lua.create_function(|lua, (tab, i): (usize, usize)| {
+        lua.create_function(|lua, (tab, i): (Value, Value)| {
+            // `is-number` on args 1 and 2 else `Usage: GetTalentPrereqs(tabIndex, talentIndex)`
+            // (`0x84ce40`, `0x4f3686`).
+            let tab =
+                binding_abi::index_arg(lua, tab, "Usage: GetTalentPrereqs(tabIndex, talentIndex)")?;
+            let i =
+                binding_abi::index_arg(lua, i, "Usage: GetTalentPrereqs(tabIndex, talentIndex)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let mut out = Vec::new();
             if let Some(t) = talent_at(&model, tab, i) {
@@ -212,7 +232,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (vmangos `Player::LearnTalent`).
     g.set(
         "LearnTalent",
-        lua.create_function(|lua, (tab, i): (u32, u32)| {
+        lua.create_function(|lua, (tab, i): (Value, Value)| {
+            // `is-number` on args 1 and 2 else `Usage: LearnTalent(tabIndex, talentIndex)`
+            // (`0x84ce70`, `0x4f380c`).
+            let tab =
+                binding_abi::index_arg32(lua, tab, "Usage: LearnTalent(tabIndex, talentIndex)")?;
+            let i = binding_abi::index_arg32(lua, i, "Usage: LearnTalent(tabIndex, talentIndex)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model.talent_learns.push((tab, i));
             Ok(())
@@ -259,8 +284,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 pub(super) fn install_tooltip_method(lua: &Lua, m: &Table) -> mlua::Result<()> {
     m.set(
         "SetTalent",
-        lua.create_function(|lua, (this, tab, i): (Table, usize, usize)| {
-            let (display, lines) = {
+        lua.create_function(|lua, (this, tab, i): (Table, Value, Value)| {
+            // `is-number` on args 2 and 3 else `Usage: SetTalent(tabIndex, talentIndex)`
+            // (`0x85555c`, `0x535394`).
+            let tab = binding_abi::index_arg(lua, tab, "Usage: SetTalent(tabIndex, talentIndex)")?;
+            let i = binding_abi::index_arg(lua, i, "Usage: SetTalent(tabIndex, talentIndex)")?;
+            let (display, ranks, mut lines) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 let Some(t) = talent_at(&model, tab, i) else {
                     return Ok(());
@@ -274,22 +303,12 @@ pub(super) fn install_tooltip_method(lua: &Lua, m: &Table) -> mlua::Result<()> {
                             .map(|v| v.description.clone())
                     })
                     .flatten();
-                // `TOOLTIP_TALENT_RANK`, "Rank %d/%d" (`0x854a2c`, pushed at `0x52b213`); an
-                // install without it shows no rank line.
-                let rank_line = crate::strings::global(lua, "TOOLTIP_TALENT_RANK").map(|tmpl| {
-                    crate::strings::fill(
-                        &tmpl,
-                        &[
-                            crate::strings::Arg::D(t.rank.into()),
-                            crate::strings::Arg::D(t.max_rank.into()),
-                        ],
-                    )
-                });
                 (
                     t.display_spell,
+                    (t.rank, t.max_rank),
                     TalentLines {
                         exceptional: t.exceptional,
-                        rank_line,
+                        rank_line: None,
                         reqs: t.req_lines.clone(),
                         next_spell: t.next_spell,
                         next_desc,
@@ -297,6 +316,18 @@ pub(super) fn install_tooltip_method(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     },
                 )
             };
+            // `TOOLTIP_TALENT_RANK`, "Rank %d/%d" (`0x854a2c`, pushed at `0x52b213`); an
+            // install without it shows no rank line. A GlobalStrings read runs an `_G` `__index`
+            // (`0x703bf0`), which may call any verb, so it is made once the Model is released.
+            lines.rank_line = crate::strings::global(lua, "TOOLTIP_TALENT_RANK").map(|tmpl| {
+                crate::strings::fill(
+                    &tmpl,
+                    &[
+                        crate::strings::Arg::D(ranks.0.into()),
+                        crate::strings::Arg::D(ranks.1.into()),
+                    ],
+                )
+            });
             super::tooltip_spell::set_spell_with_talent(lua, &this, display, lines)
         })?,
     )?;

@@ -12,15 +12,21 @@ use benilla_dbc::{DbcParser, FieldType, Schema, SchemaField};
 pub use benilla_blp::BlpTexels;
 
 mod chain;
-pub use chain::{data_locale, Chain, ChainEntry};
+pub use chain::{Chain, ChainEntry};
 /// Loose `.tga` art, as addon folders ship it.
 mod tga;
-pub use tga::tga_to_rgba;
+pub use tga::{tga_texture_size, tga_to_rgba, TGA_GATE_PREFIX};
 /// Where the WoW install is; [`Chain`] opens it.
 mod install;
 pub use install::{
     addon_corpus, addon_corpus_candidates, candidates, project_folder, set_project_folder, skipped,
     wow_data,
+};
+/// The install's loose files, asked before the archives by the opens that set the loose flag.
+mod loose;
+pub use loose::{
+    install_index, install_loose_interface_folders, LooseFile, LooseIndex, LooseIndexCell,
+    LooseOpen,
 };
 mod characters;
 pub use characters::{
@@ -36,8 +42,8 @@ mod dbc;
 mod unit_blood;
 pub use camera_shakes::{load_camera_shakes, CameraShake, CameraShakeCatalog, SpellShakeGroup};
 pub use cinematics::{
-    camera_model_path, load_cinematics, CinematicCameraRow, CinematicCatalog, CinematicPath,
-    CinematicSequence, CinematicView, SEQUENCE_CAMERAS,
+    camera_model_path, first_login_eye, load_cinematics, CinematicCameraRow, CinematicCatalog,
+    CinematicPath, CinematicSequence, CinematicView, SEQUENCE_CAMERAS,
 };
 pub use creatures::{
     load_creature_catalog, CreatureCatalog, CreatureModel, FootprintParams, NpcAppearance,
@@ -47,6 +53,12 @@ mod macro_icons;
 pub use unit_blood::{load_blood_catalog, BloodCatalog};
 mod itemsets;
 pub use itemsets::{load_item_sets, ItemSetCatalog, ItemSetInfo};
+mod gm_survey;
+mod lfg_dungeons;
+pub use lfg_dungeons::{load_lfg_dungeons, LfgDungeon};
+mod skill_tiers;
+pub use gm_survey::{load_gm_survey, GmSurvey};
+pub use skill_tiers::{load_skill_tiers, SkillTiers};
 mod gm_ticket_category;
 pub use gm_ticket_category::{
     load_gm_ticket_categories, GmTicketCategory, GmTicketCategoryCatalog,
@@ -57,7 +69,12 @@ mod cfg_configs;
 pub use cfg_configs::{load_realm_configs, RealmConfig, RealmConfigs};
 mod wow_ini;
 pub use wow_ini::client_region;
+/// The client locale, the column a localized DBC string is read from.
+mod locale;
+pub use locale::Locale;
 mod itembagfamily;
+#[cfg(test)]
+mod locale_routing;
 pub use itembagfamily::{load_item_bag_families, ItemBagFamilyCatalog};
 mod itemclass;
 pub use itemclass::{load_item_classes, ItemClassCatalog};
@@ -71,7 +88,7 @@ pub use factions::{
     FactionInfo, FactionTemplate, Reaction,
 };
 mod creature_types;
-pub use creature_types::{load_creature_type_flags, CreatureTypeFlags};
+pub use creature_types::{load_creature_type_table, CreatureTypeTable};
 /// The chat language scramble, the reference's `0x49b560`.
 mod garble;
 pub use garble::{garble, garble_chat, Garble, FLUENT_SKILL};
@@ -84,6 +101,10 @@ mod creature_families;
 pub use creature_families::{
     load_creature_families, load_pet_food_names, CreatureFamilies, CreatureFamily, PetFoodNames,
 };
+mod creature_spell_data;
+pub use creature_spell_data::{load_creature_spell_data, CreatureSpellData};
+mod resistances;
+pub use resistances::load_armor_school;
 mod gameobjects;
 pub use gameobjects::{
     go_sound_slot, load_gameobject_catalog, load_gameobject_sounds, GameObjectCatalog,
@@ -99,6 +120,8 @@ mod stable_slot_prices;
 pub use stable_slot_prices::{load_stable_slot_prices, StableSlotPrices};
 mod page_text_material;
 pub use page_text_material::{load_page_text_material_catalog, PageTextMaterialCatalog};
+mod mail_template;
+pub use mail_template::load_mail_templates;
 mod packages;
 pub use packages::{load_packages, PackageRow};
 mod stationery;
@@ -112,6 +135,8 @@ pub use lock::{
 };
 mod lock_type;
 pub use lock_type::{load_lock_type_catalog, LockTypeCatalog};
+mod chr_races;
+pub use chr_races::{load_chr_races, ChrRaces};
 mod chr_classes;
 pub use chr_classes::{load_chr_classes, ChrClasses, PET_NAME_TOKEN_FALLBACK};
 mod pet_stats;
@@ -125,8 +150,8 @@ mod item_sounds;
 pub use item_sounds::{load_item_group_sounds, ItemGesture, ItemGroupSoundsCatalog};
 mod item_visuals;
 pub use item_visuals::{
-    load_enchant_catalog, load_item_visual_catalog, EnchantCatalog, EnchantEffect,
-    ItemVisualCatalog, ITEM_VISUAL_SLOTS,
+    load_enchant_catalog, load_item_visual_catalog, EnchantCatalog, ItemVisualCatalog,
+    ITEM_VISUAL_SLOTS,
 };
 mod item_random_properties;
 pub use item_random_properties::{
@@ -200,11 +225,12 @@ mod spells;
 pub use spells::{
     cc_exemption, grants_immunity, load_shapeshift_forms, load_spell_cast_times,
     load_spell_catalog, load_spell_dispel_types, load_spell_durations, load_spell_radii,
-    load_spell_ranges, min_max_range, min_max_range_reads_units, soft_modify, substitute,
-    CcExemption, FormRefusal, LearnAnnouncement, LearnEffect, OpenLock, RangeTargets, RangeUnit,
-    ShapeshiftForm, SpellCastTime, SpellCastTimeCatalog, SpellCatalog, SpellDispelTypes,
-    SpellDisplay, SpellDuration, SpellDurationCatalog, SpellMods, SpellRadius, SpellRadiusCatalog,
-    SpellRange, SpellRangeCatalog, TokenContext, TokenNumber, UnitMotion, ATTR_CASTABLE_WHILE_DEAD,
+    load_spell_ranges, min_max_range, min_max_range_reads_units, resolve_parts, soft_modify,
+    substitute, substitute_parts, CcExemption, ExpandAt, FormRefusal, LearnAnnouncement,
+    LearnEffect, OpenLock, RangeTargets, RangeUnit, ShapeshiftForm, SpellCastTime,
+    SpellCastTimeCatalog, SpellCatalog, SpellDispelTypes, SpellDisplay, SpellDuration,
+    SpellDurationCatalog, SpellMods, SpellRadius, SpellRadiusCatalog, SpellRange,
+    SpellRangeCatalog, TokenContext, TokenNumber, TokenPart, UnitMotion, ATTR_CASTABLE_WHILE_DEAD,
     ATTR_NOT_IN_COMBAT, ATTR_ONLY_STEALTHED, COMBAT_REACH_ADD, MELEE_RANGE_FLOOR,
     MOVING_BONUS_FLAGS, MOVING_RANGE_BONUS, ON_NEXT_SWING_RANGE, SPELL_ATTR_IS_TRADESKILL,
     SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_ENCHANT_ITEM, SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY,
@@ -239,32 +265,31 @@ pub use ribbons::{parse_m2_ribbon_emitters, RibbonEmitterDef, RibbonVisibility};
 mod value_track;
 pub use value_track::{TrackValue, ValueTrack};
 mod models;
+pub use models::ERROR_CUBE;
 pub use models::{
     accumulate_wmo_group_camera_collision, accumulate_wmo_group_camera_only_collision,
-    accumulate_wmo_group_collision, authored_half_height, batch_footprint, glue_art_extent,
-    hand_grip_finger_poses, load_m2_animation_summary, load_m2_bone_spins, load_m2_bounds,
-    load_m2_collision_hull, load_m2_mesh, load_m2_mesh_skinned, load_object_model, load_wmo,
-    load_wmo_collision_tris, m2_bone_spins, m2_owner_reach, m2_ribbon_emitter_count,
-    m2_sequence_visible_textures, m2_texture_transform_count, non_separable_billboard_bones,
-    owner_last_rung, owner_last_rung_bucket, parse_m2_animation_lookup, parse_m2_animation_summary,
+    accumulate_wmo_group_collision, hand_grip_finger_poses, load_m2_animation_summary,
+    load_m2_bone_spins, load_m2_bounds, load_m2_collision_hull, load_m2_mesh, load_m2_mesh_skinned,
+    load_object_model, load_wmo, load_wmo_collision_tris, m2_bone_spins, m2_file_name,
+    m2_owner_reach, m2_ribbon_emitter_count, m2_sequence_visible_textures,
+    m2_texture_transform_count, non_separable_billboard_bones, owner_last_rung,
+    owner_last_rung_bucket, parse_m2_animation_lookup, parse_m2_animation_summary,
     parse_m2_animations, parse_m2_attachments, parse_m2_bounds, parse_m2_camera,
     parse_m2_cch_marker, parse_m2_collision_hull, parse_m2_event_markers,
     parse_m2_global_sequence_bones, parse_m2_lights, parse_m2_pane_cameras,
     parse_m2_playable_animation_lookup, parse_m2_portrait_camera, parse_m2_render_submeshes,
     parse_m2_skeleton, parse_m2_string_anchors, parse_wmo_fogs, parse_wmo_lights,
-    parse_wmo_portals, parse_wmo_root, rotation_2x2, shipped_glue_art_extent, uv_transform,
-    wmo_group_doodad_refs, wmo_group_fixed_colors, wmo_group_footprint_tris, wmo_group_header,
-    wmo_group_light_refs, wmo_group_liquid_mesh, wmo_group_raw_colors, wmo_group_submeshes,
-    wmo_root_id, AlphaAnim, AlphaMap, AlphaSeq, AnimEvent, ArtExtent, BatchFootprint, Billboard,
-    BillboardKind, BoneKeys, BoneScaleAnim, BoneSpin, CharSkinSlot, CollisionMesh, Coverage,
-    CoverageReader, EmitterBoneLink, EventMarker, FogPolicy, FootprintTris, GlobalSeqBone,
+    parse_wmo_portals, parse_wmo_root, rotation_2x2, uv_transform, wmo_group_doodad_refs,
+    wmo_group_fixed_colors, wmo_group_footprint_tris, wmo_group_header, wmo_group_light_refs,
+    wmo_group_liquid_mesh, wmo_group_raw_colors, wmo_group_submeshes, wmo_root_id, AlphaAnim,
+    AlphaSeq, AnimEvent, Billboard, BillboardKind, BoneKeys, BoneScaleAnim, BoneSpin, CharSkinSlot,
+    CollisionMesh, EmitterBoneLink, EventMarker, FogPolicy, FootprintTris, GlobalSeqBone,
     GlobalSeqChannel, GroundQuad, KeyAnim, M2AnimSummary, M2Attachment, M2Bounds, M2CameraTracks,
     M2Light, M2PaneCamera, M2PortraitCamera, ModelAnimation, ModelBlend, ParentArm, ParentBasis,
-    PlayableAnim, RenderSubmesh, RgbAnim, ScalarAnim, SeqLoops, ShippedGlueScene, Skeleton,
-    SkeletonBone, StringAnchors, UvAnim, UvRotAnim, WmoBatchClass, WmoDoodad, WmoDoodadSet, WmoFog,
+    PlayableAnim, RenderSubmesh, RgbAnim, ScalarAnim, SeqLoops, Skeleton, SkeletonBone,
+    StringAnchors, TextureStage, UvAnim, UvRotAnim, WmoBatchClass, WmoDoodad, WmoDoodadSet, WmoFog,
     WmoGroupHeader, WmoGroupInfo, WmoLight, WmoPortalInfo, WmoPortalRef, WmoPortals, WmoRoot,
-    ALPHA_KEY_REF, DEGENERATE_RING_FOOTPRINT, GLUE_AUTHORED_ASPECT, NO_GROUP_LIQUID,
-    OWNER_RUNG_BUCKETS, SHIPPED_GLUE_SCENES,
+    DEGENERATE_RING_FOOTPRINT, NO_GROUP_LIQUID, OWNER_RUNG_BUCKETS,
 };
 mod terrain;
 pub use terrain::{

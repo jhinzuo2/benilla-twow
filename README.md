@@ -27,10 +27,9 @@ benilla already speaks the stock 1.12.1 protocol, which gets you onto a TurtleWo
 own — this section is the gap-filling on top of that, specific to what TurtleWoW's own client
 patch changed or added.
 
-- **Two extra playable races** — Goblin (Horde) and Blood Elf / High Elf (Alliance) — through
-  character creation, the race-select icon art (read from the client's own
-  `CharacterCreate.lua` icon table when present, the frozen vanilla math otherwise), and the
-  per-race equipment/helm model variants.
+- **Two extra playable races** — Goblin (Horde) and Blood Elf / High Elf (Alliance). Character
+  creation runs TurtleWoW's own GlueXML off your install, the create grid and the race names
+  come from its DBCs, and the faction lookup places both races on their side.
 - **Sound kits TurtleWoW references that the vanilla DBC doesn't ship** no longer error-spam — a
   missing kit id is warned once, then plays as silence, same as a kit with no attached file.
 - **Everlook's internet-radio towers are recognized** — their `SoundEntries` path is a stream
@@ -39,10 +38,15 @@ patch changed or added.
   in [#3](https://github.com/jhinzuo2/benilla-twow/issues/3).
 - **Camera Lua API extended** with `CameraZoomIn` / `CameraZoomOut` (used by things like the
   barbershop's chair camera) and `FlipCameraYaw`.
-- **`benilla.toc` updated** to load TurtleWoW's own `json.lua` codec and the block of
-  TurtleWoW-exclusive FrameXML files its manifest appends, in TurtleWoW's own load order; the
-  two real functionality gaps that block on (`StopMusic`, `CameraZoomOut`) are filled by host
-  verbs.
+- **TurtleWoW's interface loads as shipped**: the stock UI runs off your install's own
+  `FrameXML.toc`, so TurtleWoW's `json.lua` codec and its exclusive FrameXML files load in its own
+  order.
+- **Realm login on TurtleWoW-derived realmd**: the logon presents build 7272 to realmd (which
+  rejects 5875) and 5875 to the world server, and a challenge-shaped version reject is reported
+  as such instead of a protocol error.
+- **Custom maps and missing assets don't hang the loading screen**: a map id with no `Map.dbc`
+  row, or a placement whose model is missing from the data, is skipped as the reference client
+  skips it.
 - **Options → Graphics no longer errors** on a TurtleWoW install — its patch replaces
   `OptionsFrame.lua` with its own category/search system, which doesn't define the
   slider-bounds table the panel reads, so those bounds are now vendored as a fallback.
@@ -173,6 +177,10 @@ reads the game's data from your own 1.12.1 install. Every file format, the netwo
 the interface engine are written from scratch, with no original client code, no third-party WoW
 crates and no bundled game assets.
 
+What the real client does is read at its bytes in
+[benilla-re](https://github.com/samwhosung/benilla-re), the reverse engineering benilla is built
+against, by the same client addresses the comments here cite.
+
 ## What's inside
 
 - **Formats:** readers for the whole asset stack (the MPQ patch chain, BLP, DBC, ADT, WDT, WDL, M2
@@ -197,6 +205,7 @@ crates and no bundled game assets.
 
 The format readers and the UI engine core are plain Rust with no Bevy in them, and the world
 renderer runs with no game attached. [`docs/MAP.md`](docs/MAP.md) maps every crate and subsystem,
+and [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md) lists everywhere benilla differs from 1.12.1; both are
 generated from the code.
 
 ## Status
@@ -218,11 +227,13 @@ Not planned: other expansions or client versions, Warden (anticheat).
 
 benilla builds and runs on macOS, Linux and Windows. You need:
 
-- **An English 1.12.1 client (build 5875)** for the game data. benilla only reads it.
-- **A 1.12.1 server with Warden off.** [vmangos](https://github.com/vmangos/core) is what
-  development runs against, and it ships with Warden off; cMaNGOS and the other 1.12.1 cores speak
-  the same protocol.
-- **Stable Rust and a C compiler**, because the client's Lua is built from source: on macOS the
+- **A 1.12.1 client (build 5875)** for the game data, in any locale. benilla only reads it, and
+  shows its text in the client's language; development runs on English clients.
+- **A 1.12.1 server.** [vmangos](https://github.com/vmangos/core) is what development runs
+  against; cMaNGOS and the other 1.12.1 cores speak the same protocol. benilla does not answer
+  Warden, so a server that enforces it disconnects the session after its timeout; vmangos ships
+  with Warden off.
+- **Stable Rust and a C compiler**, which some dependencies build with: on macOS the
   Xcode command line tools, on Linux the ALSA and udev development packages and pkg-config, on
   Windows the MSVC build tools that the Rust installer sets up.
 
@@ -270,6 +281,5 @@ runtime. The few files under `crates/benilla-app/assets/ui/` are our own, not co
 adapters over stock files, and the settings windows and script error log benilla draws itself.
 
 World of Warcraft is a trademark of Blizzard Entertainment, Inc. Our own code is licensed under
-[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The two vendored components
-under `third_party/`, the kira audio engine and a Lua 5.1 patched to the 1.12 client's dialect,
-keep their own upstream licenses, alongside each.
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The kira audio engine under
+`third_party/` is vendored under the same two licenses, with its author's copyright notices beside it.

@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::test_support::link_dir;
 use super::{survey, Used};
 
 /// One throwaway AddOns root, cleaned up on drop even if a test panics; its own temp prefix keeps
@@ -46,26 +47,6 @@ impl Drop for Fixtures {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// Recursively copy a directory tree. Used as the non-Unix fallback for linking addon folders
-/// from the third-party corpus into a fixture root — Windows has no unprivileged equivalent of
-/// `std::os::unix::fs::symlink` for directories, so the oracle test copies instead of linking
-/// there. (The corpus entries are addon folders, not single files, so `std::fs::copy` alone is
-/// not enough.)
-pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dst_path)?;
-        }
-    }
-    Ok(())
 }
 
 /// A 64×64 painted Button at the centre of the screen, plus whatever `extra` wires onto it.
@@ -221,8 +202,6 @@ fn the_use_column_can_fail() {
 /// `!OmniCC` is never `raised`: its output is a `FontString` on an anonymous mouse-disabled frame,
 /// so it is `untouched`. Bagnon's item slots must be reachable (`driven >= 1` on a `BagnonItem*`
 /// frame); whether they raise is not asserted here.
-// iNilla: the fixture symlinks, which only unix has; the test needs the install regardless.
-#[cfg(unix)]
 #[test]
 fn bagnon_is_reachable_and_omnicc_is_not_broken() {
     benilla_formats::wow_data_or_skip!();
@@ -230,10 +209,7 @@ fn bagnon_is_reachable_and_omnicc_is_not_broken() {
     let corpus = benilla_formats::addon_corpus_or_skip!();
     let fx = Fixtures::new("oracle");
     for name in ["!OmniCC", "Bagnon", "Bagnon_Core", "Bagnon_Forever"] {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(corpus.join(name), fx.root().join(name)).unwrap();
-        #[cfg(not(unix))]
-        copy_dir_recursive(&corpus.join(name), &fx.root().join(name)).unwrap();
+        link_dir(&corpus.join(name), &fx.root().join(name)).unwrap();
     }
     let reports = survey(fx.root());
     let row = |name: &str| {

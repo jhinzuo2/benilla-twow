@@ -308,6 +308,8 @@ pub(crate) fn apply(
     mut synth: ResMut<Synth>,
     capture: Res<UiKeyboardCapture>,
     mut script: Option<NonSendMut<UiScript>>,
+    // Lent around each binding body, as `bindings::latch_and_dispatch` lends it.
+    mut host: Option<crate::script_calls::ScriptCallHost>,
 ) {
     let synth = &mut *synth;
     let pressed = std::mem::take(&mut synth.pressed);
@@ -351,7 +353,10 @@ pub(crate) fn apply(
                         synth.taps.push(name.clone());
                     }
                 } else if let Some(s) = script.as_mut() {
-                    if let Err(e) = s.execute_binding(name, true) {
+                    let ran = crate::script_calls::lent(s, host.as_mut(), |s| {
+                        s.execute_binding(name, true)
+                    });
+                    if let Err(e) = ran {
                         warn!("inilla: synth press({name}): {e}");
                     }
                 }
@@ -367,7 +372,10 @@ pub(crate) fn apply(
         if let PadBinding::Command(name) = b {
             if !is_movement_or_held(name) {
                 if let Some(s) = script.as_mut() {
-                    if let Err(e) = s.execute_binding(name, false) {
+                    let ran = crate::script_calls::lent(s, host.as_mut(), |s| {
+                        s.execute_binding(name, false)
+                    });
+                    if let Err(e) = ran {
                         warn!("inilla: synth release({name}): {e}");
                     }
                 }
@@ -380,17 +388,19 @@ pub(crate) fn apply(
             "CAMERAZOOMOUT" => binds.synth_fire(crate::bindings::Input::CameraZoomOut, amount),
             _ => {
                 if let Some(s) = script.as_mut() {
-                    let _ = s.execute_binding(name, true);
+                    let _ = crate::script_calls::lent(s, host.as_mut(), |s| {
+                        s.execute_binding(name, true)
+                    });
                 }
             }
         }
     }
 
     for c in synth.latched.difference(&want) {
-        binds.synth_release(&mut script, c);
+        binds.synth_release(&mut script, &mut host, c);
     }
     for c in &want {
-        binds.synth_hold(&mut script, c);
+        binds.synth_hold(&mut script, &mut host, c);
     }
     synth.latched = want;
 
@@ -430,8 +440,9 @@ pub(crate) fn release_all(
     mut binds: ResMut<BindingsState>,
     mut synth: ResMut<Synth>,
     mut script: Option<NonSendMut<UiScript>>,
+    mut host: Option<crate::script_calls::ScriptCallHost>,
 ) {
-    binds.synth_release_all(&mut script);
+    binds.synth_release_all(&mut script, &mut host);
     synth.latched.clear();
     synth.taps.clear();
     synth.held.clear();
