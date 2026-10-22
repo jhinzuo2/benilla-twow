@@ -35,7 +35,8 @@ pub(crate) struct AndroidKeyboardPlugin;
 impl Plugin for AndroidKeyboardPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WasTyping>()
-            .add_systems(Update, drive_soft_keyboard);
+            // After the UI input pass, the one writer of `UiKeyboardCapture`.
+            .add_systems(Update, drive_soft_keyboard.after(crate::ui_script::UiInput));
     }
 }
 

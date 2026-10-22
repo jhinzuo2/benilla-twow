@@ -158,6 +158,10 @@ pub(crate) struct TouchPointer {
 #[derive(Message, Clone, Copy, Debug)]
 pub(crate) struct TouchWorldTap {
     /// Logical px, y-down.
+    #[expect(
+        dead_code,
+        reason = "published for the world-click reader, which the touch layer does not have yet"
+    )]
     pub pos: Vec2,
 }
 

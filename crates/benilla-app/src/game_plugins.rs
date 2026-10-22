@@ -124,6 +124,8 @@ impl PluginGroup for GamePlugins {
             .add(crate::doodad_events::plugin)
             // Owns the touch resources the player, glue and UI passes read.
             .add(crate::touch::TouchPlugin)
+            // Raises the Android soft keyboard while a text field has focus; a no-op elsewhere.
+            .add(crate::android_keyboard::AndroidKeyboardPlugin)
             .add(PlayerPlugin)
             .add(crate::screen_fade::ScreenFadePlugin)
             // After PlayerPlugin, whose `control` it overrides in the same stage.
