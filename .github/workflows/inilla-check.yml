@@ -4,7 +4,8 @@
 # - the desktop build of the app type-checks (so the HUD, launcher and console compile);
 # - the iOS build type-checks, cross-compiled with the open-source Darwin headers — no Mac.
 #
-# The .ipa itself is inilla-ipa.yml (manual / tags), because it spends macOS minutes.
+# The .ipa and every platform build are build.yml; its iOS jobs run on tags and manual runs only,
+# because they spend macOS minutes.
 name: inilla-check
 
 on:

@@ -1,0 +1,47 @@
+# Manual, on-demand only: regenerates Cargo.lock and commits it to the branch it ran on. Run it once
+# after adding a dependency, from the Actions tab -> lockfile -> Run workflow, so build.yml's
+# `--locked` builds can trust the lockfile. A no-op when nothing was out of date.
+name: lockfile
+
+on:
+  workflow_dispatch:
+
+jobs:
+  update-lockfile:
+    name: regenerate Cargo.lock
+    runs-on: ubuntu-latest
+    # So the commit step below can push to the branch this ran on.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # A real branch ref, not a detached commit: `git push` below needs a branch to push to.
+          ref: ${{ github.ref_name }}
+
+      # Resolving the graph runs build scripts and proc macros that link against these.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `cargo check` both updates the lockfile and catches a resolution that is version-compatible
+      # but does not build, in one step.
+      - name: cargo check --workspace (updates Cargo.lock)
+        run: cargo check --workspace
+
+      - name: Commit updated Cargo.lock if changed
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already up to date -- nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "ci: regenerate Cargo.lock"
+          git push

@@ -1,82 +1,25 @@
-<div align="center">
-  <h1>benilla</h1>
-  <p><b>A complete World of Warcraft 1.12.1 client, written from scratch in Rust and <a href="https://bevy.org">Bevy</a></b></p>
-  <p>
-    <a href="https://discord.gg/wJSJx467G4"><img src="https://img.shields.io/discord/1529280129518538922?style=for-the-badge&logo=discord&logoColor=white&label=discord&color=5865F2" alt="Discord"></a>
-    <a href="https://www.youtube.com/playlist?list=PLdCnpZNKxyb8"><img src="https://img.shields.io/badge/devlog-youtube-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube devlog"></a>
-    <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue?style=for-the-badge" alt="License"></a>
-  </p>
-</div>
+# benilla-TWOW — Turtle WoW fork of benilla (with iNilla for iOS)
 
-benilla plays the whole game: character creation, questing and professions, dungeons and raids,
-battlegrounds and honor, groups, guilds, trade, mail and the auction house, on the stock 1.12
-interface and with your addons. It connects to a 1.12.1 server over the original protocol and
-reads the game's data from your own 1.12.1 install. Every file format, the network protocol and
-the interface engine are written from scratch, with no original client code, no third-party WoW
-crates and no bundled game assets.
+This repository is a fork of [benilla](https://github.com/samwhosung/benilla), the from-scratch
+World of Warcraft 1.12.1 client in Rust and Bevy, extended for **Turtle WoW** and for **mobile**
+(Android, and iOS as **iNilla**). Everything specific to this fork is in this first part; the
+upstream benilla README follows below the separator, unchanged in substance.
 
-## What's inside
+## Downloads
 
-- **Formats:** readers for the whole asset stack (the MPQ patch chain, BLP, DBC, ADT, WDT, WDL, M2
-  and WMO), wired into Bevy as an asset source.
-- **World:** terrain streamed out to the horizon, portal-culled buildings with interior lighting,
-  doodads and ground clutter, swimmable water, sky and weather, and the client's own day/night
-  lighting, fog and gamma.
-- **Models:** GPU-skinned M2s with the full animation controller, particles, ribbons and the spell
-  visuals, and characters end to end: customization, the armor composite, weapons with their
-  enchant glows, forms, stealth and mounts.
-- **Movement:** networked movement in both directions, the server-granted modes from slow fall to
-  roots, a follow camera with collision, boats, zeppelins and taxi flights.
-- **Networking:** SRP6 auth through world-session crypto and the object mirror into the ECS,
-  covering the game from movement and chat through combat, spells, groups and raids, quests,
-  trade, mail, the auction house and battlegrounds.
-- **Interface:** a FrameXML and Lua engine that runs the stock 1.12 interface off your install's
-  patch chain, and third-party 1.12 addons: Questie, pfUI, Bagnon, Bartender2 and most others
-  run. By choice, the options window and the ESC menu follow the Classic Era client's rather than
-  1.12's.
-- **Audio:** music, ambience and effects under the client's own selection and crossfade rules,
-  with interior and underwater transitions and zone reverb.
+Every build of `main` and every pull request produces artifacts in the **Actions** tab. Tagged
+builds (`v*`) are published as one GitHub Release holding every platform:
 
-## Platforms
+| Platform | Asset | Notes |
+|---|---|---|
+| Windows x86_64 | `benilla-windows-x86_64.exe` | dev build (debug panel, perf HUD) |
+| Linux x86_64 | `benilla-linux-x86_64` | dev build; `chmod +x` after download |
+| macOS arm64 | `benilla-macos-aarch64` | dev build; `chmod +x` after download |
+| all desktop | `benilla-perf-*` | player build (`--profile ship`, no dev instruments) — the one to benchmark |
+| Android arm64 | `benilla-android-aarch64.apk` | signed release APK |
+| iOS arm64 | `iNilla-<version>.ipa` | iOS 17+, ad-hoc signed — sideload with SideStore, AltStore or LiveContainer |
 
-Desktop and Android build from the same source tree. Status below is what has actually been run
-and fixed against on real hardware, not just what compiles in CI.
-
-- **Windows** — actively developed against. `benilla-config` now resolves to the running user's
-  Documents folder through the Windows shell API (`SHGetKnownFolderPath`), rather than assuming
-  an XDG-style path the way Linux does, including a follow-up fix for a Windows API type
-  mismatch the first pass got wrong (a null handle, not a zero integer). Builds in CI
-  (`windows-latest`) and has been run for real.
-- **Android** — the primary mobile target, and the platform with the most fixes behind it so
-  far: the missing `INTERNET` permission (nothing connects without it — `cargo-apk` has no
-  manifest-merging step, so the permission list in `benilla-android/Cargo.toml` is the *entire*
-  source of truth for the APK's manifest) is fixed, `WOW_DATA` defaults to the app's own media
-  directory, a Bevy default-feature conflict between `game-activity` and the `native-activity`
-  this project actually targets is resolved, and a signed release APK builds from CI. See
-  **Touch input** below for the control scheme. Compile-and-link and signed packaging are
-  proven; nobody has confirmed a full play session on a device or emulator yet, so treat it as
-  "should work," not "confirmed."
-- **Linux (Ubuntu)** — builds in CI (`ubuntu-latest`) the same as upstream, and is presumed fine
-  since it's the primary Bevy development target — no Linux-specific bugs have come up because
-  none have needed fixing. Not independently verified by this fork beyond that CI build.
-- **macOS** — builds in CI (`macos-latest`). No macOS-specific work has happened in this fork at
-  all — genuinely unverified; nobody here has run it.
-
-### Touch input (Android)
-
-- An on-screen virtual joystick, bottom-left, floating — it centers on wherever your thumb lands
-  rather than sitting at a fixed spot — mapped to WASD-equivalent movement.
-- Free-swipe camera look anywhere else on the screen.
-- Every finger is classified once, on touchdown — joystick, UI, or world-look — and keeps that
-  role until it lifts. That structure is what fixed an earlier bug where a tap's release could be
-  silently dropped (the real cause of "taps need spamming" and "a second resting finger fixes
-  it"), rather than patching around it case by case.
-- **Status:** implemented and merged, not yet confirmed on a real device. CI proves the APK
-  compiles, packages, and — as of the last signed build — that release signing works; an actual
-  play session hasn't happened yet.
-- Planned next, tracked in
-  [#8](https://github.com/jhinzuo2/benilla-twow/issues/8): face/camera-based target selection
-  without needing Tab, and a more mobile-tailored FrameXML layout with auto-login.
+`SHA256SUMS.txt` in each release lists the checksum of every asset.
 
 ## TurtleWoW compatibility
 
@@ -119,6 +62,138 @@ Known open gaps, tracked as issues: TransmogUI renders only its background
 empty pending FrameXML work ([#7](https://github.com/jhinzuo2/benilla-twow/issues/7)), and some
 Tauren gear/hair combinations render white under a cause not yet identified
 ([#6](https://github.com/jhinzuo2/benilla-twow/issues/6)).
+
+## Platforms
+
+Desktop, Android and iOS build from the same source tree. Status below is what has actually been
+run and fixed against on real hardware, not just what compiles in CI.
+
+- **Windows** — actively developed against. `benilla-config` resolves to the running user's
+  Documents folder through the Windows shell API (`SHGetKnownFolderPath`), rather than assuming
+  an XDG-style path the way Linux does. Builds in CI (`windows-latest`) and has been run for real.
+- **Android** — the primary mobile target, and the platform with the most fixes behind it so
+  far: the missing `INTERNET` permission (nothing connects without it — `cargo-apk` has no
+  manifest-merging step, so the permission list in `benilla-android/Cargo.toml` is the *entire*
+  source of truth for the APK's manifest) is fixed, `WOW_DATA` defaults to the app's own media
+  directory, a Bevy default-feature conflict between `game-activity` and the `native-activity`
+  this project actually targets is resolved, and a signed release APK builds from CI.
+  Compile-and-link and signed packaging are proven; nobody has confirmed a full play session on
+  a device or emulator yet, so treat it as "should work," not "confirmed."
+- **iOS (iNilla)** — the benilla client for iPhone and iPad, with touch, game-controller support
+  and an in-app launcher (`crates/inilla-*`, `crates/benilla-app/src/inilla/`, `ios/`). The
+  `.ipa` targets iOS 17 or later on arm64 and is ad-hoc signed: SideStore, AltStore and
+  LiveContainer re-sign it on install. On first launch it asks for the game data — your own
+  1.12.1 `Data` folder, copied in or downloaded from your server's data host. A crash or black
+  screen leaves the session log under Files → iNilla → benilla-config → Diagnostics.
+- **Linux (Ubuntu)** — builds in CI (`ubuntu-latest`) the same as upstream, and is presumed fine
+  since it's the primary Bevy development target. Not independently verified by this fork beyond
+  that CI build.
+- **macOS** — builds in CI (`macos-latest`, Apple silicon). No macOS-specific work has happened
+  in this fork — genuinely unverified; nobody here has run it.
+
+### Touch input (Android)
+
+- An on-screen virtual joystick, bottom-left, floating — it centers on wherever your thumb lands
+  rather than sitting at a fixed spot — mapped to WASD-equivalent movement.
+- Free-swipe camera look anywhere else on the screen.
+- Every finger is classified once, on touchdown — joystick, UI, or world-look — and keeps that
+  role until it lifts. That structure is what fixed an earlier bug where a tap's release could be
+  silently dropped (the real cause of "taps need spamming" and "a second resting finger fixes
+  it"), rather than patching around it case by case.
+- **Status:** implemented and merged, not yet confirmed on a real device.
+- Planned next, tracked in
+  [#8](https://github.com/jhinzuo2/benilla-twow/issues/8): face/camera-based target selection
+  without needing Tab, and a more mobile-tailored FrameXML layout with auto-login.
+
+## Setup (this fork)
+
+You need your own Turtle WoW (or other 1.12.1) client for the game data; benilla only reads it
+and never writes into it. Point `WOW_DATA` at its `Data` folder (see "Running it" below), and
+`WOW_HOST` at the realm.
+
+Where local state lives:
+
+- **Windows:** `C:\Users\USERNAME\Documents\benilla-twow\benilla-config`
+- **Android:** `/sdcard/Android/media/benilla-config`
+- **iOS:** Files → iNilla → `benilla-config`
+- **Linux / macOS dev build:** `benilla-config/` at the repo root
+
+Font support: put the five original font files in `benilla-config/fonts/` — `ARIALN.ttf`,
+`FRITZQT__.ttf`, `skurri.ttf`, `MORPHEUS.ttf`, `WarSansTT-Bliz-500.ttf`.
+
+## Building (this fork)
+
+Desktop builds work as upstream describes below (`cargo run --release -p benilla`). The other
+targets:
+
+- **Android:** `cargo apk build --release -p benilla-android` with the Android SDK
+  (`platforms;android-31`, `build-tools;34.0.0`), NDK r26d and the `aarch64-linux-android` Rust
+  target. A release APK is signed through `CARGO_APK_RELEASE_KEYSTORE` and
+  `CARGO_APK_RELEASE_KEYSTORE_PASSWORD`.
+- **iOS:** `ios/build-staticlib.sh` builds `libinilla_ios.a` (it runs on Linux), then
+  `ios/package-ipa.sh` links, bundles and signs `iNilla.ipa` on a Mac with Xcode. The iOS build
+  type-checks on Linux without an SDK:
+  `source ios/toolchain/linux-env.sh && cargo check --target aarch64-apple-ios -p inilla-ios`.
+- **iNilla's own checks:** `cargo test -p inilla-core -p inilla-platform` and
+  `cargo check -p benilla-app`.
+
+### CI and releases
+
+| Workflow | When | What |
+|---|---|---|
+| `build.yml` | push to `main`, pull requests, `v*` tags, manual | builds every platform in parallel — Windows, Linux, macOS (dev and perf builds), Android, iOS — and uploads each as an artifact; a `release` job bundles them into one GitHub Release |
+| `ci.yml` | pull requests from forks, manual | upstream's install-free gates (fmt, clippy, tests, lints) |
+| `inilla-check.yml` | every push and pull request | iNilla's fast Linux gate: engine-free tests, desktop and iOS type-checks |
+| `trace.yml` | manual | Windows player build with `trace_chrome` for profiling |
+| `lockfile.yml` | manual | regenerates and commits `Cargo.lock` after a dependency change |
+| `inilla-budget.yml` | weekly, manual | reports Actions minutes against the private repository's quota |
+
+The iOS jobs spend macOS minutes, so on a plain push or pull request they are skipped; they run
+on tags and manual runs. To publish a release, push an annotated tag `v1.2.3` (its message
+becomes the release text), or run `build.yml` from the Actions tab with `release` set to the tag
+and `notes` filled in. A manual run with `release` empty is a test build: artifacts only. Releases
+are created as pre-releases until a build is marked tested by hand.
+
+---
+
+<div align="center">
+  <h1>benilla</h1>
+  <p><b>A complete World of Warcraft 1.12.1 client, written from scratch in Rust and <a href="https://bevy.org">Bevy</a></b></p>
+  <p>
+    <a href="https://discord.gg/wJSJx467G4"><img src="https://img.shields.io/discord/1529280129518538922?style=for-the-badge&logo=discord&logoColor=white&label=discord&color=5865F2" alt="Discord"></a>
+    <a href="https://www.youtube.com/playlist?list=PLdCnpZNKxyb8"><img src="https://img.shields.io/badge/devlog-youtube-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube devlog"></a>
+    <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue?style=for-the-badge" alt="License"></a>
+  </p>
+</div>
+
+benilla plays the whole game: character creation, questing and professions, dungeons and raids,
+battlegrounds and honor, groups, guilds, trade, mail and the auction house, on the stock 1.12
+interface and with your addons. It connects to a 1.12.1 server over the original protocol and
+reads the game's data from your own 1.12.1 install. Every file format, the network protocol and
+the interface engine are written from scratch, with no original client code, no third-party WoW
+crates and no bundled game assets.
+
+## What's inside
+
+- **Formats:** readers for the whole asset stack (the MPQ patch chain, BLP, DBC, ADT, WDT, WDL, M2
+  and WMO), wired into Bevy as an asset source.
+- **World:** terrain streamed out to the horizon, portal-culled buildings with interior lighting,
+  doodads and ground clutter, swimmable water, sky and weather, and the client's own day/night
+  lighting, fog and gamma.
+- **Models:** GPU-skinned M2s with the full animation controller, particles, ribbons and the spell
+  visuals, and characters end to end: customization, the armor composite, weapons with their
+  enchant glows, forms, stealth and mounts.
+- **Movement:** networked movement in both directions, the server-granted modes from slow fall to
+  roots, a follow camera with collision, boats, zeppelins and taxi flights.
+- **Networking:** SRP6 auth through world-session crypto and the object mirror into the ECS,
+  covering the game from movement and chat through combat, spells, groups and raids, quests,
+  trade, mail, the auction house and battlegrounds.
+- **Interface:** a FrameXML and Lua engine that runs the stock 1.12 interface off your install's
+  patch chain, and third-party 1.12 addons: Questie, pfUI, Bagnon, Bartender2 and most others
+  run. By choice, the options window and the ESC menu follow the Classic Era client's rather than
+  1.12's.
+- **Audio:** music, ambience and effects under the client's own selection and crossfade rules,
+  with interior and underwater transitions and zone reverb.
 
 The format readers and the UI engine core are plain Rust with no Bevy in them, and the world
 renderer runs with no game attached. [`docs/MAP.md`](docs/MAP.md) maps every crate and subsystem,
@@ -172,17 +247,6 @@ does the same (`ln -s /path/to/WoW WoW`, or on Windows a junction, which needs n
 screen, which remembers it. Credentials go in at the login screen, or set `WOW_USER` and `WOW_PASS`
 to skip it.
 
-Windows config lands in C:\Users\USERNAME\Documents\benilla-twow\benilla-config
-
-Android config lands in /sdcard/Android/media/benilla-config
-
-Font Support via the 5 Original Fontnames inside /benilla-config/fonts. 
-(ARIALN.ttf, 
-FRITZQT__.ttf, 
-skurri.ttf, 
-MORPHEUS.ttf, 
-WarSansTT-Bliz-500.ttf)
-
 Settings, screenshots and addons live in `benilla-config/` at the repo root: a 1.12 addon goes in
 `benilla-config/AddOns/`. [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) has the rest, from the
 player build to the tests.
@@ -193,7 +257,7 @@ Issues and pull requests are open. [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md
 start, what gets in, how a change is judged and what happens to a pull request once it is open.
 Bugs, questions and ideas are welcome on the [Discord](https://discord.gg/wJSJx467G4) too.
 
----
+## Credits and license
 
 Early inspiration and file format guidance came from the
 [wowemulation-dev](https://github.com/wowemulation-dev) community, and
