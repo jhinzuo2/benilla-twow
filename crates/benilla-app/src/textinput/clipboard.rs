@@ -96,7 +96,7 @@ impl Pasteboard for UiPasteboard {
 }
 
 /// The platform's own pasteboard, where there is no Wayland one.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn open_default() -> Result<Box<dyn Pasteboard>, String> {
     arboard::Clipboard::new()
         .map(|c| Box::new(c) as Box<dyn Pasteboard>)

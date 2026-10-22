@@ -107,11 +107,6 @@ objc2-app-kit = { version = "0.2", features = [
 ] }
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry"] }
 
-# The EditBox clipboard, on the main thread as NSPasteboard requires; bevy_egui's 3.x. iNilla: not
-# on iOS, where arboard has no backend (it would build its X11 one) — `inilla-platform::pasteboard` is.
-[target.'cfg(not(target_os = "ios"))'.dependencies]
-arboard = "3"
-
 # iNilla: the game's UIView behind Bevy's raw window handle (the safe-area insets), and winit's
 # iOS window extension (the landscape lock). The versions already in the tree via Bevy.
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -160,7 +155,9 @@ bevy = { workspace = true, features = ["android-native-activity"] }
 # missing type. Moved here so a phone build never asks for it; clipboard.rs's arboard impl block
 # and its one call site are `#[cfg(not(target_os = "android"))]` to match, with a no-op
 # `NoClipboard` backend standing in for Android until a JNI ClipboardManager shim exists.
-[target.'cfg(not(target_os = "android"))'.dependencies]
+# iNilla: not on iOS either, where arboard has no backend (it would build its X11 one) — the
+# pasteboard there is `inilla-platform::pasteboard`.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # OS clipboard access for the UI EditBox copy/cut/paste chords (chat input). Already in the tree via
 # bevy_egui; pinned to the same 3.x so there's one copy. Read on the main thread (the UI key feed is
 # a NonSend system) — required for the macOS NSPasteboard path. Covers macOS, Windows, and Linux/BSD
