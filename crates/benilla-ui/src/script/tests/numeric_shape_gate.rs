@@ -87,8 +87,8 @@ fn a_numeric_string_at_a_shape_c_position_is_its_number() {
         -- The colour is stored a byte per channel, as the reference's is: within 1/255.
         assert(math.abs(r - 0.6) < 1 / 255, "'.6' is 0.6, got " .. tostring(r))
         assert(math.abs(g - 0.5) < 1 / 255, "'0.5' is 0.5, got " .. tostring(g))
-        assert(b == 1, "' 1 ' is 1, got " .. tostring(b))
-        assert(a == 1, "the alpha slot is untouched")
+        assert(math.abs(b - 1) < 1 / 255, "' 1 ' is 1, got " .. tostring(b))
+        assert(math.abs(a - 1) < 1 / 255, "the alpha slot is untouched, got " .. tostring(a))
         "#,
     )
     .expect("numeric strings are numbers");
