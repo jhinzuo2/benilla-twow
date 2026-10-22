@@ -951,7 +951,11 @@ pub(crate) mod schedule_tests {
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
     /// that commutes by construction belongs in [`Classes`].
-    const UPDATE_ACTIONABLE_CEILING: usize = 1_780;
+    ///
+    /// The fork's own: Android's touch arbiter (`touch::classify_touches`) and soft-keyboard driver
+    /// (`android_keyboard::drive_soft_keyboard`), which read the input and client state the game
+    /// writes and are ordered only against the UI pass.
+    const UPDATE_ACTIONABLE_CEILING: usize = 1_790;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1771,6 +1775,10 @@ pub(crate) mod schedule_tests {
           raised by the gesture it just made"),
         ("death/mod.rs", "feed_death", Because::MemoLatched,
          "`feed.vm: VmMemo<DeathAnnounced>`: a fresh memo makes the first snapshot an edge and re-announces a held offer, confirm and corpse range"),
+        ("inilla/synth.rs", "apply", Because::SelfHealing,
+         "iNilla: the binding presses the touch and controller layers queued, which the player makes again; its plugin is added after `GamePlugins` (`lib.rs`), so the headless census does not see it"),
+        ("inilla/synth.rs", "run_vm_ops", Because::FilledByVm,
+         "iNilla: the console's chat lines and Lua jobs, typed by the player into a VM that is up; its plugin is added after `GamePlugins` (`lib.rs`), so the headless census does not see it"),
         ("net/objects/update.rs", "on_update_end", Because::Deliberate,
          "a net handler whose take is the packet's own pass, the blocks its write pass recorded, documented at the line: it publishes nothing to the VM, whose `UNKNOWNOBJECT` text it reads only to name a party member's pet; its notices go to the gated field-notice firing"),
         ("screenshot.rs", "ask_for_captures", Because::FilledByVm,

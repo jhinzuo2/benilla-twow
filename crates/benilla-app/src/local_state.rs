@@ -794,18 +794,7 @@ mod tests {
         let _h = EnvGuard::unset("BENILLA_HOME");
         let h = resident_home().expect("the resident folder always resolves");
         assert!(h.ends_with(STATE_DIR), "{}", h.display());
-
-        #[cfg(windows)]
-        {
-            // `home()` tries this before either of the other two steps, so as long as the shell
-            // call succeeds (true on every CI/player Windows box — it fails only in exotic
-            // sandboxes with no Documents folder at all) this is the whole answer, and the
-            // project-folder/exe-dir cases below are unreachable on this platform.
-            if let Some(docs) = windows_documents_dir() {
-                assert_eq!(h, docs.join("benilla-twow").join(STATE_DIR));
-                return;
-            }
-        }
+        // Windows' Documents folder is `home()`'s step ahead of these two, not `resident_home`'s.
 
         let Some(here) = benilla_formats::project_folder() else {
             // Player build: beside the binary.

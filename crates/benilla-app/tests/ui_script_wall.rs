@@ -40,7 +40,11 @@ fn family(rel: &str) -> Family {
 }
 
 /// The standing count of `Game` files; raise it only with the reason written down.
-const CEILING: usize = 40;
+///
+/// The fork's seven: iNilla drives the interface for touch and controllers (`inilla/hints.rs`,
+/// `icons.rs`, `pad.rs`, `platform.rs`, `synth.rs`, `touch.rs`), and Android's touch arbiter
+/// hit-tests it (`touch/mod.rs`).
+const CEILING: usize = 46;
 
 /// How far under [`CEILING`] the count may sit before the test asks for the ceiling to follow it.
 const SLACK: usize = 4;

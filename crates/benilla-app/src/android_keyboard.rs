@@ -87,7 +87,8 @@ mod tests {
 
     fn keyboard_app() -> App {
         let mut app = App::new();
-        app.init_state::<ClientState>()
+        app.add_plugins(bevy::state::app::StatesPlugin)
+            .init_state::<ClientState>()
             .init_resource::<UiKeyboardCapture>()
             .add_plugins(AndroidKeyboardPlugin);
         app

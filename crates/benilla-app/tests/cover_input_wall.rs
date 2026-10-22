@@ -103,6 +103,34 @@ const VERDICTS: &[(&str, Verdict)] = &[
     ("WindowPlugin", Plumbing),
     ("WindowPosition", Plumbing),
     ("WindowResolution", Plumbing),
+    // ── The fork's mobile input ─────────────────────────────────────────────────────────────
+    // The Android activity handle and winit's window table: read to raise the soft keyboard and
+    // to set iOS window options, outputs that carry no input.
+    ("ANDROID_APP", Plumbing),
+    ("AndroidApp", Plumbing),
+    ("WINIT_WINDOWS", Plumbing),
+    // iOS's deferred screen edges, an output setting.
+    ("ScreenEdge", Plumbing),
+    (
+        "Touches",
+        Open("the fork's touch layers (`touch/`, `inilla/`), not routed through the cover yet"),
+    ),
+    (
+        "TouchInput",
+        Open("iNilla's touch layer, not routed through the cover yet"),
+    ),
+    (
+        "TouchPhase",
+        Open("iNilla's touch layer, not routed through the cover yet"),
+    ),
+    (
+        "Gamepad",
+        Open("iNilla's controller layer (`inilla/pad.rs`), not routed through the cover yet"),
+    ),
+    (
+        "GamepadButton",
+        Open("iNilla's controller layer (`inilla/pad.rs`), not routed through the cover yet"),
+    ),
 ];
 
 /// The gate's source, which every `Swallowed` row must name.

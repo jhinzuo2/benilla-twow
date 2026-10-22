@@ -253,7 +253,13 @@ impl Plugin for TouchPlugin {
             // Before the UI feed, which reads `TouchPointer`, and so before the world input that
             // runs after the UI pass.
             .configure_sets(Update, TouchInputSet.before(crate::ui_script::UiInput))
-            .add_systems(Update, classify_touches.in_set(TouchInputSet))
+            // A VM holder (the UI hit test), so it declares its side of the tick: the feed phase.
+            .add_systems(
+                Update,
+                classify_touches
+                    .in_set(TouchInputSet)
+                    .in_set(crate::ui_script::UiFeed),
+            )
             .add_plugins(joystick::JoystickVisualsPlugin);
     }
 }

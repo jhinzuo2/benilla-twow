@@ -246,6 +246,16 @@ mod tests {
         // The action bar's usable cache, engine state the reference keeps past a `/reload`: its
         // zeroing `0x4e4f50` runs only from `InitializeGame 0x48f480`.
         ("ui_action/state.rs", "cache"),
+        // iNilla: the hotkey hints compare against a generation they stamp into the VM, so a
+        // fresh VM reads 0 and they apply again.
+        ("inilla/hints.rs", "state"),
+        // iNilla's throttles, wall-clock times of the next look.
+        ("inilla/hints.rs", "next"),
+        ("inilla/icons.rs", "next"),
+        ("inilla/pad.rs", "next"),
+        ("inilla/platform.rs", "next"),
+        // The pad's pointer-window Lua source, built once; it holds no VM value.
+        ("inilla/pad.rs", "chunk"),
     ];
 
     use crate::test_support::{fn_parameter_lists, rust_files};
