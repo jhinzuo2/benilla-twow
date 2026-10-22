@@ -159,10 +159,16 @@ pub(super) fn spawn_loaded_placements(
             // empty, and let residency complete.
             let failed = match &p.model {
                 ModelHandle::M2(h) => {
-                    matches!(asset_server.load_state(h), bevy::asset::LoadState::Failed(_))
+                    matches!(
+                        asset_server.load_state(h),
+                        bevy::asset::LoadState::Failed(_)
+                    )
                 }
                 ModelHandle::Wmo(h) => {
-                    matches!(asset_server.load_state(h), bevy::asset::LoadState::Failed(_))
+                    matches!(
+                        asset_server.load_state(h),
+                        bevy::asset::LoadState::Failed(_)
+                    )
                 }
             };
             if failed {
