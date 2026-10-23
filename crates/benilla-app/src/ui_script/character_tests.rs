@@ -53,6 +53,7 @@ fn combat_stats() -> UnitCombatStats {
 fn inventory_with_head_item() -> InventorySlots {
     let mut slots: InventorySlots = Default::default();
     slots[1] = Some(InvSlotView {
+        uncached_link: None,
         duration_ms: None,
         field_duration: 0,
         already_bound: false,
@@ -91,6 +92,7 @@ fn backpack_with_fitting_helm() -> benilla_ui::script::ContainerState {
     slots.insert(
         1,
         benilla_ui::script::ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -566,6 +568,7 @@ fn cursor_update_highlights_fitting_doll_slots_while_holding_a_bag_item() {
 fn model_pane_click_auto_equips_a_held_bag_item() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for f in super::test_ui::CHARACTER_UI {
         super::test_ui::load_ui_strict(&s, f);
@@ -673,9 +676,10 @@ fn broken_equipped_item_tints_its_doll_slot_red() {
 #[test]
 fn tab_round_trip_with_a_selected_skill_by_point() {
     let _data = benilla_formats::wow_data_or_skip!();
-    use benilla_ui::script::{SkillEntry, SkillsState};
+    use benilla_ui::script::{SkillCall, SkillEntry, SkillsState};
 
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for f in super::test_ui::CHARACTER_UI {
         super::test_ui::load_ui_strict(&s, f);
@@ -784,7 +788,7 @@ fn tab_round_trip_with_a_selected_skill_by_point() {
         "the detail description renders via SKILL_DESCRIPTION"
     );
 
-    // Accepting the unlearn confirm queues CMSG_UNLEARN_SKILL by skill id; the server removes it.
+    // Accepting the unlearn confirm hands CMSG_UNLEARN_SKILL by skill id; the server removes it.
     assert!(
         shown(&mut s, "SkillDetailStatusBarUnlearnButton"),
         "the unlearn button shows for a profession"
@@ -801,9 +805,9 @@ fn tab_round_trip_with_a_selected_skill_by_point() {
     );
     s.run("StaticPopup1Button1:Click()").unwrap();
     assert_eq!(
-        s.take_skill_abandons(),
-        vec![164],
-        "accept queues the skill id"
+        s.take_skill_calls(),
+        [SkillCall::Abandon(164)],
+        "accept hands the skill id"
     );
     assert!(!shown(&mut s, "StaticPopup1"), "accept closes the confirm");
     assert_eq!(

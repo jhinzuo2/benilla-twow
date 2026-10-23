@@ -4,11 +4,11 @@ use crate::layout::{LayoutInput, LayoutSolver, Rect};
 use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 
 use super::{
-    auction, backdrop, bank, bind_confirm, camera_view, char_stats, chat_window, colorselect,
-    container, craft, cursor, death, duel, follow, gossip, guild, item_text, loot, loot_roll,
-    macros, mail, merchant, parse_unit_token, party, petition, pvp, quest, quest_log, reputation,
-    session, simplehtml, skills, slider, social, spellbook, stable, taxi, trade, tradeskill,
-    trainer, weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView, MusicRequest,
+    auction, backdrop, bank, camera_view, char_stats, chat_window, colorselect, container, craft,
+    cursor, death, duel, follow, gossip, guild, item_calls, item_text, loot, loot_roll, macros,
+    mail, merchant, parse_unit_token, party, petition, pvp, quest, quest_log, reputation, session,
+    simplehtml, skills, slider, social, spellbook, stable, taxi, trade, tradeskill, trainer,
+    weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView, MusicRequest,
     PlayerReqState, RegionData, ScriptValue, SoundRequest, UnitBase, UnitState, UnitTokenParse,
 };
 
@@ -148,6 +148,9 @@ pub(crate) struct Model {
     /// A path's texel size, which an axis authored as 0 takes, one texel per unit, as the client's
     /// `GetWidth` (`0x770720`) and `GetHeight` (`0x770790`) do; `None` leaves it as authored.
     pub(crate) texture_size_probe: Option<TextureSizeProbe>,
+    /// The size of a picture the cursor code opens (`0x449610`), which `SetCursor`'s custom
+    /// cursor must have at 32 by 32 (`0x523cb9`); `None` loads none.
+    pub(crate) cursor_size_probe: Option<TextureSizeProbe>,
     /// Whether a font path loads: `SetFont`'s 1 or nil, nil meaning a load failure (`0x79f345`,
     /// `0x79f361`, from `0x5c1ae0` in the `0x44d040` cache). Unlike `texture_probe`, `None` answers
     /// 1 for a non-empty path: without a font backend nothing failed, and addons revert their font
@@ -432,9 +435,9 @@ pub(crate) struct Model {
     pub(crate) call_raises: super::calls::CallRaises,
     /// The binding functions' queue and mouselook state.
     pub(crate) input: super::input_verbs::InputState,
-    /// The selection change a script call made and the input events it ran under, for the event
-    /// the unit feed signals for it ([`super::UiScript::note_selection_cause`]).
-    pub(crate) selection_cause: Option<(Option<u64>, super::InputEvents)>,
+    /// The selection a script call last moved to and signalled `PLAYER_TARGET_CHANGED` for inside
+    /// itself, for the unit feed to take as heard ([`super::UiScript::announce_selection`]).
+    pub(crate) announced_selection: Option<Option<u64>>,
     /// The protected-action gate's input events ([`super::protected`]).
     pub(crate) protected: super::protected::Flags,
     /// `DropItemOnUnit` tokens (`0x48d960`), gated by the app; a refusal silently keeps the item.
@@ -476,14 +479,15 @@ pub(crate) struct Model {
     pub(crate) lfg_comment: String,
     /// Guild roster, ranks, MOTD and info, sorted and filtered by the app, which holds the toggles.
     pub(crate) guild: guild::GuildState,
-    /// The rank editor's unsaved edits, apart from `guild` so a push cannot discard them.
-    pub(crate) guild_control: guild::GuildRankEdit,
-    /// Guild calls (`GuildInviteByName`, `GuildSetMOTD`, `GuildControlSaveRank`, …) queued.
-    pub(crate) guild_requests: Vec<guild::GuildRequest>,
+    /// The roster module's own cells and the rank editor's unsaved edits, apart from `guild` so a
+    /// push keeps them.
+    pub(crate) guild_cells: guild::GuildCells,
+    /// The guilds `GetGuildInfo` missed, `(guild_id, guid)`, for the app to ask with a waiter.
+    pub(crate) guild_info_asks: Vec<(u32, u64)>,
     /// The charter price and open petition, names resolved from caches as the reference does.
     pub(crate) petition: petition::PetitionState,
-    /// Charter calls (`BuyGuildCharter`, `SignPetition`, `TurnInGuildCharter`, …) queued.
-    pub(crate) petition_requests: Vec<petition::PetitionRequest>,
+    /// `CloseGuildRegistrar` was called: the interaction latch runs the close core.
+    pub(crate) registrar_close: bool,
     /// Per chat window from `ChatFrame1`, the tint, alpha and font size its tab menu can change.
     pub(crate) chat_window_looks: [chat_window::ChatWindowLook; chat_window::NUM_CHAT_WINDOWS],
     /// 0-based windows whose look Lua changed, the persist cue.
@@ -632,22 +636,23 @@ pub(crate) struct Model {
     pub(crate) pet_book_generation: u64,
     /// The player's macros, owned here as 1.12 macros have no server side; the app persists them.
     pub(crate) macros: macros::MacroState,
-    /// A script changed the macros: the save and `UPDATE_MACROS` cue.
+    /// A script changed the macros: the save's cue.
     pub(crate) macros_dirty: bool,
     /// Bumped by every seed and change, for readers that must not drain `macros_dirty`.
     pub(crate) macros_generation: u64,
     /// Bumped by every `EditMacro` that names a macro, whose worker `0x4f1280` ends in the action
     /// bar's usable refresh (`0x4f132e`).
     pub(crate) macro_edits: u64,
-    /// Each macro's cached cast by id, from the app; an absent macro reads unbound.
+    /// The load's derivations the table owes the app since its last take.
+    pub(crate) macro_derives: macros::MacroDerives,
+    /// Each macro's cached cast by id, derived in the verbs and the app's pass; an absent macro
+    /// reads unbound.
     pub(crate) macro_bindings: HashMap<u32, macros::MacroBinding>,
     /// The macro icon chooser's paths, behind `GetMacroIconInfo`: `0x4f0090`'s listing of
     /// `Interface\Icons\`, not `SpellIcon.dbc`.
     pub(crate) macro_icons: Vec<String>,
     /// What builds `macro_icons` while it is empty; `None` builds nothing.
     pub(crate) macro_icon_source: Option<MacroIconSource>,
-    /// `ToggleSpellAutocast` ids for `CMSG_PET_SPELL_AUTOCAST` (`0x2F3`), which names a spell.
-    pub(crate) pet_spell_autocasts: Vec<u32>,
     /// The player's cast state, which `IsCurrentAction`, `IsAutoRepeatAction` and
     /// `SpellStopCasting()` (`0x6e6e80`) read: the last's 1 or nil matters, as the ESC chain
     /// (`UIParent.lua:1489`) reaches `CloseAllWindows()` on nil.
@@ -661,10 +666,6 @@ pub(crate) struct Model {
     pub(crate) spell_targetable_units: HashSet<u64>,
 
     pub(crate) talents: super::talent::TalentUiState,
-    /// `LearnTalent(tab, index)` calls queued.
-    pub(crate) talent_learns: Vec<(u32, u32)>,
-    /// `ConfirmTalentWipe()` calls, one `MSG_TALENT_WIPE_CONFIRM` each; the app holds the trainer.
-    pub(crate) talent_wipe_confirms: u32,
     /// `CheckTalentMasterDist()`: the respec question is live and in range; false hides its dialog.
     pub(crate) talent_master_pending: bool,
     // ── The dialog engine's verbs (`0x48dca0` is the first below) ──
@@ -730,24 +731,12 @@ pub(crate) struct Model {
 
     /// The pet bar's ten slots and two bar-wide bits, replaced whole by every `SMSG_PET_SPELLS`.
     pub(crate) pet_bar: super::pet::PetBarState,
-    /// 1-based slot indices `TogglePetAutocast` queued.
-    pub(crate) pet_autocast_toggles: Vec<u32>,
-    /// `PetStopAttack()` calls.
-    pub(crate) pet_stop_attacks: u32,
     /// `HasFullControl`, the reference's `[0xb4b3e4]`: set by `SMSG_CLIENT_CONTROL_UPDATE` for the
     /// player, boots 1, and every cast, item and cursor gate refuses at 0.
     pub(crate) player_control: bool,
     /// The on-use spells that pass the item dispatcher's control gate without control of the
     /// character (`0x5d8ec0`-`0x5d8f6a`), fed by the app.
     pub(crate) control_bypass: HashSet<u32>,
-    /// One `CMSG_PET_SET_ACTION` per entry, its one or two `(position, packed word)` pairs: the
-    /// server tells the forms apart by body size, so a move's two pairs must not be flattened.
-    pub(crate) pet_set_actions: Vec<Vec<(u32, u32)>>,
-    /// `PetAbandon()` and `PetDismiss()` calls, counted apart though both end at one opcode.
-    pub(crate) pet_abandons: u32,
-    pub(crate) pet_dismisses: u32,
-    /// Names `PetRename` queued, from the `PETRENAMECONFIRM` popup.
-    pub(crate) pet_renames: Vec<String>,
 
     /// Bag contents by API bag id (0 is the backpack).
     pub(crate) containers: HashMap<i64, container::ContainerState>,
@@ -772,19 +761,14 @@ pub(crate) struct Model {
     /// The world pick under the cursor (`[this+0x350]`): a world click drops no payload on an
     /// object, only an item on terrain, and anything over nothing.
     pub(crate) world_pick: cursor::WorldPick,
-    /// Held-item bag moves, sent as `CMSG_SWAP_INV_ITEM` or `CMSG_SPLIT_ITEM`.
-    pub(crate) container_moves: Vec<container::ContainerMove>,
-    /// `(bag, slot)` clicks made in repair mode.
-    pub(crate) container_repairs: Vec<(i64, u32)>,
+    /// The item calls the verb segment running now filed, which its binding hands the host as the
+    /// segment ends ([`item_calls::submit_item_calls`]).
+    pub(crate) item_calls: Vec<item_calls::ItemCall>,
     /// Targeting wants an item (`0x6e6330`): a bag or paper-doll click becomes a pick.
     pub(crate) item_pick_armed: bool,
-    /// `DeleteCursorItem`'s `(bag, slot, count)`, 0 for the whole stack, as `CMSG_DESTROYITEM`.
-    pub(crate) container_destroys: Vec<(i64, u32, u32)>,
     /// The wrapping paper a right-click armed (`0x5edea0`: lock it, cursor mode 2, no packet). Not
     /// a cursor payload: the reference sets only the cursor mode, so `CursorHasItem()` stays nil.
     pub(crate) pending_wrap: Option<container::PendingWrap>,
-    /// `(giftBag, giftSlot, itemBag, itemSlot)` per completed wrap, in `CMSG_WRAP_ITEM`'s order.
-    pub(crate) container_wraps: Vec<(i64, u32, i64, u32)>,
     /// The cursor mode Lua set (`0xbe2c2c`); `ResetCursor` returns it to the world's mode.
     pub(crate) ui_cursor: Option<container::UiCursorMode>,
     /// A FrameXML cursor call ran. The mode is a write, not a level: `0xbe2c2c` keeps its value
@@ -793,13 +777,6 @@ pub(crate) struct Model {
     /// The name the last custom cursor loaded under (`0xbe2c70`, copied at `0x523cf5`), which
     /// [`container::UiCursorMode::Custom`] shows; kept across every other mode.
     pub(crate) custom_cursor_name: String,
-    /// `AutoEquipCursorItem`'s `(bag, slot)` sources, sent as `CMSG_AUTOEQUIP_ITEM`.
-    pub(crate) container_autoequips: Vec<(i64, u32)>,
-    /// `AutoEquipCursorItem`'s bind-on-equip questions, `(bag, slot, guid)`: the item stays held.
-    pub(crate) container_equip_asks: Vec<(i64, u32, u64)>,
-    /// `PutItemInBag` and `PutItemInBackpack` stores, sent as `CMSG_AUTOSTORE_BAG_ITEM`, or
-    /// `CMSG_SPLIT_ITEM` for a split stack.
-    pub(crate) bag_autostores: Vec<container::BagAutoStore>,
 
     /// `RegisterForDrag` buttons per frame, compared case-insensitively. Nothing destroys a frame,
     /// so this, `scripts` and `frame_events` are never pruned; a destroy path must prune all three.
@@ -837,9 +814,9 @@ pub(crate) struct Model {
     pub(crate) repair_all_cost: u32,
     /// The repair costs `SetInventoryItem` and `SetBagItem` return.
     pub(crate) repair_costs: merchant::RepairCosts,
-    /// A held vendor row a drop verb bought into a slot, `(bag, slot, item entry)`, handed to the
-    /// host as the verb returns ([`merchant::MerchantCall::BuyInSlot`]).
-    pub(crate) merchant_slot_buys: Vec<(i64, u32, u32)>,
+    /// The buys a drop verb made of a held vendor row, into a slot or a bag, handed to the host as
+    /// the verb returns ([`merchant::MerchantCall::BuyInSlot`], [`merchant::MerchantCall::BuyIntoBag`]).
+    pub(crate) merchant_drops: Vec<merchant::MerchantCall>,
     pub(crate) merchant_close: bool,
     /// Repair mode (`InRepairMode`).
     pub(crate) repair_mode: bool,
@@ -857,8 +834,10 @@ pub(crate) struct Model {
     pub(crate) trainer: Option<trainer::TrainerState>,
     pub(crate) trainer_selection: Option<u32>,
     pub(crate) trainer_close: bool,
-    /// Available, unavailable and used filters, all on by default; they hide services, not headers.
-    pub(crate) trainer_filter: [bool; 3],
+    /// The state filter `ds:0xb73a1c`: bit n set shows the services in state n.
+    pub(crate) trainer_filter: u32,
+    /// The item records the trainer getters' calls missed, one per call, until the app takes them.
+    pub(crate) trainer_item_waits: Vec<u32>,
     /// Collapsed skill-line ids, kept across a re-push and cleared when the trainer closes.
     pub(crate) trainer_collapsed: HashSet<u32>,
     /// The skill-line filter `ds:0xb73a20`: bit n set shows header group n, every bit on a list.
@@ -917,10 +896,6 @@ pub(crate) struct Model {
     /// The 1-based selection, 0 for none, carried across a re-push by the recipe's spell id.
     pub(crate) craft_selection: u32,
     pub(crate) craft_close: bool,
-
-    /// `EquipPendingItem`/`CancelPendingEquip` answers in order, and `ConfirmBindOnUse()` calls.
-    pub(crate) pending_equip_answers: Vec<bind_confirm::PendingEquipAnswer>,
-    pub(crate) bind_on_use_confirms: Vec<bool>,
 
     /// The open loot as the app pushed it; the verbs over it are script calls
     /// ([`loot::LootCall`]).
@@ -1010,6 +985,8 @@ pub(crate) struct Model {
 
     /// The open questgiver panel, and whether `CloseQuest` ran.
     pub(crate) quest: Option<quest::QuestState>,
+    /// The item records `GetQuestItemInfo`'s calls missed, one per call, until the app takes them.
+    pub(crate) quest_item_waits: Vec<u32>,
     pub(crate) quest_close: bool,
     /// The levels of the last greeting's two pools (`0xbde690`, `0xbdfe60`), which outlive the
     /// panel until the next list fills them.
@@ -1156,8 +1133,6 @@ pub(crate) struct Model {
     pub(crate) bank_bag_slots: char_stats::BankBagSlots,
     /// `GetInventoryAlertStatus` in `0x806eb8` order; every push fires `UPDATE_INVENTORY_ALERTS`.
     pub(crate) inventory_alerts: [u8; 12],
-    /// Equipped slot ids clicked while the merchant repair cursor is armed.
-    pub(crate) inventory_repairs: Vec<u32>,
     /// Main- and off-hand temporary enchants in `GetWeaponEnchantInfo`'s order, pushed each frame.
     pub(crate) weapon_enchants: [Option<weapon_enchant::WeaponEnchant>; 2],
 
@@ -1175,7 +1150,8 @@ pub(crate) struct Model {
     pub(crate) tabard_designs: HashMap<crate::widget::FrameHandle, [i32; 5]>,
     pub(crate) tabard_preview: Option<[i32; 5]>,
     pub(crate) tabard_host: super::tabard::TabardHost,
-    pub(crate) tabard_intents: Vec<super::tabard::TabardIntent>,
+    /// `CloseTabardCreation` was called: the interaction latch runs the close core.
+    pub(crate) tabard_close: bool,
     /// The `WorldFrame` type's one-shot record: true once the first is made.
     pub(crate) world_frame_made: bool,
     /// Set while the XML loader's `CreateFrame` call builds a frame: the creation half only, so
@@ -1186,15 +1162,18 @@ pub(crate) struct Model {
     /// The host's relation functions the six relation verbs ask; `None` holds no unit.
     pub(crate) unit_relations: Option<std::rc::Rc<dyn super::UnitRelations>>,
 
-    /// The skills pane's snapshot and the display tree built from it.
+    /// The skill list as the last rebuild made it, its rows' values refreshed by each push, and the
+    /// display tree built from it.
     pub(crate) skills: skills::SkillsState,
     pub(crate) skills_groups: Vec<skills::SkillGroup>,
-    /// Collapsed skill categories by id, kept across a re-push.
+    /// The lines as last pushed, which the next rebuild lists.
+    pub(crate) skills_live: skills::SkillsState,
+    /// Whether this VM's list has been built: its first push builds it.
+    pub(crate) skills_built: bool,
+    /// Collapsed skill categories by id: the mask `0xb731c8`, which only a rebuild resets.
     pub(crate) skills_collapsed: HashSet<u32>,
-    /// The selection as a skill id, not a row.
+    /// The selection as a skill id, not a row (`0xb731c4`).
     pub(crate) skills_selected: Option<u32>,
-    /// `AbandonSkill` ids for `CMSG_UNLEARN_SKILL`; nothing changes until the server's update.
-    pub(crate) skill_abandons: Vec<u32>,
     /// The skill points chosen on each line and not yet accepted (row `+0x10`): `AddSkillUp` and
     /// `RemoveSkillUp` move them, a rebuild or `CancelSkillUps` clears them.
     pub(crate) skills_pending: HashMap<u32, u32>,
@@ -1208,13 +1187,12 @@ pub(crate) struct Model {
     /// The reputation pane's snapshot and the display tree built from it.
     pub(crate) reputation: reputation::ReputationState,
     pub(crate) reputation_groups: Vec<reputation::FactionGroup>,
-    /// Folded headers by key (a `Faction.dbc` id, 0 "Other", -1 "Inactive"), reset on every push
-    /// to all open but Inactive, as the client's rebuild does.
+    /// Folded headers by key (a `Faction.dbc` id, 0 "Other", -1 "Inactive"): the mask `0x84a0a4`.
     pub(crate) reputation_collapsed: HashSet<i64>,
-    /// The selection as a reputation-list slot, not a row.
-    pub(crate) reputation_selected: Option<u32>,
-    /// Reputation calls queued, applied locally first because none of the three sends is acked.
-    pub(crate) reputation_sends: Vec<reputation::ReputationSend>,
+    /// The header keys registered since the last rebuild (`0x4d5c20`), empty before the first.
+    pub(crate) reputation_headers: HashSet<i64>,
+    /// The selection as a faction id, a header's key included (`0xb73768`); 0 until set.
+    pub(crate) reputation_selected: i64,
     /// Every faction with a reputation index under 64, by `Faction.dbc` id: the base for the
     /// player's race and class plus the wire standing (`0x4d6370`). Unlike the pane's rows, a
     /// faction no race/class column fits is here at base 0 (`0x4d5426`, `0x4d553c`).
@@ -1255,8 +1233,6 @@ pub(crate) struct Model {
     /// The world points our own `Minimap:PingLocation` calls pinged, for the host's wire send
     /// (`0x1d5`, `0x4eef72`) and its process-wide copy of the ping.
     pub(crate) minimap_pings_sent: Vec<(f32, f32)>,
-    /// `RequestTimePlayed()` calls, one empty `CMSG_PLAYED_TIME` each.
-    pub(crate) played_time_asks: u32,
     /// `OpeningCinematic()` calls, one empty `CMSG_OPENING_CINEMATIC` each.
     pub(crate) opening_cinematic_asks: u32,
     /// `Screenshot()` calls, one capture each.
@@ -1426,6 +1402,7 @@ impl Model {
             texture_probe: None,
             world_loc_projector: None,
             texture_size_probe: None,
+            cursor_size_probe: None,
             font_probe: None,
             addons_saved_account: None,
             addons_saved_character: None,
@@ -1525,7 +1502,7 @@ impl Model {
             call_raises: Default::default(),
             input: Default::default(),
             protected: Default::default(),
-            selection_cause: None,
+            announced_selection: None,
             drop_item_on_unit: Vec::new(),
             joined_channels: Vec::new(),
             party: party::PartyState::default(),
@@ -1544,10 +1521,10 @@ impl Model {
             lfg_slots: [0; 3],
             lfg_comment: String::new(),
             guild: guild::GuildState::default(),
-            guild_control: guild::GuildRankEdit::default(),
-            guild_requests: Vec::new(),
+            guild_info_asks: Vec::new(),
+            guild_cells: guild::GuildCells::default(),
             petition: petition::PetitionState::default(),
-            petition_requests: Vec::new(),
+            registrar_close: false,
             // Per window, as the stock dock differs: 1 and 2 are the dock, the rest undocked.
             chat_window_looks: std::array::from_fn(chat_window::ChatWindowLook::stock),
             chat_window_changes: HashSet::new(),
@@ -1614,16 +1591,14 @@ impl Model {
             macros_dirty: false,
             macros_generation: 0,
             macro_edits: 0,
+            macro_derives: Default::default(),
             macro_bindings: HashMap::new(),
             macro_icons: Vec::new(),
             macro_icon_source: None,
-            pet_spell_autocasts: Vec::new(),
             cast_view: Default::default(),
             spell_targeting: false,
             spell_targetable_units: HashSet::new(),
             talents: super::talent::TalentUiState::default(),
-            talent_learns: Vec::new(),
-            talent_wipe_confirms: 0,
             talent_master_pending: false,
             pet_unlearn_confirms: 0,
             pet_untrainer_pending: false,
@@ -1657,14 +1632,8 @@ impl Model {
             tutorial_resets: 0,
             shapeshift_forms: Vec::new(),
             pet_bar: super::pet::PetBarState::default(),
-            pet_autocast_toggles: Vec::new(),
-            pet_stop_attacks: 0,
             player_control: true,
             control_bypass: HashSet::new(),
-            pet_set_actions: Vec::new(),
-            pet_abandons: 0,
-            pet_dismisses: 0,
-            pet_renames: Vec::new(),
             containers: HashMap::new(),
             container_cooldowns: HashMap::new(),
             worn_cooldowns: HashMap::new(),
@@ -1673,18 +1642,12 @@ impl Model {
             cursor: None,
             cursor_grid: false,
             world_pick: cursor::WorldPick::default(),
-            container_moves: Vec::new(),
-            container_repairs: Vec::new(),
+            item_calls: Vec::new(),
             item_pick_armed: false,
-            container_destroys: Vec::new(),
             pending_wrap: None,
-            container_wraps: Vec::new(),
             ui_cursor: None,
             ui_cursor_dirty: false,
             custom_cursor_name: String::new(),
-            container_autoequips: Vec::new(),
-            container_equip_asks: Vec::new(),
-            bag_autostores: Vec::new(),
             drag_registered: HashMap::new(),
             drag: None,
             moving: None,
@@ -1699,7 +1662,7 @@ impl Model {
             merchant: None,
             repair_all_cost: 0,
             repair_costs: Default::default(),
-            merchant_slot_buys: Vec::new(),
+            merchant_drops: Vec::new(),
             merchant_close: false,
             repair_mode: false,
             stable: Default::default(),
@@ -1709,7 +1672,8 @@ impl Model {
             trainer: None,
             trainer_selection: None,
             trainer_close: false,
-            trainer_filter: [true; 3],
+            trainer_filter: 7,
+            trainer_item_waits: Vec::new(),
             trainer_collapsed: HashSet::new(),
             trainer_line_filter: u32::MAX,
             trainer_rows: Vec::new(),
@@ -1737,8 +1701,6 @@ impl Model {
             craft_close: false,
             loot: None,
             loot_type: 0,
-            pending_equip_answers: Vec::new(),
-            bind_on_use_confirms: Vec::new(),
             loot_rolls: loot_roll::LootRollsState::default(),
             loot_roll_votes: Vec::new(),
             item_text: None,
@@ -1775,6 +1737,7 @@ impl Model {
             trade_place_seq: 0,
             trade_offered: Default::default(),
             quest: None,
+            quest_item_waits: Vec::new(),
             quest_pool_levels: Default::default(),
             quest_close: false,
             death: death::DeathUiState::default(),
@@ -1826,7 +1789,6 @@ impl Model {
             cursor_pos: (0.0, 0.0),
             minimap: crate::widget::MinimapStatics::default(),
             minimap_pings_sent: Vec::new(),
-            played_time_asks: 0,
             opening_cinematic_asks: 0,
             screenshot_asks: 0,
             realm_name: String::new(),
@@ -1870,7 +1832,6 @@ impl Model {
             inventory_slots: Default::default(),
             bank_bag_slots: Default::default(),
             inventory_alerts: [0; 12],
-            inventory_repairs: Vec::new(),
             weapon_enchants: [None; 2],
             visible_equipment: HashMap::new(),
             inspect_notifies: Vec::new(),
@@ -1879,7 +1840,7 @@ impl Model {
             tabard_designs: HashMap::new(),
             tabard_preview: None,
             tabard_host: Default::default(),
-            tabard_intents: Vec::new(),
+            tabard_close: false,
             world_frame_made: false,
             xml_creating: false,
             unit_reach: HashMap::new(),
@@ -1889,7 +1850,8 @@ impl Model {
             skills_groups: Vec::new(),
             skills_collapsed: HashSet::new(),
             skills_selected: None,
-            skill_abandons: Vec::new(),
+            skills_live: skills::SkillsState::default(),
+            skills_built: false,
             skills_pending: HashMap::new(),
             skill_tiers: HashMap::new(),
             unserved_sends: Vec::new(),
@@ -1897,8 +1859,8 @@ impl Model {
             reputation: reputation::ReputationState::default(),
             reputation_groups: Vec::new(),
             reputation_collapsed: HashSet::new(),
-            reputation_selected: None,
-            reputation_sends: Vec::new(),
+            reputation_headers: HashSet::new(),
+            reputation_selected: 0,
             faction_standings: HashMap::new(),
         }
     }

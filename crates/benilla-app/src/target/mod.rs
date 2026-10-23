@@ -70,14 +70,15 @@ pub(crate) use relations::{
 // pet bar's; the melee probe's press with nothing selected.
 #[cfg(test)]
 pub(crate) use scan::LastEnemy;
-pub(crate) use scan::{AttackNearestRequest, AttackPick, CreatureTypes};
+pub(crate) use scan::{AttackNearestRequest, AttackPick, CreatureTypes, Owed};
 // The chat layer's by-name asks (`/target`, `/assist`), and the typemask `TargetByName`'s
 // candidate feed shares.
 pub(crate) use by_name::{
     assistable_alive, AssistRequest, Candidacy, NameSearch, PlayerLookup, TargetByNameRequest,
 };
-// The one SetSelection path, for the loot response's select (`0x48f3a0`).
-pub(crate) use by_name::SelectCommit;
+// The one SetSelection path, for the loot response's select (`0x48f3a0`), and what a selecting
+// call owes after its signals.
+pub(crate) use by_name::{SelectCommit, SelectDebt};
 // The selector's colour and the faction catalog it and the model read.
 #[cfg(test)]
 pub(crate) use ring::{ring_variant, PlayerPath, SelectorInput};
@@ -391,14 +392,8 @@ impl Plugin for TargetPlugin {
                     (
                         by_name::target_by_name_requests,
                         by_name::assist_requests,
-                        // After the pet bar's and pet book's drains, which write `PetBar`. The
-                        // two commute: the `FollowUnit` resolver reads only the pet's guid
-                        // (`spells.pet_guid`), which neither writes; the order keeps them declared.
                         // After the follow drain, so a `FollowUnit` starts the frame it is made.
-                        by_name::follow_requests
-                            .after(crate::ui_pet::drain_pet_actions)
-                            .after(crate::ui_pet_book::drain_pet_book)
-                            .after(crate::ui_follow::drain_follow),
+                        by_name::follow_requests.after(crate::ui_follow::drain_follow),
                     )
                         .chain(),
                     scan::auto_acquire,
@@ -421,10 +416,12 @@ impl Plugin for TargetPlugin {
                     .after(WorldStage::Input),
             )
             // The selection's object, as the objects that streamed in and out applied and the
-            // active player is tagged, before any reader of the frame.
+            // active player is tagged, before any reader of the frame. Its teardown signals with
+            // the host lent, as a feed of the frame's packets.
             .add_systems(
                 Update,
                 track::follow_selection_object
+                    .in_set(crate::ui_script::UiFeed)
                     .after(WorldStage::Net)
                     .before(WorldStage::Input),
             )

@@ -16,9 +16,10 @@
 //!
 //! The watches here: the unit-field bridge `0x51bbb0` on every unit with token flags; the unit
 //! type watchers `0x6041f0` and the player type watchers `0x5e2510` whose callbacks signal; the
-//! active player's `0x5de4b0`, rest-state and charmed-by watches registered in `0x5dd8a0`, its
-//! skill watches `0x5de180` and `0x5de470`, its ammunition watch `0x4c70b0`, and the weapon arms
-//! of the visible-item watch `0x5e2810`. The item watchers' signals are [`crate::item_watch`]'s.
+//! active player's `0x5de4b0`, rest-state, coinage and charmed-by watches registered in
+//! `0x5dd8a0`, its skill watches `0x5de180`, `0x5de450` and `0x5de470`, its ammunition watch
+//! `0x4c70b0`, and the weapon arms of the visible-item watch `0x5e2810`. The item watchers' and the
+//! inventory watcher's runs are [`crate::item_watch`]'s.
 
 use benilla_protocol::messages::ObjectType;
 use benilla_protocol::{ObjectFields, OwnerFallback};
@@ -39,7 +40,8 @@ pub(crate) enum FieldNotice {
     /// A callback's `FrameScript_SignalEvent2(id, "%s", "player")`: `0x5de4b0` on the active
     /// player, the event its registration pushes as the argument (`0x5de4b3`, `0x5de4c1`); the
     /// ammunition watch's, the item slot path's and the ammo getters' record callback's
-    /// `UNIT_INVENTORY_CHANGED` (`0x4c7110`, `0x4c72e0`, `0x4c8509`).
+    /// `UNIT_INVENTORY_CHANGED` (`0x4c7110`, `0x4c72e0`, `0x4c8509`); the item slot path's
+    /// `PLAYERBANKSLOTS_CHANGED` (`0x4c728d`).
     Player { id: u16 },
     /// `0x5de4e0` on `PLAYER_BYTES_2` byte 3: `UPDATE_EXHAUSTION` bare (`0x5de4e8`), then the
     /// rest-state line for the new state.
@@ -79,6 +81,15 @@ pub(crate) enum FieldNotice {
     /// `OnComboPointsChanged` (`0x5ddff0`) on the active player's combo count: after the usable
     /// refresh (the action feed's), `PLAYER_COMBO_POINTS` (`0x5ddffa`).
     ComboPoints,
+    /// A skill watch's rebuild of the skill list (`0x4d2cb0`), which signals `SKILL_LINES_CHANGED`
+    /// (`0x4d2fec`): the maximum's and the permanent bonus's watch `0x5de450` (`0x5de45c`) and the
+    /// temporary bonus's `0x5de470` (`0x5de49a`).
+    SkillLines,
+    /// The skill value watch `0x5de180` past its gate (`0x5de20c`): the rebuild (`0x5de2a7`), then
+    /// its line for the active player: `ERR_SKILL_GAINED_S` over an old value of 0 (`0x5de378`),
+    /// else `ERR_SKILL_UP_SI` with the shown value (`0x5de417`). `old` is the value word's copy,
+    /// `shown` the value plus the permanent bonus when the value is above 0.
+    SkillValue { skill_id: u16, old: u16, shown: u32 },
 }
 
 /// The notice lane: each notice stamped as a handler writes it ([`crate::lanes::stamp`]), fired
@@ -157,6 +168,8 @@ pub(crate) mod id {
     pub(crate) const UNIT_AURA: u16 = 41;
     pub(crate) const UNIT_NAME_UPDATE: u16 = 183;
     pub(crate) const UNIT_INVENTORY_CHANGED: u16 = 186;
+    pub(crate) const PLAYER_MONEY: u16 = 200;
+    pub(crate) const PLAYERBANKSLOTS_CHANGED: u16 = 347;
     pub(crate) const UNIT_CLASSIFICATION_CHANGED: u16 = 187;
     pub(crate) const PLAYER_FLAGS_CHANGED: u16 = 407;
     pub(crate) const UNIT_QUEST_LOG_CHANGED: u16 = 522;
@@ -165,6 +178,7 @@ pub(crate) mod id {
     pub(crate) const PET_ATTACK_START: u16 = 334;
     pub(crate) const PET_ATTACK_STOP: u16 = 335;
     pub(crate) const PLAYER_GUILD_UPDATE: u16 = 345;
+    pub(crate) const UPDATE_FACTION: u16 = 372;
     pub(crate) const TABARD_CANSAVE_CHANGED: u16 = 376;
     pub(crate) const PLAYER_UNGHOST: u16 = 401;
     pub(crate) const PLAYER_UPDATE_RESTING: u16 = 405;
@@ -296,14 +310,20 @@ const PLAYER_EVENT_WATCHES: [(u16, u16, u16); 11] = [
     (0x10c4, 4, 372),
 ];
 
+/// The coinage watch `OnMoneyChanged` (`0x5ddf30`) registered in `0x5dd8a0`:
+/// `PLAYER_FIELD_COINAGE`, the purse it reads at `+0xf70` (`0x5ddfa5`).
+const COINAGE: (u16, u16) = (0xf70, 4);
+
 /// `0x5de4e0`'s range, `PLAYER_BYTES_2` byte 3 (`0x5ddb0b`).
 const REST_STATE: u16 = 0x1b;
 
 /// The skill block: entry `k` at `0x848 + 12k` of the player section, 128 entries (`0x5dda54` to
-/// `0x5ddaf0`). The value watch covers the value word at `+4` and the temporary-bonus watch the
-/// word at `+8`, two bytes each.
+/// `0x5ddaf0`). Each entry's four watches cover two bytes each: the value at `+4`, the maximum at
+/// `+6`, the temporary bonus at `+8` and the permanent bonus at `+0xa`.
 const SKILL_VALUE: u16 = 0x84c;
+const SKILL_MAX: u16 = 0x84e;
 const SKILL_TEMP_BONUS: u16 = 0x850;
+const SKILL_PERM_BONUS: u16 = 0x852;
 const SKILL_STRIDE: u16 = 12;
 const SKILLS: u16 = 128;
 
@@ -461,6 +481,19 @@ impl<'a> Notified<'a> {
             && range.into_iter().any(|i| self.visits(i))
     }
 
+    /// The place of a watch on `list` over the whole dwords of `range`, when it runs
+    /// ([`Self::runs`]): the first field of the range the block visits.
+    pub(crate) fn place(&self, range: std::ops::Range<u16>, list: List) -> Option<Place> {
+        if !self.runs(range.clone()) {
+            return None;
+        }
+        let first = range.start;
+        range
+            .into_iter()
+            .find(|&i| self.visits(i))
+            .map(|fired| (fired, first, list))
+    }
+
     /// The moved dwords the block visits, as `(index, copy, now)`: the edges
     /// [`crate::net::FieldChanged`] carries.
     pub(crate) fn edges(&self) -> impl Iterator<Item = (u16, u32, u32)> + '_ {
@@ -494,17 +527,8 @@ impl Pass {
     /// for its `SUMMON` (`0x606e9d`) and its `CHARM` (`0x606edf`) when set, then, for the active
     /// player, for every other unit not its own (`0x606efb`).
     fn reaction(&mut self, at: Place, guid: u64, fields: &ObjectFields, around: &Around) {
-        self.signal(at, guid, id::UNIT_FACTION);
-        for pet in [fields.unit_summon(), fields.unit_charm()]
-            .into_iter()
-            .flatten()
-        {
-            self.signal(at, pet, id::UNIT_FACTION);
-        }
-        if around.me == Some(guid) {
-            for other in (around.others)() {
-                self.signal(at, other, id::UNIT_FACTION);
-            }
+        for notice in reaction_signals(guid, fields, around.me, around.others) {
+            self.push(at, notice);
         }
     }
 
@@ -515,10 +539,11 @@ impl Pass {
 }
 
 /// One step of a block's notify in the watchers' order: a field edge, whose watcher may write a
-/// chat line, or a notice.
+/// chat line, a notice, or an item watcher's run ([`crate::item_watch::Run`]).
 pub(crate) enum Step {
     Edge { index: u16, old: u32, new: u32 },
     Notice(FieldNotice),
+    Item(crate::item_watch::Run),
 }
 
 /// The type watch an edge's chat line is written in, by the edge's field: the aura watcher
@@ -539,15 +564,21 @@ fn edge_place(block: &Notified, index: u16) -> Place {
     (index, index, List::Type)
 }
 
-/// A block's edges and notices in the one ascending walk the notify pass makes (`0x465330`): by
-/// field, the type watchers ahead of the object's own, an edge ahead of a notice at one place.
-/// Each takes its stamp as it is written in this order, so a line a later system words off an
-/// edge fires among the notices where its watcher ran.
-pub(crate) fn in_watch_order(block: &Notified, notices: Vec<(Place, FieldNotice)>) -> Vec<Step> {
+/// A block's edges, item watchers' runs and notices in the one ascending walk the notify pass makes
+/// (`0x465330`): by field, the type watchers ahead of the object's own, an edge ahead of a run and
+/// a run ahead of a notice at one place, as one callback's recounts precede its signals
+/// (`0x5dee9e`, `0x5deea9` before `0x5deecb`). Each takes its stamp as it is written in this order,
+/// so a line a later system words off an edge fires among the notices where its watcher ran.
+pub(crate) fn in_watch_order(
+    block: &Notified,
+    notices: Vec<(Place, FieldNotice)>,
+    runs: Vec<(Place, crate::item_watch::Run)>,
+) -> Vec<Step> {
     let mut steps: Vec<(Place, Step)> = block
         .edges()
         .map(|(index, old, new)| (edge_place(block, index), Step::Edge { index, old, new }))
         .collect();
+    steps.extend(runs.into_iter().map(|(at, r)| (at, Step::Item(r))));
     steps.extend(notices.into_iter().map(|(at, n)| (at, Step::Notice(n))));
     steps.sort_by_key(|&(at, _)| at);
     steps.into_iter().map(|(_, step)| step).collect()
@@ -805,22 +836,44 @@ pub(crate) fn placed_values(
                 pass.push(at, FieldNotice::Player { id });
             }
         }
+        // `0x5ddf30` signals `PLAYER_MONEY` (`0x5ddf4b`) ahead of the trade offer's trim
+        // (`0x5ddfda`), which signals nothing and runs at the packet ([`crate::ui_trade`]).
+        if let Some(at) = at(PLAYER_SECTION, COINAGE, List::Object) {
+            pass.push(
+                at,
+                FieldNotice::Global {
+                    id: id::PLAYER_MONEY,
+                },
+            );
+        }
         // `0x4c70b0` sets the ammunition model (`0x4c70fc`, not built) and signals (`0x4c7110`).
         if let Some(at) = at(PLAYER_SECTION, AMMO_ID, List::Object) {
             let id = id::UNIT_INVENTORY_CHANGED;
             pass.push(at, FieldNotice::Player { id });
         }
+        // Each entry's watches in their registration order (`0x5dda6c`, `0x5dda8e`, `0x5ddaaf`,
+        // `0x5ddad1`), the order they run in at one field.
         for k in 0..SKILLS {
-            let value = SKILL_VALUE + SKILL_STRIDE * k;
-            if let Some(at) = at(PLAYER_SECTION, (value, 2), List::Object) {
+            let entry = SKILL_STRIDE * k;
+            if let Some(at) = at(PLAYER_SECTION, (SKILL_VALUE + entry, 2), List::Object) {
+                // `0x5de180`: past its gate, `0x5ed990` (`0x5de214`), then the rebuild
+                // (`0x5de2a7`) and the line.
                 let (old, _) = block.edge(at.0).unwrap_or_default();
-                if skill_value_signals(fields, k, old) {
+                if let Some(notice) = skill_value_notice(fields, k, old) {
                     pass.push(at, FieldNotice::CombatSkill);
+                    pass.push(at, notice);
                 }
             }
-            let bonus = SKILL_TEMP_BONUS + SKILL_STRIDE * k;
-            if let Some(at) = at(PLAYER_SECTION, (bonus, 2), List::Object) {
+            // `0x5de450` on the maximum and the permanent bonus: the rebuild (`0x5de45c`).
+            for half in [SKILL_MAX, SKILL_PERM_BONUS] {
+                if let Some(at) = at(PLAYER_SECTION, (half + entry, 2), List::Object) {
+                    pass.push(at, FieldNotice::SkillLines);
+                }
+            }
+            // `0x5de470`: `0x5ed990` (`0x5de495`), then the rebuild (`0x5de49a`).
+            if let Some(at) = at(PLAYER_SECTION, (SKILL_TEMP_BONUS + entry, 2), List::Object) {
                 pass.push(at, FieldNotice::CombatSkill);
+                pass.push(at, FieldNotice::SkillLines);
             }
         }
         for slot in WEAPON_SLOTS {
@@ -836,18 +889,49 @@ pub(crate) fn placed_values(
 /// `0x5de180`'s gate ahead of its `0x5ed990` call: the new shown value, the value plus the
 /// permanent bonus when the value is above 0 (`0x5de1f8`, `0x5de207`), against the old value word
 /// the watch passes (`0x5de18f`), equal skipping to the end (`0x5de20c`). `old` is the value's
-/// whole dword before the block.
-fn skill_value_signals(fields: &ObjectFields, k: u16, old: u32) -> bool {
-    let Some(slot) = fields.player_skill(k as u8) else {
-        return true;
+/// whole dword before the block. Past the gate, the watch's rebuild and line, for the slot's
+/// skill.
+fn skill_value_notice(fields: &ObjectFields, k: u16, old: u32) -> Option<FieldNotice> {
+    let old = (old & 0xffff) as u16;
+    let slot = fields.player_skill(k as u8);
+    let value = slot.map_or(0, |s| u32::from(s.value));
+    let shown = match value {
+        0 => 0,
+        v => v + slot.map_or(0, |s| u32::from(s.perm_bonus as u16)),
     };
-    let value = u32::from(slot.value);
-    let shown = if value > 0 {
-        value + u32::from(slot.perm_bonus as u16)
-    } else {
-        0
-    };
-    shown != old & 0xffff
+    (shown != u32::from(old)).then(|| FieldNotice::SkillValue {
+        skill_id: slot.map_or(0, |s| s.skill_id),
+        old,
+        shown,
+    })
+}
+
+/// `CGUnit_C::RefreshReaction` (`0x606e20`) on `guid`, its signals in order: `UNIT_FACTION` for it
+/// (`0x606e57`), for its `SUMMON` (`0x606e9d`) and its `CHARM` (`0x606edf`) when set, then, for the
+/// active player `me`, for every other unit `others` sweeps (`0x606efb`, [`reaction_sweep`]).
+pub(crate) fn reaction_signals(
+    guid: u64,
+    fields: &ObjectFields,
+    me: Option<u64>,
+    others: &dyn Fn() -> Vec<u64>,
+) -> Vec<FieldNotice> {
+    let mut guids = vec![guid];
+    guids.extend(
+        [fields.unit_summon(), fields.unit_charm()]
+            .into_iter()
+            .flatten(),
+    );
+    if me == Some(guid) {
+        guids.extend(others());
+    }
+    guids
+        .into_iter()
+        .filter(|&g| g != 0)
+        .map(|guid| FieldNotice::Signal {
+            guid,
+            id: id::UNIT_FACTION,
+        })
+        .collect()
 }
 
 /// `RefreshReaction`'s sweep for the active player `me` (`0x468380` with `0x606f20`) over the held
@@ -1080,9 +1164,15 @@ mod tests {
     }
 
     /// The value watch signals when the shown value differs from the old value word; the
-    /// temporary-bonus watch on any change; the maximum and permanent bonus run neither.
+    /// temporary-bonus watch on any change; the maximum and permanent bonus only rebuild.
     #[test]
     fn the_skill_watches_reach_the_combat_signals() {
+        let combat = |notices: Vec<FieldNotice>| {
+            notices
+                .into_iter()
+                .filter(|n| *n == FieldNotice::CombatSkill)
+                .collect::<Vec<_>>()
+        };
         let mut me = player();
         let value = pf(SKILL_VALUE);
         let bonus = pf(SKILL_TEMP_BONUS);
@@ -1094,24 +1184,102 @@ mod tests {
             &[(value - 1, 95), (value, (300 << 16) | 1)],
         );
         assert_eq!(
-            block(&mut me, Some(ME), ME, &[(value, (300 << 16) | 2)]),
+            combat(block(&mut me, Some(ME), ME, &[(value, (300 << 16) | 2)])),
             [FieldNotice::CombatSkill]
         );
-        // The maximum alone (`0x5de450`), and the permanent bonus alone, signal nothing.
-        assert!(block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 2)]).is_empty());
-        assert!(block(&mut me, Some(ME), ME, &[(bonus, 5 << 16)]).is_empty());
+        // The maximum alone (`0x5de450`), and the permanent bonus alone, signal none.
+        assert!(combat(block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 2)])).is_empty());
+        assert!(combat(block(&mut me, Some(ME), ME, &[(bonus, 5 << 16)])).is_empty());
         // The temporary bonus, in entry 1.
         assert_eq!(
-            block(&mut me, Some(ME), ME, &[(bonus + 3, 10)]),
+            combat(block(&mut me, Some(ME), ME, &[(bonus + 3, 10)])),
             [FieldNotice::CombatSkill]
         );
         // With a permanent bonus of 5: a value of 2 → 7 shows 12 against the old word 2, and a
         // drop of exactly the bonus, 7 → 2, shows 7, the old word itself, so the gate skips it.
         assert_eq!(
-            block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 7)]),
+            combat(block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 7)])),
             [FieldNotice::CombatSkill]
         );
         assert!(block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 2)]).is_empty());
+    }
+
+    /// Each of the four watches of a skill slot (`0x5dda54`-`0x5ddaf0`) rebuilds the list: the value
+    /// past its gate after its combat signals (`0x5de214`, `0x5de2a7`), the maximum and the
+    /// permanent bonus (`0x5de450` → `0x5de45c`), and the temporary bonus after its combat signals
+    /// (`0x5de470` → `0x5de495`, `0x5de49a`); at one field the watches run in their registration
+    /// order, value, maximum, permanent bonus, temporary bonus (`0x5dda6c`, `0x5dda8e`,
+    /// `0x5ddaaf`, `0x5ddad1`).
+    #[test]
+    fn every_skill_watch_rebuilds_the_list() {
+        use FieldNotice::{CombatSkill, SkillLines, SkillValue};
+        let mut me = player();
+        let value = pf(SKILL_VALUE);
+        let bonus = pf(SKILL_TEMP_BONUS);
+        // Skill 95 (Defense) lands in entry 0 at 1/300.
+        assert_eq!(
+            block(
+                &mut me,
+                Some(ME),
+                ME,
+                &[(value - 1, 95), (value, (300 << 16) | 1)]
+            ),
+            [
+                CombatSkill,
+                SkillValue {
+                    skill_id: 95,
+                    old: 0,
+                    shown: 1
+                },
+                SkillLines,
+            ]
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(value, (300 << 16) | 2)]),
+            [
+                CombatSkill,
+                SkillValue {
+                    skill_id: 95,
+                    old: 1,
+                    shown: 2
+                }
+            ]
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 2)]),
+            [SkillLines],
+            "the maximum alone"
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(bonus, 5 << 16)]),
+            [SkillLines],
+            "the permanent bonus alone"
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(bonus, (5 << 16) | 3)]),
+            [CombatSkill, SkillLines],
+            "the temporary bonus alone"
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(bonus, (6 << 16) | 4)]),
+            [SkillLines, CombatSkill, SkillLines],
+            "both bonuses: the permanent one's watch first"
+        );
+        // Shown 4 + 6 against the old word 2.
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(value, (310 << 16) | 4)]),
+            [
+                CombatSkill,
+                SkillValue {
+                    skill_id: 95,
+                    old: 2,
+                    shown: 10
+                },
+                SkillLines,
+            ],
+            "the value and the maximum in one dword"
+        );
+        assert!(block(&mut player(), Some(ME), 0x08, &[(value, 7)]).is_empty());
     }
 
     /// The visible-item watch signals on the three weapon slots only, on any of their 12 dwords.
@@ -1781,11 +1949,12 @@ mod tests {
         };
         let block = Notified::new(Sent::Fields(&sent), &moved);
         let placed = placed_values(&around, MOB, ObjectType::Unit, &mob, &block);
-        let steps: Vec<String> = in_watch_order(&block, placed)
+        let steps: Vec<String> = in_watch_order(&block, placed, Vec::new())
             .into_iter()
             .map(|s| match s {
                 Step::Edge { index, .. } => format!("edge {index}"),
                 Step::Notice(n) => format!("{n:?}"),
+                Step::Item(r) => format!("{r:?}"),
             })
             .collect();
         assert_eq!(

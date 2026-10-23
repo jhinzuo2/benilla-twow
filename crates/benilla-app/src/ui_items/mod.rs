@@ -3,10 +3,11 @@
 //! [`feed`] builds each bag from the player's descriptor (the backpack's `PACK_SLOT` array, the
 //! equipped bags at `INV_SLOT` 19-22 with their own `CONTAINER_FIELD_SLOT` arrays, the keyring at
 //! 81.. with no container object, like the bank), the object index and the template cache, and
-//! fires `BAG_UPDATE(bagID)` per changed bag. [`drain`] sends the Lua intents over [`wire_pos`]:
-//! an equippable item that starts no quest goes out as `CMSG_AUTOEQUIP_ITEM`, anything else
-//! through [`send_item_use`]. The cursor verbs lock what they pick up and place onto, and the
-//! server's answer lifts it ([`crate::ui_items::locks`]).
+//! fires `BAG_UPDATE(bagID)` per changed bag. The verbs' calls send inside their verbs over
+//! [`wire_pos`]: [`drain`]'s item use takes an equippable item that starts no quest out as
+//! `CMSG_AUTOEQUIP_ITEM` and anything else through [`send_item_use`], and [`calls`] the cursor's
+//! moves, stores, repairs, destroys and bind answers. The cursor verbs lock what they pick up and
+//! place onto, and the server's answer lifts it ([`crate::ui_items::locks`]).
 
 use benilla_protocol::messages::{BAG_PLAYER_INVENTORY, SLOT_BAG_FIRST, SLOT_PACK_FIRST};
 use benilla_protocol::ObjectFields;
@@ -18,20 +19,21 @@ use crate::net::Objects;
 use crate::query_cache::Ask;
 use crate::ui_unit::UnitFeed;
 
+mod calls;
 mod drain;
 mod equip_error;
 pub(crate) mod feed;
 mod lock_openers;
 pub(crate) mod locks;
 mod net;
+#[cfg(test)]
+mod verb_tests;
 
 pub(crate) use drain::{dispatch_fork, send_auto_equip};
-use drain::{
-    drain_bag_autostores, drain_container_autoequips, drain_container_destroys,
-    drain_container_moves, drain_container_repairs,
-};
-pub(crate) use equip_error::equip_error_key;
-// `UseContainerItem` and `UseInventoryItem`, applied in call order by `crate::script_calls`.
+pub(crate) use equip_error::{equip_error_key, EquipError, EquipErrors};
+// `UseContainerItem`, `UseInventoryItem` and the item verbs' calls, applied in call order by
+// `crate::script_calls`.
+pub(crate) use calls::BagSteps;
 pub(crate) use drain::ScriptItemUse;
 use feed::{
     ask_item_build_lookups, feed_containers, feed_item_sets, feed_item_stats, feed_player_req,
@@ -109,28 +111,6 @@ pub(crate) fn wire_pos(bag: i64, slot1: u32) -> Option<(u8, u8)> {
         _ => None,
     }
 }
-
-/// One inventory refusal off the wire, with the fills of the only two reasons that format one.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EquipError {
-    /// The wire `InventoryResult`.
-    pub reason: u8,
-    /// Reason 1's `%d`, the packet's `requiredLevel`.
-    pub required_level: Option<u32>,
-    /// Reason 16's `%s` source: the destination bag's player slot (255 names no bag), which the
-    /// drain resolves to the bag's `BagFamily` name.
-    pub bag_slot: u8,
-    /// The item guids a refused inventory operation unlocks after its line (`0x5e3ac0`,
-    /// `0x5e3ad3`); none for a mail refusal.
-    pub unlocks: [u64; 2],
-    /// The change tick of the handler call that queued it, its place on the wire: each call is
-    /// its own system run, so a later packet's writes carry newer ticks.
-    pub at: bevy::ecs::change_detection::Tick,
-}
-
-/// Inventory refusals (`SMSG_INVENTORY_CHANGE_FAILURE`) queued for the UI error line.
-#[derive(Resource, Default)]
-pub(crate) struct EquipErrors(pub Vec<EquipError>);
 
 /// The item guid in a Lua-space bag slot; for [`EQUIPMENT_BAG`], `slot0` is the wire slot, as in
 /// [`wire_pos`].
@@ -831,7 +811,10 @@ pub(crate) fn object_name(
     template: &benilla_protocol::messages::ItemInfo,
     rolls: crate::items::RollCatalogs,
 ) -> String {
-    rolls.name(&template.name, object_link_numbers(fields, template).1)
+    rolls.name(
+        &template.name,
+        object_link_numbers(fields, Some(template)).1,
+    )
 }
 
 /// The three numbers `0x52ae00` passes `0x52adb0` for an item object: the permanent enchant
@@ -840,14 +823,16 @@ pub(crate) fn object_name(
 /// wrapped item (`ITEM_FIELD_FLAGS & 0x8`) passes 0 for all three (`0x52ae66`-`0x52ae80`).
 pub(crate) fn object_link_numbers(
     fields: &ObjectFields,
-    template: &benilla_protocol::messages::ItemInfo,
+    template: Option<&benilla_protocol::messages::ItemInfo>,
 ) -> (u32, u32, u32) {
+    // No record reads flags 0 (`0x5da2a0`): no charter.
+    let charter =
+        template.is_some_and(|t| t.flags & benilla_protocol::messages::ITEM_FLAG_CHARTER != 0);
     let wrapped =
         fields.item_flags().unwrap_or(0) & benilla_protocol::messages::ITEM_DYNFLAG_WRAPPED != 0;
     if wrapped {
         return (0, 0, 0);
     }
-    let charter = template.flags & benilla_protocol::messages::ITEM_FLAG_CHARTER != 0;
     let enchant = if charter {
         0
     } else {
@@ -860,25 +845,35 @@ pub(crate) fn object_link_numbers(
     )
 }
 
-/// `0x52ae00`, the link of an item object: its template's quality and [`object_name`], with
+/// `0x52ae00`, the link of an item object: its record's quality and [`object_name`], with
 /// [`object_link_numbers`]. Every link the client makes of an item it holds comes from here: the
 /// bag slot's (`GetContainerItemLink`, `0x4f997f`), the player's own equipped slot's
 /// (`GetInventoryItemLink`, `0x4c8ce2`) and our own trade slot's (`GetTradePlayerItemLink`,
-/// `0x4c06bc`).
+/// `0x4c06bc`). With no record the link is white (`0x52aec5`) and nameless (`0x5d8b40`), and the
+/// record's flags read 0 (`0x5da2a0`), so the enchant goes in.
 pub(crate) fn object_link(
     fields: &ObjectFields,
-    template: &benilla_protocol::messages::ItemInfo,
+    template: Option<&benilla_protocol::messages::ItemInfo>,
     rolls: crate::items::RollCatalogs,
 ) -> String {
-    let (enchant, roll, seed) = object_link_numbers(fields, template);
-    item_link_full(
-        fields.object_entry().unwrap_or(0),
-        enchant,
-        roll,
-        seed,
-        &object_name(fields, template, rolls),
-        template.quality,
-    )
+    let entry = fields.object_entry().unwrap_or(0);
+    match template {
+        Some(t) => {
+            let (enchant, roll, seed) = object_link_numbers(fields, Some(t));
+            item_link_full(
+                entry,
+                enchant,
+                roll,
+                seed,
+                &object_name(fields, t, rolls),
+                t.quality,
+            )
+        }
+        None => {
+            let (enchant, roll, seed) = object_link_numbers(fields, None);
+            item_link_full(entry, enchant, roll, seed, "", 1)
+        }
+    }
 }
 
 /// [`item_link_full`] with zero enchant, random-property and suffix ids, for a caller with no roll
@@ -1030,17 +1025,16 @@ pub(crate) struct UiItemsPlugin;
 impl Plugin for UiItemsPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        crate::item_lane::add_item_lane(app);
+        equip_error::add_equip_error_lane(app);
+        feed::add_bag_view_lane(app);
         // The icons come from the equipment renderer's `ItemDisplays`.
-        app.init_resource::<EquipErrors>()
-            .init_resource::<feed::BagUpdates>()
-            .init_resource::<crate::ui_items::locks::ItemReleases>()
-            .init_resource::<crate::ui_items::locks::HeldItemLocks>()
+        app.init_resource::<crate::ui_items::locks::HeldItemLocks>()
             .init_resource::<crate::ui_items::locks::LockWatch>()
             // The soulbind confirmations' pending records: the client's pending-equip array and
             // its one bind-on-use cell.
             .init_resource::<crate::ui_bind_confirm::PendingEquips>()
             .init_resource::<crate::ui_bind_confirm::PendingBindOnUse>()
-            .init_resource::<net::BagOpens>()
             // After the chain opens: unordered, it can run first and skip every item DBC.
             .add_systems(
                 Startup,
@@ -1049,17 +1043,19 @@ impl Plugin for UiItemsPlugin {
             .add_systems(
                 Update,
                 (
-                    // The server's unlocks, ahead of both inventory feeds: the reference's
-                    // watchers run before the descriptor takes the new guid.
+                    // The loot window's owed unlocks and the dead objects' locks, ahead of both
+                    // inventory feeds.
                     crate::ui_items::locks::apply_item_releases
                         .in_set(crate::ui_script::UiFeed)
                         .before(feed_containers)
                         .before(crate::ui_char::feed_char),
                     // The slot cooldowns must be in the VM before the action feed's
-                    // `BAG_UPDATE_COOLDOWN` makes the bag handlers re-read them, and the action
-                    // feed counts this feed's `BAG_UPDATE`s (`crate::ui_action`'s schedule).
+                    // `BAG_UPDATE_COOLDOWN` makes the bag handlers re-read them
+                    // (`crate::ui_action`'s schedule), and the bags before the world-enter
+                    // cascade's `BAG_UPDATE`s (`UiScript::fire_world_enter`).
                     feed_containers
                         .in_set(UnitFeed)
+                        .in_set(crate::ui_unit::WorldEnterSeats)
                         .before(crate::ui_action::CooldownEvents),
                     // The item-tooltip store answers before the input pass, so a re-hover the
                     // next frame sees the answer, and seats a new VM before its world entry; a
@@ -1079,22 +1075,6 @@ impl Plugin for UiItemsPlugin {
                     // The item tooltip's lock check: `Lock.dbc` once, the player's openers on change.
                     lock_openers::feed_lock_rows.in_set(UnitFeed),
                     lock_openers::feed_lock_openers.in_set(UnitFeed),
-                    // After the input pass, so a repair-mode click goes out the same frame; a
-                    // plain `UseContainerItem` is a script call.
-                    drain_container_repairs.in_set(crate::ui_script::UiDrain),
-                    // Pick, place and split: `CMSG_SWAP_INV_ITEM`, `CMSG_SWAP_ITEM` or
-                    // `CMSG_SPLIT_ITEM`.
-                    drain_container_moves.in_set(crate::ui_script::UiDrain),
-                    // The delete-confirm popup's accept: `CMSG_DESTROYITEM`.
-                    drain_container_destroys.in_set(crate::ui_script::UiDrain),
-                    // `AutoEquipCursorItem`: `CMSG_AUTOEQUIP_ITEM`.
-                    drain_container_autoequips.in_set(crate::ui_script::UiDrain),
-                    drain_bag_autostores.in_set(crate::ui_script::UiDrain),
-                    // The soulbind confirmations' answers (`EquipPendingItem`,
-                    // `CancelPendingEquip`, `ConfirmBindOnUse`). A dialog is answered in a later
-                    // frame than it was raised, so no order against the other drains is needed.
-                    drain::drain_bind_confirm_answers.in_set(crate::ui_script::UiDrain),
-                    drain::drain_bind_on_use_confirms.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }

@@ -239,7 +239,7 @@ impl BindChecks<'_, '_> {
 /// - `Location`: `TargetingWantsLocation 0x6e6320`, `word & 0x60`, the terrain click.
 /// - `Item`: `TargetingWantsItem 0x6e6330`, `word & 0x4010`, the bag and paper-doll clicks.
 /// - `GameObject`: `TargetingWantsGameObject 0x6e62d0`, `word & 0x4800`, the world object click.
-/// - `Unit`: `SpellCanTargetUnit 0x6e6460`, the unit arm of the world click.
+/// - `Unit`: `SpellCanTargetObject 0x6e6460`, the unit arm of the world click.
 /// - `Corpse`: `0x6e6230`, `word & 0x8600`, the pick's corpse flag `0x40` ([`corpse`]).
 ///
 /// The masks overlap on `TARGET_FLAG_LOCKED`, so a lock spell answers both the item and the
@@ -254,8 +254,8 @@ pub(crate) enum TargetingWants {
     Corpse,
 }
 
-/// The unit-shaped bits of the flag_word, the first gate `SpellCanTargetUnit` tests before it runs
-/// the candidate through the unit arm's relation and liveness checks.
+/// The unit-shaped bits of the flag_word, the first gate `SpellCanTargetObject 0x6e6460` tests
+/// before it runs the candidate through the unit arm's relation and liveness checks.
 const UNIT_WORD_BITS: u16 = 0x0002 | 0x0004 | 0x0008 | 0x0080 | 0x0100 | 0x0200 | 0x0400 | 0x8000;
 
 impl TargetingWants {
@@ -346,8 +346,8 @@ impl SpellTargeting {
         self.0.as_ref().is_some_and(|t| wants.matches(t.word))
     }
 
-    /// `SpellCanTargetUnit`'s predicate `0x6e6460`, its unit leg, with the range flag both callers
-    /// pass (the world hover `0x4828d0` at `48290b`, the Lua `SpellCanTargetUnit 0x6e6d00`):
+    /// `SpellCanTargetObject 0x6e6460`, its unit leg, with the range flag both callers pass (the
+    /// world hover `0x4828d0` at `48290b`, the Lua `SpellCanTargetUnit 0x6e6d00`):
     /// `BindTarget`'s gates and relation checks (`6e6507`–`6e65ab`), then min² ≤ d² ≤ max²
     /// (`6e677c`–`6e6802`), so a unit inside the minimum is out too. There is no line-of-sight
     /// test.
@@ -416,6 +416,12 @@ impl SpellTargeting {
         if let Some(t) = &mut self.0 {
             t.in_slot = false;
         }
+    }
+
+    /// The standing cast and its commit while its word wants an item, which `BindTarget
+    /// 0x6e5b40` binds a passed item to.
+    pub(crate) fn wanting_item(&self) -> Option<(u32, super::cast_send::CastCommit)> {
+        self.pending_for(TargetingWants::Item)
     }
 
     /// The pending cast when the standing word answers `wants`, so no commit fires on a word its
@@ -496,10 +502,10 @@ pub(crate) fn feed_targeting_to_vm(
     mut vm: crate::script_calls::VmWith<(
         Res<'static, SpellTargeting>,
         crate::ui_unit::UnitTokens<'static, 'static>,
+        BindChecks<'static, 'static>,
     )>,
-    checks: BindChecks,
 ) {
-    vm.turn(|script, (targeting, tokens)| {
+    vm.turn(|script, (targeting, tokens, checks)| {
         if let Some(script) = script {
             push_targeting_view(script, &targeting, &checks, &tokens);
         }

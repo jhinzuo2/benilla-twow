@@ -210,6 +210,8 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
     let chain = assets.chain.clone();
     let size_chain = chain.clone();
     let size_loose = loose.clone();
+    let cursor_chain = chain.clone();
+    let cursor_loose = loose.clone();
     let font_chain = chain.clone();
     let font_loose = loose.clone();
     // `SetTexture` runs per frame in the addons that set an icon every `OnUpdate`: the probe
@@ -227,6 +229,12 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
         let measured = benilla_assets::sprite_dimensions(&size_chain, &size_loose, path);
         sizes.borrow_mut().insert(path.to_string(), measured);
         measured
+    }));
+    // `SetCursor`'s 32×32 test reads the picture the cursor code opens (`0x449610`), its `.blp`
+    // alone, decoded each call as `0x523c98` waits on the load.
+    script.set_cursor_size_probe(Box::new(move |path| {
+        benilla_assets::file_texture_rgba(&cursor_chain, &cursor_loose, path)
+            .map(|(w, h, _)| (w, h))
     }));
     // Existence over the same stores, in the same order, as `ui_text::engine`'s face loader,
     // memoised because a path's answer cannot change and an addon may call `SetFont` every frame.
@@ -466,6 +474,7 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // item objects.
     crate::ui_items::locks::seed_vm_item_locks(world, &mut script, seat == LoadSeat::Live);
     crate::ui_party::seed_vm_ready_check(world, &mut script, seat == LoadSeat::Live);
+    crate::ui_guild::seed_vm_guild(world, &mut script, seat == LoadSeat::Live);
     // The realm before the load, since addons read `GetRealmName()` at file scope; the roster
     // carries the realm-list entry this session connected to.
     let realm = world
@@ -710,7 +719,7 @@ pub(crate) fn seat_from_roster(
         is_player: true,
         player_controlled: true,
         // AceDB-2.0 concatenates `UnitFactionGroup("player")` at file scope, where nil is an error.
-        faction_group: crate::ui_unit::race_faction_group(row.race).map(str::to_string),
+        faction_group: names.faction_group(row.race).map(str::to_string),
         ..Default::default()
     })
 }
@@ -942,6 +951,8 @@ fn close_ui_session(world: &mut World, root: ShutdownRoot) {
     crate::ui_items::locks::fold_dying_vm_item_locks(world);
     // And the ready check, engine state the reference's reload never writes.
     crate::ui_party::fold_dying_vm_ready_check(world);
+    // The guild roster's show-offline flag and selection, which only a login zeroes.
+    crate::ui_guild::fold_dying_vm_guild(world);
     // So do the engine globals the VM holds for the session: the quest log's fold mask and the
     // tradeskill repeat, which no UI init resets.
     crate::ui_quest_log::fold_dying_vm_quest_folds(world);

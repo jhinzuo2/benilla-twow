@@ -33,6 +33,8 @@ mod worldmap_arrow;
 mod button;
 mod calls;
 mod camera_view;
+#[cfg(any(test, feature = "test-support"))]
+pub mod census;
 mod channel;
 mod char_stats;
 pub mod chat_bubble;
@@ -116,6 +118,7 @@ pub use surface::widget_method_census;
 mod input_verbs;
 mod inspect;
 mod inventory_verbs;
+mod item_calls;
 mod item_stats;
 mod item_text;
 pub mod keybind;
@@ -267,10 +270,10 @@ pub use cvar_checks::{
     check_small_cull, check_tex_lod_bias, check_triple_buffer, CvarCheck, CvarRows, CvarVerdict,
 };
 pub use cvar_checks::{
-    check_dist_cull, check_error_filter, check_footstep_bias, check_horizon_farclip,
-    check_lod_dist, check_map_obj_light_lod, check_max_lights, check_particle_density,
-    check_shadow_bias, check_target_nearest_distance, check_texture_lod_dist, check_unit_draw_dist,
-    check_water_lod,
+    check_dist_cull, check_error_filter, check_ffx_echo, check_footstep_bias,
+    check_horizon_farclip, check_lod_dist, check_map_obj_light_lod, check_max_lights,
+    check_particle_density, check_shadow_bias, check_target_nearest_distance,
+    check_texture_lod_dist, check_unit_draw_dist, check_water_lod, scanf_f_prefix,
 };
 pub use cvars::small_cull_text;
 pub use cvars::{
@@ -286,21 +289,22 @@ pub use gm_survey::{GmSurveyTables, SurveyAnswerSend};
 pub use gm_ticket::{GmTicketIntent, GmTicketWrite};
 pub use gossip::{GossipCall, GossipMenu, GossipOptionView, GossipQuestRow};
 pub use guild::{
-    GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
-    MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
+    GuildCall, GuildCells, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildState, LastOnline,
+    UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
 pub use host::{CallHost, CallTail};
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
+pub use item_calls::ItemCall;
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
 pub use modelframe::{CharacterPaneFrame, ModelPaneFrame, ModelWanted};
 pub use petition::{
-    validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
+    validate_guild_name, PetitionCall, PetitionRecordView, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
 };
 pub use protected::InputEvents;
 pub use tabard::{
-    emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
+    emblem_mask_path, TabardCall, TabardHost, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
 };
 pub use video_pairs::VIDEO_PAIR_CVARS;
@@ -319,8 +323,8 @@ pub use lock_check::{check_lock, LockCheck, LockOpener, LockOpeners, LockSlotVie
 pub use loot::{LootCall, LootRow, LootState, LOOT_PORTRAIT_UNIT};
 pub use loot_roll::{LootRollEntry, LootRollsState};
 pub use macros::{
-    MacroBinding, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS, MAX_MACRO_BODY,
-    MAX_MACRO_NAME,
+    macro_lines, MacroBinding, MacroDerives, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS,
+    MAX_MACRO_BODY, MAX_MACRO_NAME,
 };
 pub use mail::{
     MailCall, MailInboxRow, MailInvoice, MailRowVerb, MailSendRequest, MailState, PackageView,
@@ -341,7 +345,7 @@ pub use model::{
 pub use party::{
     PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, ReadyCheckState, SavedInstanceInfo,
 };
-pub use pet::{PetActionView, PetStats};
+pub use pet::{PetActionView, PetCall, PetStats, PET_DISMISS_WORD};
 pub use pvp::{decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, RankTitle};
 pub use quest::{QuestCall, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState};
 pub use quest_log::{
@@ -352,23 +356,23 @@ pub(crate) use region::{
     load_blend_mode, load_texture_file, load_texture_name, load_xml_font_file,
     texture_name_verdict, FileLoad,
 };
-pub use reputation::{FactionEntry, ReputationSend, ReputationState};
+pub use reputation::{FactionEntry, ReputationCall, ReputationState};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
     element_fonts_lua as simplehtml_element_fonts_lua,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
-pub use skills::{SkillEntry, SkillsState};
+pub use skills::{SkillCall, SkillEntry, SkillsState};
 pub use social::{FriendInfo, IgnoreInfo, SocialCall, SocialState, WhoInfo};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spellbook::{
     resolve_spell_in_books, NamedSpell, PetBookState, SpellBookState, SpellSlotView, SpellTabName,
     SpellTabView,
 };
-pub use stable::{StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
+pub use stable::{StableCall, StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
 pub use summon::SummonConfirmUiState;
-pub use talent::{TalentPrereqView, TalentTabView, TalentUiState, TalentView};
+pub use talent::{TalentCall, TalentPrereqView, TalentTabView, TalentUiState, TalentView};
 pub use taxi::{TaxiCall, TaxiNodeType, TaxiUiNode, TaxiUiState};
 pub use tooltip_aura::{AuraKey, AuraTooltipView};
 pub use tooltip_spell::{ReputationRequirement, SpellTooltipView};
@@ -792,6 +796,7 @@ impl UiScript {
     pub fn new() -> mlua::Result<UiScript> {
         let lua = install_framescript(VmKind::InGame)?;
         install_in_game(&lua)?;
+        object::guard_receivers(&lua)?;
         Ok(Self::host(lua))
     }
 
@@ -803,6 +808,7 @@ impl UiScript {
     pub fn new_glue() -> mlua::Result<UiScript> {
         let lua = install_framescript(VmKind::Glue)?;
         glue::install(&lua)?;
+        object::guard_receivers(&lua)?;
         Ok(Self::host(lua))
     }
 

@@ -1,14 +1,17 @@
 //! The submitted-line side of the chat: [`drain_chat_input`] executes what [`parse`] resolved and
 //! the `ConsoleExec` lines the VM queues; [`send`] applies `SendChatMessage`, `RandomRoll`,
-//! `UninviteByName`, `SendAddonMessage` and the channel verbs inside their calls, and [`emote`]
-//! `DoEmote` (`0x5ef560`): the eligibility gate, the asleep gate, the stow, the posture, then
-//! `CMSG_TEXT_EMOTE`. Own sends are never echoed locally; the server echoes them.
+//! `RequestTimePlayed`, `UninviteByName`, `SendAddonMessage` and the channel verbs inside their
+//! calls, and [`emote`] `DoEmote` (`0x5ef560`): the eligibility gate, the asleep gate, the stow,
+//! the posture, then `CMSG_TEXT_EMOTE`. Own sends are never echoed locally; the server echoes
+//! them.
 
 use crate::query_cache::Ask;
 use bevy::prelude::*;
 
 /// The channel verbs' slot writes and packets.
 mod channel;
+/// The drunk transform a drunk player's line goes through.
+mod drunk;
 /// `DoEmote`, applied inside its call.
 mod emote;
 mod parse;
@@ -130,6 +133,8 @@ pub(super) fn drain_chat_input(
         MessageWriter<'static, crate::creature_anim::CastEvent>,
         ResMut<'static, crate::creature_anim::PlaySeq>,
         ChatOut<'static, 'static>,
+        // The dev probes read the relation inputs a call can write.
+        ChatProbes<'static, 'static>,
     )>,
     chat_log: Res<super::feed::ChatLog>,
     commands: Res<NetCommands>,
@@ -137,13 +142,13 @@ pub(super) fn drain_chat_input(
     self_player: Query<(Entity, &MovementState, &GlobalTransform), With<SelfPlayer>>,
     mut go_targets: MessageWriter<crate::creature_anim::SpellGoTargets>,
     table: Res<super::commands::SlashCommands>,
-    probes: ChatProbes,
 ) {
     // The lines are taken in turns, and a line's Lua runs between them with the host lent, so a
     // call it makes applies inside its verb, before the next line is taken.
     let mut lines: Option<std::vec::IntoIter<(String, ParsedChat)>> = None;
     while let Some(work) = vm.turn(|script, parts| {
-        let (selection, mut group, mut names, mut cast_events, mut play_seq, mut chat_out) = parts;
+        let (selection, mut group, mut names, mut cast_events, mut play_seq, mut chat_out, probes) =
+            parts;
         let ChatProbes {
             camera: world_camera,
             clock,
@@ -763,8 +768,13 @@ pub(super) fn drain_chat_input(
                 }
             }),
             LineWork::Emote { text_id, arg } => {
-                if let Some(host) = vm.parts().1.p1().as_mut() {
-                    host.emote(text_id, arg.as_deref());
+                if let (Some(script), set) = vm.parts() {
+                    if let Some(host) = set.p1().as_mut() {
+                        // The engine half runs as a turn, what it signals held, then its
+                        // listeners run with the host lent, as inside `DoEmote`'s call.
+                        script.host_out(|script| host.emote(script, text_id, arg));
+                        script.hosted(host, |_| ());
+                    }
                 }
             }
         }

@@ -29,8 +29,11 @@ mod objects;
 pub(crate) use objects::wire;
 pub(crate) use objects::Listed;
 pub(crate) use objects::{release_unheld, ReleasePending};
+mod reputations;
 mod session;
 mod world;
+
+pub(crate) use reputations::Reputations;
 
 pub(crate) use apply::apply_net_updates;
 pub(crate) use apply::enter_world_on_self_create;
@@ -105,7 +108,10 @@ impl Plugin for NetPlugin {
             .init_resource::<crate::world_state::WorldStates>()
             .add_message::<TeleportMessage>()
             .add_message::<FieldChanged>()
-            .add_message::<crate::item_watch::ItemNotice>()
+            .add_message::<AuraFieldsChanged>()
+            .init_resource::<crate::item_lane::ItemLane>()
+            .init_resource::<crate::item_watch::BagCache>()
+            .init_resource::<crate::ui_items::feed::BagView>()
             .init_resource::<crate::field_watch::NoticeLane>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
@@ -299,6 +305,58 @@ impl FieldChanged {
     pub fn unit_array_slot(&self, base: u16, len: u16) -> Option<u16> {
         (self.is_unit() && (base..base + len).contains(&self.index)).then(|| self.index - base)
     }
+}
+
+/// The dwords the aura watcher `0x604d00` covers from `UNIT_FIELD_AURA`: the 48 slot ids and the
+/// 6 `UNIT_FIELD_AURAFLAGS` nibble words, fields 47 to 100 (registered at `0x604226`).
+pub(crate) const AURA_WATCH_SPAN: usize = 54;
+
+/// One call of the aura watcher `0x604d00` on a unit: once per notified block whose fields 47 to
+/// 100 moved, with the watch copy's old dwords and the descriptor's new ones, as the notify pass
+/// hands a range watcher its copy (`0x4655c7`). `at` is the watcher's place among what the packets
+/// queue, the stamp of the block's first edge in the range, where
+/// [`crate::field_watch::in_watch_order`] places them all. `health` is the descriptor's
+/// `UNIT_FIELD_HEALTH` as the watcher runs, which the loss line reads (`0x62b50e`).
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuraFieldsChanged {
+    pub at: crate::lanes::Stamp,
+    pub entity: Entity,
+    pub guid: u64,
+    pub old: [u32; AURA_WATCH_SPAN],
+    pub new: [u32; AURA_WATCH_SPAN],
+    pub health: u32,
+}
+
+/// Whether a unit field lies in the aura watcher's range.
+pub(crate) fn in_aura_watch(index: u16) -> bool {
+    use benilla_protocol::field::FIELD_UNIT_AURA;
+    (FIELD_UNIT_AURA..FIELD_UNIT_AURA + AURA_WATCH_SPAN as u16).contains(&index)
+}
+
+/// The watch copy and the descriptor of the aura watcher's range for one block, or `None` when
+/// the block moved nothing in it: `fields` is the descriptor after the block, `moved` the block's
+/// `(index, old, new)` edges.
+pub(crate) fn aura_watch_span(
+    fields: &ObjectFields,
+    moved: impl IntoIterator<Item = (u16, u32, u32)>,
+) -> Option<([u32; AURA_WATCH_SPAN], [u32; AURA_WATCH_SPAN])> {
+    use benilla_protocol::field::FIELD_UNIT_AURA;
+    let slot = |index: u16| in_aura_watch(index).then(|| usize::from(index - FIELD_UNIT_AURA));
+    let mut new = [0u32; AURA_WATCH_SPAN];
+    for (index, value) in fields.raw_fields() {
+        if let Some(i) = slot(index) {
+            new[i] = value;
+        }
+    }
+    let mut old = new;
+    let mut any = false;
+    for (index, was, _) in moved {
+        if let Some(i) = slot(index) {
+            old[i] = was;
+            any = true;
+        }
+    }
+    any.then_some((old, new))
 }
 
 /// A block's write into a held store (`0x466590` with its copy flag clear): a create's delta
@@ -696,54 +754,6 @@ pub(crate) fn send_query_time(
     if entering || due {
         *asked_at = Some(Instant::now());
         let _ = commands.0.send(ClientCommand::QueryTime);
-    }
-}
-
-/// Our reputation state: the `(flags, standing)` per slot and the forced-reaction table.
-///
-/// `slots` is indexed by `Faction.dbc`'s `reputationIndex`. The standing excludes the DBC
-/// race/class base, which consumers add before ranking. Filled by `SMSG_INITIALIZE_FACTIONS`, kept
-/// current by `SMSG_SET_FACTION_STANDING` (which also reveals) and `SMSG_SET_FACTION_VISIBLE`.
-/// Flag bit `0x08` marks a pane header.
-///
-/// `forced` is `SMSG_SET_FORCED_REACTIONS` (`0x4d59a0`): `(Faction.dbc id, reaction rank)` per
-/// faction a `SPELL_AURA_FORCE_REACTION` aura forces, which answers with that rank whatever its
-/// templates or our standing say. Both halves live on one resource so a change to either wakes the
-/// unit feed and the questgiver-marker re-query that read reactions.
-#[derive(Resource, Default, Clone)]
-pub(crate) struct Reputations {
-    pub(crate) slots: Vec<(u8, i32)>,
-    pub(crate) forced: Vec<(u32, u32)>,
-    /// How many forced tables have arrived. The reference's handler fires `UNIT_FACTION` on every
-    /// arrival, a resend of the same table included, so a feed counts arrivals, not table diffs.
-    forced_arrivals: u64,
-}
-
-impl Reputations {
-    /// A store holding only `slots`, with nothing forced.
-    #[cfg(test)]
-    pub(crate) const fn from_slots(slots: Vec<(u8, i32)>) -> Self {
-        Self {
-            slots,
-            forced: Vec::new(),
-            forced_arrivals: 0,
-        }
-    }
-
-    /// `SMSG_SET_FORCED_REACTIONS`: the table replaces the last whole (`0x4d59a0`).
-    pub(crate) fn set_forced(&mut self, table: Vec<(u32, u32)>) {
-        self.forced = table;
-        self.forced_arrivals += 1;
-    }
-
-    /// Drops the table: the reference's teardown zeroes the count (`0x4d5419`).
-    pub(crate) fn clear_forced(&mut self) {
-        self.forced.clear();
-    }
-
-    /// The tables that have arrived so far.
-    pub(crate) fn forced_arrivals(&self) -> u64 {
-        self.forced_arrivals
     }
 }
 

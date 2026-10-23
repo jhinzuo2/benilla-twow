@@ -87,13 +87,25 @@ impl Rig {
             .record_count()
     }
 
-    /// Whether the pet's list still holds a record that has run out.
-    fn elapsed_pending(&self) -> bool {
+    /// Whether the pet's list still holds a record that has run out by `at`.
+    fn elapsed_pending(&self, at: Instant) -> bool {
         self.app
             .world()
             .resource::<PetBar>()
             .cooldowns
-            .sweep_pending(Instant::now())
+            .sweep_pending(at)
+    }
+
+    /// The frame's clock pair stepped to `ahead` past the wall clock, as the UI step re-anchors it
+    /// each frame: every record armed so far is then `ahead` older, however long the run took.
+    fn step_clock(&mut self, ahead: Duration) {
+        let mut clock = self
+            .app
+            .world_mut()
+            .resource_mut::<crate::ui_script::UiClock>();
+        let anchor = Instant::now() + ahead;
+        clock.ui_now += anchor.duration_since(clock.anchor).as_secs_f64();
+        clock.anchor = anchor;
     }
 }
 
@@ -306,7 +318,7 @@ fn a_natural_expiry_fires_nothing() {
     assert_eq!(rig.frame(), FLUSH);
     assert!(rig.cooldown(1).1 > 0.0, "running");
 
-    std::thread::sleep(Duration::from_millis(80));
+    rig.step_clock(Duration::from_millis(80));
 
     assert!(
         rig.frame().is_empty(),
@@ -518,11 +530,12 @@ fn an_insert_leaves_the_pets_list_its_live_records_alone() {
         rig.press(1);
     }
     let_the_gcds_run_out();
-    assert!(rig.elapsed_pending(), "the forty GCDs have run out");
+    let pressed = Instant::now();
+    assert!(rig.elapsed_pending(pressed), "the forty GCDs have run out");
 
     rig.press(1);
 
-    assert!(!rig.elapsed_pending(), "the insert dropped them");
+    assert!(!rig.elapsed_pending(pressed), "the insert dropped them");
     assert_eq!(
         rig.record_count(),
         3,
@@ -553,7 +566,8 @@ fn an_inserts_prune_fires_only_the_inserts_own_flush() {
     assert_eq!(rig.frame(), FLUSH, "the presses' own flush");
     let held = rig.generation();
     let_the_gcds_run_out();
-    assert!(rig.elapsed_pending());
+    let pressed = Instant::now();
+    assert!(rig.elapsed_pending(pressed));
 
     // Growl has no GCD pair: nothing is armed, so nothing is dropped or flushed.
     rig.press(2);
@@ -564,7 +578,7 @@ fn an_inserts_prune_fires_only_the_inserts_own_flush() {
     assert_eq!(rig.generation(), held);
 
     rig.press(1);
-    assert!(!rig.elapsed_pending(), "the insert dropped the five");
+    assert!(!rig.elapsed_pending(pressed), "the insert dropped the five");
     assert_eq!(rig.frame(), FLUSH, "the insert's flush, once");
     assert_eq!(
         rig.generation(),
@@ -601,10 +615,11 @@ fn an_insert_changes_no_bar_read_of_the_records_that_stay() {
         "the parked record shows disabled: {parked_read:?}"
     );
     let_the_gcds_run_out();
-    assert!(rig.elapsed_pending());
+    let pressed = Instant::now();
+    assert!(rig.elapsed_pending(pressed));
 
     rig.press(1);
-    assert!(!rig.elapsed_pending(), "the insert pruned");
+    assert!(!rig.elapsed_pending(pressed), "the insert pruned");
     rig.frame();
 
     assert_eq!(
@@ -613,4 +628,79 @@ fn an_insert_changes_no_bar_read_of_the_records_that_stay() {
         "the running recovery, its start too"
     );
     assert_eq!(rig.cooldown(3), parked_read, "the parked record");
+}
+
+/// `SMSG_PET_SPELLS` seeds each cooldown through `StartCooldown 0x6e2c60` with pet=1
+/// (`0x4bdabf`): the timer is the larger of the spell's own time and the remainder, started so it
+/// ends at the remainder (`0x6e2d8b`-`0x6e2d94`), so a sweep the bar shows on arrival keeps its
+/// whole length, partly run. The category dword's bit 31 is the held flag, masked off
+/// (`0x4bda97`, `0x4bdaab`).
+#[test]
+fn the_pet_spells_packet_back_dates_its_cooldowns_and_reads_the_held_bit() {
+    let mut rig = growl_rig();
+    let with = |category_cd_ms: u32, bar: &PetSpells| PetSpells {
+        cooldowns: vec![PetSpellCooldown {
+            spell_id: GROWL,
+            category: 82,
+            spell_cd_ms: 0,
+            category_cd_ms,
+        }],
+        ..bar.clone()
+    };
+    let bar = rig.app.world().resource::<PetBar>().spells.clone();
+
+    // The frame's clock pair taken where the packet lands, as the UI step re-anchors it every
+    // frame; the rig runs no step, so the pair would otherwise date from the rig's build.
+    let now = ui(&mut rig).now();
+    *rig.app
+        .world_mut()
+        .resource_mut::<crate::ui_script::UiClock>() = crate::ui_script::UiClock {
+        anchor: Instant::now(),
+        ui_now: now,
+    };
+    rig.receive(vec![SessionEvent::PetSpells(Box::new(with(2000, &bar)))]);
+    rig.frame();
+    let now = ui(&mut rig).eval::<f64>("return GetTime()").unwrap();
+    let (start, duration, enable) = rig.cooldown(1);
+    assert!(
+        (duration - 5.0).abs() < 1e-9,
+        "Growl's own 5 s, not the 2 s remainder: {duration}"
+    );
+    assert!(
+        (start + duration - now - 2.0).abs() < 0.25,
+        "ending 2 s from now: start {start}, now {now}"
+    );
+    assert_eq!(enable, 1);
+
+    rig.receive(vec![SessionEvent::PetSpells(Box::new(with(
+        0x8000_0000,
+        &bar,
+    )))]);
+    rig.frame();
+    let (_, _, enable) = rig.cooldown(1);
+    assert_eq!(enable, 0, "bit 31 holds the cooldown, and is no time");
+}
+
+/// The category dword loses only bit 31 (`0x4bdaab`): any other bit is time, bit 27 included, so a
+/// remainder of `0x0800_0bb8` runs 134 220.728 s.
+#[test]
+fn the_pet_spells_cooldown_keeps_every_bit_but_the_held_flag() {
+    let mut rig = growl_rig();
+    let bar = rig.app.world().resource::<PetBar>().spells.clone();
+    rig.receive(vec![SessionEvent::PetSpells(Box::new(PetSpells {
+        cooldowns: vec![PetSpellCooldown {
+            spell_id: GROWL,
+            category: 82,
+            spell_cd_ms: 0,
+            category_cd_ms: 0x0800_0bb8,
+        }],
+        ..bar
+    }))]);
+    rig.frame();
+    let (_, duration, enable) = rig.cooldown(1);
+    assert!(
+        (duration - 134_220.728).abs() < 1e-3,
+        "the whole remainder: {duration}"
+    );
+    assert_eq!(enable, 1);
 }

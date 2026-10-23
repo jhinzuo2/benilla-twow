@@ -25,14 +25,12 @@ fn bag_link(pairs: &[(u16, u32)], template_flags: u32) -> String {
     let mut app = App::new();
     app.init_resource::<Items>()
         .init_resource::<Cooldowns>()
+        .init_resource::<super::BagView>()
         .init_resource::<crate::net::GuidIndex>()
-        .init_resource::<crate::ui_items::EquipErrors>()
         .init_resource::<crate::ui_chat::ChatLog>()
         .init_resource::<crate::sound::MessageSounds>()
-        .init_resource::<crate::ui_items::net::BagOpens>()
-        .init_resource::<super::BagUpdates>()
         .init_resource::<crate::names::NameCache>()
-        .init_resource::<crate::ui_petition::PetitionState>()
+        .init_resource::<crate::ui_petition::PetitionRecords>()
         .insert_resource(crate::ui_script::UiClock {
             anchor: now,
             ui_now: 1000.0,

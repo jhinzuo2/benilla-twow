@@ -1,8 +1,10 @@
 //! `CGUnit_C::OnDied 0x605860`, which the health watcher runs on every unit's alive-to-dead edge
 //! (`0x6046f0` at `0x6047a3`: the new health not above 0, the old above). In its order:
 //!
-//! - a player's own leg first (`0x5e99b0` at `0x60588d`): a groupmate's death line, here, and
-//!   the active player's release latch and timer, [`crate::ui_session`]'s;
+//! - a player's own leg first (`0x5e99b0` at `0x60588d`): a groupmate's death line, here; for
+//!   the active player, in its order, the target cleared, the interaction latch released
+//!   ([`crate::ui_session`]'s), the loot window closed, the quest-giver statuses refreshed
+//!   ([`crate::quest_markers`]'), the cast cancelled and, on a taxi, the release asked;
 //! - the dying unit's attack words zeroed (`0x605896`-`0x6058a8`): its target ([`Engaged`],
 //!   `+0xc48`) and its stop in flight (`+0xc54`);
 //! - `PresentUnitDeath 0x625190` (`0x6058ae`), the death line, animation and sound, which the chat
@@ -27,62 +29,95 @@ use crate::ui_action::{FillArg, UiError, UiErrorKeys};
 /// What a groupmate's death shows: message `0x4c` (`0x5e9a0e`).
 const PLAYER_DIED: &str = "ERR_PLAYER_DIED_S";
 
-/// Each unit's death, in the order the edges came.
-#[allow(clippy::too_many_arguments)] // the death's legs, each its own owner's state
+/// Each unit's death, in the order the edges came. A deselect's `SetSelection` signals inside it
+/// ([`crate::script_calls::ScriptCallHost::engine_select`]), before the death goes on.
 pub(super) fn on_unit_died(
     mut edges: MessageReader<FieldChanged>,
-    mut selection: ResMut<Selection>,
-    mut seam: AttackSeam,
-    mut commands: Commands,
-    engaged: Query<(), (With<Engaged>, With<SelfPlayer>)>,
-    group: Res<crate::ui_party::GroupState>,
-    names: Res<crate::names::NameCache>,
-    stores: Query<&ObjectStore>,
-    errors: Res<UiErrorKeys>,
+    mut vm: crate::script_calls::VmWith<Died<'static, 'static>>,
 ) {
+    let edges: Vec<FieldChanged> = edges.read().filter(|e| e.unit_died()).copied().collect();
+    if edges.is_empty() {
+        return;
+    }
     // Our attack target as this pass leaves it: our own death zeroes it before a deselect reads it.
-    let mut me_engaged = !engaged.is_empty();
-    for e in edges.read().filter(|e| e.unit_died()) {
-        let me = seam.me.single().ok();
+    let mut me_engaged = !vm.own().engaged.is_empty();
+    for e in edges {
+        let me = vm.own().seam.me.single().ok();
         // `CGPlayer_C::OnDied 0x5e99b0`, for a player (`0x605882`): another player than the
         // active one (`0x5e99d8`-`0x5e99e4`) on one of our four party slots (`IsPartyMember
         // 0x4918d0` → `0x4e7f70` at `0x5e99f7`) shows the line under `GetUnitName`'s name, the
         // cache's with a callback or `UNKNOWNOBJECT` (`0x609210` at `0x5e9a08`, `0x496720` at
         // `0x5e9a10`).
-        if e.kind == ObjectType::Player
-            && me != Some(e.entity)
-            && group.party_slots().any(|m| m.guid == e.guid)
-        {
-            let store = stores.get(e.entity).ok();
-            errors.push(
-                match names.resolve_unit(e.guid, store, Ask::Event(&seam.net)) {
-                    Some(name) => UiError::s(PLAYER_DIED, name),
-                    None => UiError::args(PLAYER_DIED, vec![FillArg::UnknownObject]),
-                },
-            );
-        }
-        if let Ok(mut unit) = commands.get_entity(e.entity) {
-            unit.try_remove::<Engaged>();
-        }
-        seam.clear_stop_word(e.entity);
-        if me == Some(e.entity) {
-            me_engaged = false;
-        }
-        let spells = seam.spells.as_deref();
-        let mut core = seam.slots.core(&seam.net);
-        if core.slot().is_some() && core.pending.record_target() == Some(e.guid) {
-            core.cancel_reaping(
+        if e.kind == ObjectType::Player && me == Some(e.entity) {
+            // The active player's leg (`0x5e99d8`-`0x5e99e4` match): `SetSelection(0, 0)`
+            // (`0x5e9a45`), our attack target still set, as the unit leg below zeroes it after.
+            let select = vm.own().deselect(me_engaged);
+            vm.engine_select(select, Died::pay);
+            let mut d = vm.own();
+            let seam = &mut d.seam;
+            // `0x48f200(1, 0, 0)` (`0x5e9a5c`): whatever loot window is open, with its release.
+            seam.close_loot();
+            // `CancelCast(1, 1, 0x1c)` (`0x5e9a6c`), asking nothing of the slot first.
+            let spells = seam.spells.as_deref();
+            seam.slots.core(&seam.net).cancel_reaping(
                 true,
                 true,
-                crate::spell::REASON_TARGETS_DEAD,
+                crate::spell::REASON_ERROR,
                 spells,
                 me,
                 &seam.edits,
             );
+            // `UNIT_FIELD_FLAGS` bit 20 (`0x5e9a7d`): `0x5e0ae0` sends `CMSG_REPOP_REQUEST` at
+            // once while the player is dead or a ghost (`0x605f30`), as it is at its death edge.
+            let store = d.stores.get(e.entity).ok();
+            if store.is_some_and(|s| {
+                s.0.unit_flags() & crate::player::UNIT_FLAG_TAXI_FLIGHT != 0
+                    && (s.0.unit_is_dead() || s.0.player_is_ghost())
+            }) {
+                let _ = d.seam.net.0.send(crate::net::ClientCommand::RepopRequest);
+            }
+        } else if e.kind == ObjectType::Player {
+            let d = vm.own();
+            if d.group.party_slots().any(|m| m.guid == e.guid) {
+                let store = d.stores.get(e.entity).ok();
+                d.errors.push(
+                    match d.names.resolve_unit(e.guid, store, Ask::Event(&d.seam.net)) {
+                        Some(name) => UiError::s(PLAYER_DIED, name),
+                        None => UiError::args(PLAYER_DIED, vec![FillArg::UnknownObject]),
+                    },
+                );
+            }
         }
+        let selected = {
+            let mut d = vm.own();
+            if let Ok(mut unit) = d.commands.get_entity(e.entity) {
+                unit.try_remove::<Engaged>();
+            }
+            d.seam.clear_stop_word(e.entity);
+            if me == Some(e.entity) {
+                me_engaged = false;
+            }
+            let seam = &mut d.seam;
+            let spells = seam.spells.as_deref();
+            let mut core = seam.slots.core(&seam.net);
+            if core.slot().is_some() && core.pending.record_target() == Some(e.guid) {
+                core.cancel_reaping(
+                    true,
+                    true,
+                    crate::spell::REASON_TARGETS_DEAD,
+                    spells,
+                    me,
+                    &seam.edits,
+                );
+            }
+            d.selection.guid == Some(e.guid)
+        };
         // The dead target becomes the last one; a corpse selected afterwards stays selected, gray.
-        if selection.guid == Some(e.guid) {
-            super::click::deselect(&mut selection, &mut seam, me_engaged);
+        if selected {
+            let select = vm.own().deselect(me_engaged);
+            vm.engine_select(select, Died::pay);
+            let mut d = vm.own();
+            let seam = &mut d.seam;
             crate::creature_anim::cancel_auto_repeat_local(
                 me,
                 &mut seam.auto_repeat,
@@ -90,6 +125,33 @@ pub(super) fn on_unit_died(
                 &mut seam.slots.core(&seam.net),
             );
         }
+    }
+}
+
+/// What a death's legs read and write, each its own owner's state.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct Died<'w, 's> {
+    selection: ResMut<'w, Selection>,
+    seam: AttackSeam<'w, 's>,
+    commands: Commands<'w, 's>,
+    engaged: Query<'w, 's, (), (With<Engaged>, With<SelfPlayer>)>,
+    group: Res<'w, crate::ui_party::GroupState>,
+    names: Res<'w, crate::names::NameCache>,
+    stores: Query<'w, 's, &'static ObjectStore>,
+    errors: Res<'w, UiErrorKeys>,
+}
+
+impl Died<'_, '_> {
+    /// `SetSelection(0, 0)`, owing its send when its teardown signals.
+    fn deselect(&mut self, engaged: bool) -> crate::script_calls::EngineSelect {
+        let before = super::click::Standing::of(&self.selection, &self.seam);
+        let send = super::click::deselect_owing(&mut self.selection, &mut self.seam, engaged);
+        before.owing(super::scan::Owed { send, swing: None })
+    }
+
+    /// What a deselect owes, paid with nothing to listen first.
+    fn pay(mut d: Died, owed: super::scan::Owed) {
+        owed.pay(&mut d.selection, &mut d.seam);
     }
 }
 
@@ -277,6 +339,66 @@ mod tests {
                     },
                 )
                 .expect("the slot reads")
+        }
+    }
+
+    /// Our own death runs `0x5e99b0`'s active-player leg first (`0x605860` at `0x60588d`), in its
+    /// order: the target cleared (`0x493540(0, 0)` at `0x5e9a45`), the loot window closed with its
+    /// release (`0x48f200(1, 0, 0)` at `0x5e9a5c`), the cast cancelled whatever it is bound to
+    /// (`CancelCast(1, 1, 0x1c)` at `0x5e9a6c`), and with `UNIT_FIELD_FLAGS` 0x100000 a release
+    /// asked at once (`0x5e9a7d` → `0x5e0ae0`, `CMSG_REPOP_REQUEST`); without it, none.
+    #[test]
+    fn our_own_death_clears_the_target_closes_the_loot_cancels_the_cast_and_releases() {
+        for flagged in [true, false] {
+            let mut c = client();
+            let (me, mob) = (c.me, c.mob);
+            c.select(MOB, mob);
+            c.cast(FIREBALL);
+            c.world()
+                .resource_mut::<crate::ui_loot::LootState>()
+                .open(OTHER, 1, 0, Vec::new());
+            if flagged {
+                c.world()
+                    .get_mut::<ObjectStore>(me)
+                    .unwrap()
+                    .0
+                    .merge(ObjectFields::from_pairs(&[(
+                        FIELD_UNIT_FLAGS,
+                        0x8 | 0x10_0000,
+                    )]));
+            }
+            c.sent();
+            c.reports();
+            // The health written, whose edge the handler reads.
+            c.world()
+                .get_mut::<ObjectStore>(me)
+                .unwrap()
+                .0
+                .merge(ObjectFields::from_pairs(&[(FIELD_UNIT_HEALTH, 0)]));
+
+            c.dies(me, ME, ObjectType::Player);
+            let mut want = vec![
+                "SetSelection { guid: 0 }".to_string(),
+                format!("LootRelease {{ guid: {OTHER} }}"),
+                format!("CancelCast {{ spell_id: {FIREBALL} }}"),
+            ];
+            if flagged {
+                want.push("RepopRequest".to_string());
+            }
+            let sent: Vec<String> = c.sent().iter().map(|s| format!("{s:?}")).collect();
+            assert_eq!(sent, want, "flagged: {flagged}");
+            assert_eq!(c.world().resource::<Selection>().guid, None);
+            assert_eq!(
+                c.world().resource::<crate::ui_loot::LootState>().source(),
+                None
+            );
+            assert_eq!(c.in_flight(), None, "the cast is popped");
+            assert!(
+                c.reports()
+                    .iter()
+                    .any(|r| matches!(r, CastReport::Bar(CastBarEdge::Failed))),
+                "and fails"
+            );
         }
     }
 
@@ -588,5 +710,81 @@ mod tests {
         let (mob, me) = (c.mob, c.me);
         assert_eq!(lines(&mut c, mob, MOB, ObjectType::Unit), [], "a creature");
         assert_eq!(lines(&mut c, me, ME, ObjectType::Player), [], "our own");
+    }
+
+    /// A possessed unit's attack, latched: charmed by us, flagged possessed, our view on it, as
+    /// `0x5ee5a0` answers it.
+    fn possessing_an_attacker(c: &mut Client) {
+        const PET: u64 = 0xF140_0000_0000_0099;
+        let world = c.world();
+        let pet = world
+            .spawn((
+                Guid(PET),
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (2, 0x9),
+                    (FIELD_UNIT_HEALTH, 100),
+                    (10, ME as u32),
+                    (FIELD_UNIT_FLAGS, crate::target::UNIT_FLAG_POSSESSED),
+                ])),
+            ))
+            .id();
+        world.resource_mut::<GuidIndex>().0.insert(PET, pet);
+        let me = c.me;
+        let world = c.world();
+        world
+            .get_mut::<ObjectStore>(me)
+            .unwrap()
+            .0
+            .merge(ObjectFields::from_pairs(&[
+                (712, PET as u32),
+                (713, (PET >> 32) as u32),
+            ]));
+        world
+            .resource_mut::<crate::ui_pet::PetBar>()
+            .spells
+            .pet_guid = PET;
+        world.resource_mut::<crate::ui_pet::PetAttackLatch>().0 = Some(PET);
+    }
+
+    /// The selection's death deselects (`0x605901`), whose teardown calls a possessed unit off
+    /// (`0x493a18` → `0x4bd650`): `PetStopAttack` signals `PET_BAR_UPDATE` in place (`0x4bd6b4`),
+    /// so its listener's packet goes out ahead of the deselect's `CMSG_SET_SELECTION` 0, and
+    /// `PLAYER_TARGET_CHANGED` (`0x493a73`) is heard inside the death, once.
+    #[test]
+    fn the_selections_death_signals_its_pet_stop_and_its_change_in_place() {
+        let mut c = client();
+        possessing_an_attacker(&mut c);
+        let mob = c.mob;
+        c.select(MOB, mob);
+        crate::script_calls::insert_test_vm(c.world());
+        crate::script_calls::with_hosted_vm(c.world(), |s| {
+            s.expect("a VM").run(
+                r#"HEARD = {}
+                local r = CreateFrame("Frame")
+                r:RegisterEvent("PET_BAR_UPDATE")
+                r:RegisterEvent("PLAYER_TARGET_CHANGED")
+                r:SetScript("OnEvent", function()
+                    table.insert(HEARD, event)
+                    if event == "PET_BAR_UPDATE" then RandomRoll(1, 100) end
+                end)"#,
+            )
+        })
+        .expect("the listener is in");
+        let _ = c.sent();
+        c.dies(mob, MOB, ObjectType::Unit);
+        let wire: Vec<String> = c
+            .sent()
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                ClientCommand::PetStopAttack { .. } => Some("PetStopAttack".to_string()),
+                ClientCommand::RandomRoll { .. } => Some("RandomRoll".to_string()),
+                ClientCommand::SetSelection { guid } => Some(format!("SetSelection {guid:#x}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wire, ["PetStopAttack", "RandomRoll", "SetSelection 0x0"]);
+        crate::ui_unit::run_feed_units_once(c.world());
+        let heard: Vec<String> = crate::script_calls::eval_in_vm(c.world(), "return HEARD");
+        assert_eq!(heard, ["PET_BAR_UPDATE", "PLAYER_TARGET_CHANGED"]);
     }
 }

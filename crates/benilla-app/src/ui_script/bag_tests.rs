@@ -385,6 +385,7 @@ fn bag_tooltip_hangs_left_when_the_slot_sits_in_the_right_half() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -475,6 +476,7 @@ fn hovered_bag_tooltip_fills_itself_when_the_stats_land() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -595,6 +597,7 @@ fn vendor_bag_hover_shows_sell_price_and_arms_the_pouch_cursor() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -630,6 +633,7 @@ fn vendor_bag_hover_shows_sell_price_and_arms_the_pouch_cursor() {
     slots.insert(
         2,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -813,6 +817,7 @@ fn readable_letter_hover_shows_the_inspect_magnifier() {
 fn drag_across_two_slots_queues_the_same_move_a_click_pickup_would() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -830,6 +835,7 @@ fn drag_across_two_slots_queues_the_same_move_a_click_pickup_would() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -929,6 +935,7 @@ fn a_second_bag_window_feeds_and_paints_via_the_bag_bar() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -1078,6 +1085,7 @@ pub(super) fn open_backpack_with_a_five_stack(s: &mut UiScript) -> (f32, f32) {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
@@ -1327,6 +1335,7 @@ fn typing_a_number_into_the_split_spinner_sets_the_count() {
 fn split_okay_then_a_placement_queues_the_split_move() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     let (x, y) = open_backpack_with_a_five_stack(&mut s);
     s.set_modifiers(true, false, false);
@@ -1497,6 +1506,7 @@ fn the_bar_bag_buttons_name_themselves_on_hover() {
     // inventory slot 20.
     let mut inv: benilla_ui::script::InventorySlots = Default::default();
     inv[20] = Some(benilla_ui::script::InvSlotView {
+        uncached_link: None,
         duration_ms: None,
         field_duration: 0,
         already_bound: false,
@@ -1802,6 +1812,7 @@ fn a_hovered_key_shows_its_tooltip_through_its_inventory_slot() {
 fn a_key_dropped_on_the_button_files_itself() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     keyring_surface(&s);
     s.set_money(0);

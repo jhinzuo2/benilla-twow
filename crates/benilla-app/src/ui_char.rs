@@ -9,10 +9,9 @@ use bevy::prelude::*;
 
 use benilla_protocol::messages::PLAYER_SKILL_SLOTS;
 use benilla_ui::script::{
-    weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, ScriptValue, SkillEntry,
-    SkillsState, UiScript, UnitCombatStats, BANK_BAG_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
+    weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, SkillEntry, SkillsState,
+    UnitCombatStats, SKILL_DEFENSE, SKILL_UNARMED,
 };
-use benilla_ui::strings::Arg;
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
@@ -44,9 +43,6 @@ struct CharFeedMemo {
     last_stats: Option<UnitCombatStats>,
     last_inv: Option<InventorySlots>,
     last_bank_bags: Option<BankBagSlots>,
-    /// The bag guid in each bank bag slot, `PLAYERBANKSLOTS_CHANGED`'s discriminator: the pushed
-    /// view cannot tell two copies of one bag apart, and the reference fires when they swap.
-    last_bank_bag_guids: [u64; BANK_BAG_SLOT_COUNT],
     /// Counters for the stores whose lazy resolves poison `is_changed` (item templates, creator
     /// names); item objects are entities, watched through [`crate::items::ItemChanges`].
     items_templates: gate::Watch,
@@ -68,16 +64,21 @@ impl Plugin for UiCharPlugin {
             .add_systems(
                 Update,
                 (
-                    // Before `feed_containers`: a `BAG_UPDATE` handler may read the bag item's own
-                    // row (`GetInventoryItemLink("player", ContainerIDToInventoryID(bag))`), so the
-                    // inventory push lands first.
+                    // A `BAG_UPDATE` handler may read the bag item's own row
+                    // (`GetInventoryItemLink("player", ContainerIDToInventoryID(bag))`): the lanes'
+                    // drain and the world-enter cascade both follow this push. Before the bag feed:
+                    // left to the VM pass, the pair links through one more command barrier
+                    // ([`crate::vm_pass`]).
                     feed_char
                         .before(crate::ui_items::feed::feed_containers)
                         .in_set(UiFeed)
                         .in_set(crate::ui_unit::field_events::FieldEventPushes),
-                    watch_skill_ups.in_set(UiFeed),
-                    feed_skills.in_set(UiFeed),
-                    drain_skill_abandons.in_set(crate::ui_script::UiDrain),
+                    // A seat, and ahead of the notice lane: the world-enter cascade's rebuild and
+                    // the skill watches' list what this pushed.
+                    feed_skills
+                        .in_set(UiFeed)
+                        .in_set(crate::ui_unit::field_events::FieldEventPushes)
+                        .in_set(crate::ui_unit::WorldEnterSeats),
                 ),
             );
     }
@@ -102,150 +103,10 @@ fn load_skill_tiers(mut commands: Commands, assets: Option<Res<benilla_assets::W
     }
 }
 
-/// The skill block [`watch_skill_ups`] last announced: the self guid and its `skillId → value`
-/// map, the diff base for the chat lines and the event.
-type SkillBlock = Option<(u64, std::collections::HashMap<u16, u16>)>;
-
-/// One skill-up chat line, `ERR_SKILL_UP_SI` or `ERR_SKILL_GAINED_S`, pushed as `CHAT_MSG_SKILL`.
-/// The server sends no skill-up message; the reference's watcher on the skill value words
-/// (`0x5de180`) prints these through `0x496720`, silent for a line whose `SkillRaceClassInfo`
-/// flags carry `0x402` or that no row admits for this race and class (`0x5de352`), so a level-up
-/// prints none. Not `ui_action::show_messages`: that sink sends every chat row as
-/// `CHAT_MSG_SYSTEM`, and these two ask for `CHAT_MSG_SKILL` (23).
-fn skill_line(script: &UiScript, chat: &crate::ui_chat::ChatLog, key: &str, args: &[Arg<'_>]) {
-    let Some(template) = script
-        .lua()
-        .globals()
-        .get::<String>(key)
-        .ok()
-        .filter(|t| !t.is_empty())
-    else {
-        return;
-    };
-    chat.push_event(crate::ui_chat::ChatEvent::text_only(
-        crate::ui_chat::ChatEventKind::Skill,
-        benilla_ui::strings::fill(&template, args),
-    ));
-}
-
-fn watch_skill_ups(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    self_guid: Res<crate::net::SelfGuid>,
-    self_store: Query<&ObjectStore, With<SelfPlayer>>,
-    skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
-    chat: Res<crate::ui_chat::ChatLog>,
-    mut prev: Local<crate::ui_script::VmMemo<SkillBlock>>,
-) {
-    hosted_vm.run(|script| {
-        let (Some(guid), Ok(store)) = (self_guid.0, self_store.single()) else {
-            return;
-        };
-        // The memo is per VM and a new VM re-seeds silently; with no VM nothing is diffed, or a
-        // stale skill-up would replay at the next login. `SKILL_LINES_CHANGED` fires here only when
-        // a line is added, removed or changes value; the reference fires it at the end of every
-        // skill-list rebuild (`0x4d2fec`), which its value, max, permanent-bonus and
-        // temporary-bonus watchers run (registered `0x5dda54`-`0x5ddaf0`), and from both header
-        // collapse and expand verbs.
-        let Some(script) = script else {
-            return;
-        };
-        let prev = prev.get(script);
-        let mut cur = std::collections::HashMap::new();
-        for i in 0..PLAYER_SKILL_SLOTS {
-            if let Some(s) = store.0.player_skill(i) {
-                if s.skill_id != 0 {
-                    cur.insert(s.skill_id, s.value);
-                }
-            }
-        }
-        match prev.as_ref() {
-            // First fill: seed silently, no lines; the event fires once.
-            None => {
-                if cur.is_empty() {
-                    return;
-                }
-                script.fire_event("SKILL_LINES_CHANGED", vec![]);
-                *prev = Some((guid, cur));
-            }
-            Some((prev_guid, _)) if *prev_guid != guid => {
-                // A different character: re-seed, never diff across characters.
-                script.fire_event("SKILL_LINES_CHANGED", vec![]);
-                *prev = Some((guid, cur));
-            }
-            Some((_, prev_map)) => {
-                if *prev_map == cur {
-                    return;
-                }
-                // The `0x402` gate reads the player's own race and class row, as `skills_row` does.
-                let (race, class) = (
-                    store.0.unit_race().unwrap_or(0),
-                    store.0.unit_class().unwrap_or(0),
-                );
-                for (&id, &value) in &cur {
-                    let line_id = u32::from(id);
-                    let name = || {
-                        skill_lines
-                            .as_ref()
-                            .and_then(|s| s.catalog.line(line_id))
-                            .map(|l| l.name.clone())
-                    };
-                    let announces = || {
-                        skill_lines
-                            .as_ref()
-                            .is_some_and(|s| s.catalog.announces_skill_ups(line_id, race, class))
-                    };
-                    match prev_map.get(&id) {
-                        // A rank-up: `ERR_SKILL_UP_SI` (catalog row 54), not `SKILL_RANK_UP`, the
-                        // same enUS sentence with no catalog row.
-                        Some(&old) if value > old => {
-                            if let Some(name) = name() {
-                                if announces() {
-                                    debug!("chat: skill-up announced ({name} {old}→{value})");
-                                    skill_line(
-                                        script,
-                                        &chat,
-                                        "ERR_SKILL_UP_SI",
-                                        &[Arg::S(&name), Arg::D(i64::from(value))],
-                                    );
-                                } else {
-                                    debug!(
-                                        "chat: skill-up silenced ({name} {old}→{value}, the \
-                                            0x402 gate)"
-                                    );
-                                }
-                            }
-                        }
-                        // A new line: `ERR_SKILL_GAINED_S` (catalog row 53).
-                        None => {
-                            if let Some(name) = name() {
-                                if announces() {
-                                    debug!("chat: skill-gain announced ({name} at {value})");
-                                    skill_line(
-                                        script,
-                                        &chat,
-                                        "ERR_SKILL_GAINED_S",
-                                        &[Arg::S(&name)],
-                                    );
-                                } else {
-                                    debug!(
-                                        "chat: skill-gain silenced ({name} at {value}, the 0x402 \
-                                         gate)"
-                                    );
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                script.fire_event("SKILL_LINES_CHANGED", vec![]);
-                *prev = Some((guid, cur));
-            }
-        }
-    })
-}
-
 /// The skills-pane feed: every `PLAYER_SKILL_INFO` line the reference lists, as a flat
-/// [`SkillEntry`] pushed through `set_skills` on change; the engine groups, sorts and folds.
+/// [`SkillEntry`] pushed through `set_skills` on change; the engine groups, sorts and folds at its
+/// rebuilds, which the skill watches' notices run (`crate::field_watch`) and the world-enter
+/// cascade.
 fn feed_skills(
     mut hosted_vm: crate::script_calls::HostedVm,
     self_store: Query<Ref<ObjectStore>, With<SelfPlayer>>,
@@ -345,18 +206,22 @@ pub(crate) fn skills_row(
     })
 }
 
-/// Each queued `AbandonSkill` becomes one `CMSG_UNLEARN_SKILL`; nothing changes locally, as the
-/// server's `SetSkill(id, 0, 0)` (vmangos `SkillHandler.cpp:69`) returns as a skill-field update.
-fn drain_skill_abandons(mut hosted_vm: crate::script_calls::HostedVm, commands: Res<NetCommands>) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        for skill_id in script.take_skill_abandons() {
-            debug!("ui_char: abandon skill line {skill_id}");
-            let _ = commands.0.send(ClientCommand::UnlearnSkill { skill_id });
-        }
-    })
+/// The skills verbs' engine half, which the call host applies inside each call
+/// ([`crate::script_calls::ScriptCallHost`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SkillSteps<'w> {
+    net: Res<'w, NetCommands>,
+}
+
+impl SkillSteps<'_> {
+    /// `AbandonSkill`'s `CMSG_UNLEARN_SKILL` (`0x4d3b40`); nothing changes locally, as the
+    /// server's `SetSkill(id, 0, 0)` (vmangos `SkillHandler.cpp:69`) returns as a skill-field
+    /// update.
+    pub(crate) fn apply(&mut self, call: benilla_ui::script::SkillCall) {
+        let benilla_ui::script::SkillCall::Abandon(skill_id) = call;
+        debug!("ui_char: abandon skill line {skill_id}");
+        let _ = self.net.0.send(ClientCommand::UnlearnSkill { skill_id });
+    }
 }
 
 /// The item entry in an equipped slot; `None` for an empty slot or an item not yet streamed.
@@ -554,7 +419,11 @@ fn slot_view(
     let flags = obj.item_flags().unwrap_or(0);
     // Soulbound or carrying a binding enchant (`0x5da2c0`), read off the raw descriptor, never off
     // the enchant lines below.
-    let already_bound = crate::items::already_bound(obj, rolls.enchants);
+    let already_bound = crate::items::already_bound(
+        obj,
+        crate::items::record_flags(items, entry, guid),
+        rolls.enchants,
+    );
     // Only read: the tooltip build asks the creator (`crate::ui_items::feed::ask_item_build_lookups`).
     let creator = obj
         .item_creator()
@@ -575,21 +444,20 @@ fn slot_view(
         }),
         rolls.enchants,
     );
-    // `ITEM_FIELD_RANDOM_PROPERTIES_ID`, the roll behind an "of the Bear" name; its enchants are
-    // already in the slots above.
-    let roll = obj.item_random_properties_id();
     // Only read, as the inventory getters read it (`0x4c8a0a`, `0x4c8d34`): the item's create asked.
     let t = items.template(entry, guid, Ask::Read);
+    // `GetInventoryItemLink` links the player's own item object (`0x4c8ce2` → `0x52ae00`), its
+    // record cached or not.
+    let object_link = crate::ui_items::object_link(obj, t, rolls);
     let (name, quality, display, link, equip_slots, kind, bar_placeable, consumable) = match t {
         Some(t) => {
-            let name = rolls.name(&t.name, roll);
+            // The item object's name (`0x5d8bc0`): the roll's suffix, unless it is wrapped.
+            let name = crate::ui_items::object_name(obj, t, rolls);
             (
                 Some(name.clone()),
                 t.quality as i32,
                 t.display_info_id,
-                // `GetInventoryItemLink` links the player's own item object (`0x4c8ce2` →
-                // `0x52ae00`).
-                Some(crate::ui_items::object_link(obj, t, rolls)),
+                Some(object_link.clone()),
                 find_equip_slot(t.inventory_type, has_relic_slot),
                 (t.class, t.subclass),
                 t.placeable_on_action_bar(),
@@ -634,6 +502,7 @@ fn slot_view(
         contents_count,
         quality,
         name,
+        uncached_link: t.is_none().then_some(object_link),
         link,
         durability,
         flags,
@@ -717,6 +586,7 @@ fn inventory_slots(
             .and_then(|i| i.catalog.get(display))
             .and_then(|d| d.icon.clone());
         inv[0] = Some(InvSlotView {
+            uncached_link: None,
             inventory_type,
             durability: None,
             flags: 0,
@@ -933,48 +803,16 @@ pub(crate) fn feed_char(
         // The doll's `UNIT_INVENTORY_CHANGED` is its producers' alone, the visible-item bridge, the
         // ammunition watch and the item paths ([`crate::field_watch`], [`crate::item_watch`]),
         // fired after this push; a view change raises none, a repair's durability included, which
-        // repaints through the push's `UPDATE_INVENTORY_ALERTS` (`0x5d9920` → `0x4c7ee0`).
-        // `PLAYERBANKSLOTS_CHANGED`'s two producers, planned off the old memo: `false` is the
-        // descriptor watcher (`0x5ddd6e`: a bag arrived, left or was swapped), `true` the
-        // item-object path (`0x4c728d`: the same bag's own fields changed).
-        let bank_bag_guids: [u64; BANK_BAG_SLOT_COUNT] =
-            std::array::from_fn(|i| store.0.player_bank_bag_slot(i as u8).unwrap_or(0));
-        let repainted: Vec<bool> = (0..BANK_BAG_SLOT_COUNT)
-            .filter_map(|i| {
-                if bank_bag_guids[i] != memo.last_bank_bag_guids[i] {
-                    Some(false)
-                } else {
-                    let was = memo.last_bank_bags.as_ref().and_then(|b| b[i].as_ref());
-                    (was != bank_bags[i].as_ref()).then_some(true)
-                }
-            })
-            .collect();
-        memo.last_bank_bag_guids = bank_bag_guids;
+        // repaints through the push's `UPDATE_INVENTORY_ALERTS` (`0x5d9920` → `0x4c7ee0`). So is
+        // the bank bag buttons' `PLAYERBANKSLOTS_CHANGED` (`BankFrame.lua:206-208`): the
+        // inventory watcher's (`0x5ddd69`) and the item path's (`0x4c728d`).
         if memo.last_inv.as_ref() != Some(&inv) || memo.last_bank_bags.as_ref() != Some(&bank_bags)
         {
             gate.audit("feed_char", "the inventory snapshot");
             script.set_inventory_slots(inv.clone());
             script.set_bank_bag_slots(bank_bags.clone());
-            // The bank bag buttons repaint only on `PLAYERBANKSLOTS_CHANGED` and
-            // `BANKFRAME_OPENED` (`BankFrame.lua:206-208`). One event per changed slot: the
-            // descriptor watcher signals through `0x703e50` with no arguments, the item path
-            // through `SignalEvent2` with `"player"`.
             memo.last_inv = Some(inv);
             memo.last_bank_bags = Some(bank_bags);
-        }
-        // Outside the push block: an identical-bag swap moves no view at all.
-        if !repainted.is_empty() {
-            gate.audit("feed_char", "a bank bag slot transition");
-        }
-        for same_bag in repainted {
-            if same_bag {
-                script.fire_event(
-                    "PLAYERBANKSLOTS_CHANGED",
-                    vec![ScriptValue::Str("player".to_string())],
-                );
-            } else {
-                script.fire_event("PLAYERBANKSLOTS_CHANGED", vec![]);
-            }
         }
     })
 }
@@ -1012,6 +850,7 @@ fn weapon_enchant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
 
     /// A worn bag's view says how many of its seats are filled, which `ClickTradeButton` reads
     /// to refuse it (`0x4bff50`, then `0x4bffae` for an empty one in a bag slot).
@@ -1178,22 +1017,21 @@ mod tests {
         out
     }
 
+    /// The bank bag buttons' `PLAYERBANKSLOTS_CHANGED` is the inventory watcher's and the item
+    /// path's (`0x5ddd69`, `0x4c728d`, [`crate::item_watch`]): the feed's push of a bank bag
+    /// arriving, or of its own field moving, fires none, nor a doll event.
     #[test]
-    fn a_bank_bag_slot_filling_fires_playerbankslots_changed() {
+    fn a_bank_bag_push_fires_no_event() {
         let mut app = world_with_bank_bag(Some(BAG));
         app.world_mut().run_system_once(feed_char).unwrap();
-        let events = seen(&mut app);
-        assert!(
-            events.contains(&"PLAYERBANKSLOTS_CHANGED nil".to_string()),
-            "the repaint event, and it carries NO argument — `0x703e50` pushes none, and the \
-             recorder stringifies the absent arg1 as nil. Got {events:?}"
+        assert!(seen(&mut app).is_empty());
+        restream(
+            &mut app,
+            BAG,
+            ObjectFields::from_pairs(&[(F_OBJECT_ENTRY, BAG_ENTRY), (F_ITEM_STACK_COUNT, 3)]),
         );
-        assert!(
-            !events
-                .iter()
-                .any(|e| e.starts_with("UNIT_INVENTORY_CHANGED")),
-            "a bank bag seat is no doll seat (`0x4c726a`), got {events:?}"
-        );
+        app.world_mut().run_system_once(feed_char).unwrap();
+        assert!(seen(&mut app).is_empty());
     }
 
     /// Rewrite the active player's descriptor wholesale: `ObjectFields` has no setter.
@@ -1286,6 +1124,96 @@ mod tests {
         assert_eq!(link, "|cffffffff|Hitem:7366:1900:862:7|h[Helm]|h|r");
     }
 
+    /// An own item whose record the cache lacks still links: `0x52ae00` answers null only for a
+    /// null object (`0x52ae24`), takes quality 1 without a record (`0x52aec5`), and the name
+    /// builder leaves the name empty (`0x5d8b25`, the miss at `0x5d8b40`).
+    #[test]
+    fn an_equipped_item_with_no_record_links_white_and_nameless() {
+        use benilla_protocol::field::FIELD_PLAYER_INV_SLOT_HEAD;
+        const HELM: u64 = 0x4000_0000_0000_0b02;
+        const HELM_ID: u32 = 7366;
+        let mut app = world_with_bank_bag(None);
+        set_self(
+            &mut app,
+            &[
+                (FIELD_PLAYER_INV_SLOT_HEAD, HELM as u32),
+                (FIELD_PLAYER_INV_SLOT_HEAD + 1, (HELM >> 32) as u32),
+            ],
+        );
+        crate::items::test_spawn_item(
+            app.world_mut(),
+            HELM,
+            ObjectFields::from_pairs(&[(F_OBJECT_ENTRY, HELM_ID), (22, 1900), (43, 7), (44, 862)]),
+            false,
+        );
+        app.world_mut().run_system_once(feed_char).unwrap();
+        let link = app
+            .world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .eval::<Option<String>>(r#"return GetInventoryItemLink("player", 1)"#)
+            .unwrap();
+        assert_eq!(
+            link.as_deref(),
+            Some("|cffffffff|Hitem:7366:1900:862:7|h[]|h|r")
+        );
+    }
+
+    /// A wrapped item names no random property (`0x5d8bc0`: `ITEM_FIELD_FLAGS & 0x8` passes 0 to
+    /// `0x5d8b00`, `0x5d8bc9`-`0x5d8bcf`), so a worn slot's name, the tooltip's title, carries no
+    /// suffix of the item inside.
+    #[test]
+    fn a_wrapped_items_slot_name_hides_the_roll() {
+        use benilla_formats::{RandomProperty, RandomPropertyCatalog};
+        use benilla_protocol::field::FIELD_OBJECT_ENTRY;
+        const GIFT_ID: u32 = 5043;
+        /// `ITEM_FIELD_FLAGS`.
+        const F_ITEM_FLAGS: u16 = 21;
+        /// `ITEM_FIELD_RANDOM_PROPERTIES_ID`.
+        const F_ROLL: u16 = 44;
+        let props = crate::items::RandomProperties::new(RandomPropertyCatalog::from_rows(
+            std::collections::HashMap::from([(
+                862,
+                RandomProperty {
+                    suffix: "of the Bear".into(),
+                    enchants: [0; 5],
+                },
+            )]),
+        ));
+        let mut items = Items::default();
+        items.insert_template(
+            GIFT_ID,
+            Some(crate::items::test_template("Red Ribboned Gift")),
+        );
+        let names = crate::names::NameCache::default();
+        let mut objs = crate::ui_items::TestObjects::new();
+        for (guid, flags) in [(0xC1, 0), (0xC2, 0x8)] {
+            objs.spawn(
+                guid,
+                ObjectFields::from_pairs(&[
+                    (2, 0x3),
+                    (FIELD_OBJECT_ENTRY, GIFT_ID),
+                    (F_ROLL, 862),
+                    (F_ITEM_FLAGS, flags),
+                ]),
+            );
+        }
+        let mut name = |guid: u64| {
+            let rolls = crate::items::RollCatalogs {
+                enchants: None,
+                props: Some(&props),
+            };
+            slot_view(&objs.get(), &items, None, rolls, &names, None, false, guid)
+                .expect("a view")
+                .name
+        };
+        assert_eq!(
+            name(0xC1).as_deref(),
+            Some("Red Ribboned Gift of the Bear"),
+            "unwrapped, the roll names"
+        );
+        assert_eq!(name(0xC2).as_deref(), Some("Red Ribboned Gift"));
+    }
+
     /// The ammo view only reads the record: what asks it are the texture and quality getters'
     /// lookups with the callback `0x4c84f0` (`0x4c83ce`, `0x4c8a0a`), so a frame no getter read
     /// the slot in sends nothing.
@@ -1367,70 +1295,6 @@ mod tests {
                 .resource_mut::<Items>()
                 .take_ammo_waiters(ARROW),
             0
-        );
-    }
-
-    /// A bag's own field moving is the item-object path (`0x4c7180`), which pushes `"player"`.
-    #[test]
-    fn a_bank_bags_own_field_moving_fires_the_item_object_producer() {
-        let mut app = world_with_bank_bag(Some(BAG));
-        app.world_mut().run_system_once(feed_char).unwrap();
-        assert!(seen(&mut app).contains(&"PLAYERBANKSLOTS_CHANGED nil".to_string()));
-
-        // The same bag guid, restacked: only the item object moved.
-        restream(
-            &mut app,
-            BAG,
-            ObjectFields::from_pairs(&[(F_OBJECT_ENTRY, BAG_ENTRY), (F_ITEM_STACK_COUNT, 3)]),
-        );
-        app.world_mut().run_system_once(feed_char).unwrap();
-        let events = seen(&mut app);
-        assert!(
-            events.contains(&"PLAYERBANKSLOTS_CHANGED player".to_string()),
-            "the item path pushes the token, got {events:?}"
-        );
-    }
-
-    /// Identical bags push identical views; the reference watches the guids and fires twice.
-    #[test]
-    fn two_identical_bags_swapped_between_bank_bag_slots_still_announce() {
-        let mut app = world_with_bank_bag(Some(BAG));
-        // A second, byte-identical bag in bank bag slot 2.
-        const BAG2: u64 = 0x4000_0000_0000_0abd;
-        // Rewritten wholesale: `ObjectFields` has no setter.
-        let set_slots = |app: &mut App, a: u64, b: u64| {
-            let mut q = app
-                .world_mut()
-                .query_filtered::<&mut ObjectStore, With<SelfPlayer>>();
-            let mut store = q.single_mut(app.world_mut()).unwrap();
-            *store = ObjectStore(ObjectFields::from_pairs(&[
-                (F_BANK_BAG_1, a as u32),
-                (F_BANK_BAG_1 + 1, (a >> 32) as u32),
-                (F_BANK_BAG_1 + 2, b as u32),
-                (F_BANK_BAG_1 + 3, (b >> 32) as u32),
-            ]));
-        };
-        set_slots(&mut app, BAG, BAG2);
-        crate::items::test_spawn_item(
-            app.world_mut(),
-            BAG2,
-            ObjectFields::from_pairs(&[(F_OBJECT_ENTRY, BAG_ENTRY)]),
-            true,
-        );
-        app.world_mut().run_system_once(feed_char).unwrap();
-        let _ = seen(&mut app);
-
-        // Exchange them. Every pushed view is equal before and after.
-        set_slots(&mut app, BAG2, BAG);
-        app.world_mut().run_system_once(feed_char).unwrap();
-        let events = seen(&mut app);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| *e == "PLAYERBANKSLOTS_CHANGED nil")
-                .count(),
-            2,
-            "one argless event per slot whose guid moved, got {events:?}"
         );
     }
 
@@ -1761,3 +1625,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_char_call_tests.rs"]
+mod call_tests;

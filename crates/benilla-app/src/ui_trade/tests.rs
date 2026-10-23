@@ -90,17 +90,18 @@ fn a_partner_slot_links_with_the_wires_enchant_roll_and_suffix() {
         suffix_factor: 77,
         ..wire_item(1234)
     };
-    let props = crate::items::RandomProperties(benilla_formats::RandomPropertyCatalog::from_rows(
-        [(
-            862,
-            benilla_formats::RandomProperty {
-                suffix: "of the Monkey".into(),
-                enchants: [0; 5],
-            },
-        )]
-        .into_iter()
-        .collect(),
-    ));
+    let props =
+        crate::items::RandomProperties::new(benilla_formats::RandomPropertyCatalog::from_rows(
+            [(
+                862,
+                benilla_formats::RandomProperty {
+                    suffix: "of the Monkey".into(),
+                    enchants: [0; 5],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ));
     let rolls = crate::items::RollCatalogs {
         props: Some(&props),
         enchants: None,
@@ -145,6 +146,40 @@ fn an_own_slot_links_from_the_item_object() {
     assert_eq!(
         row.link.as_deref(),
         Some("|cffffffff|Hitem:1234:1900:862:7|h[Helm]|h|r")
+    );
+}
+
+/// Our own item with no cached record still links (`0x4c06bc` → `0x52ae00`): white
+/// (`0x52aec5`) and nameless (`0x5d8b40`), with the object's enchant, roll and seed, the record's
+/// flags reading 0 without it (`0x5da2a0`).
+#[test]
+fn an_own_slot_with_no_record_links_white_and_nameless() {
+    use bevy::ecs::system::RunSystemOnce;
+    const GUID: u64 = 0x4000_0000_0000_0123;
+    let mut world = World::new();
+    world.init_resource::<GuidIndex>();
+    world.insert_resource(Items::default());
+    crate::items::test_spawn_item(
+        &mut world,
+        GUID,
+        benilla_protocol::ObjectFields::from_pairs(&[(3, 1234), (22, 1900), (43, 7), (44, 862)]),
+        false,
+    );
+    let item = world
+        .run_system_once(|objects: Objects, items: Res<Items>| own_item(GUID, 1, &objects, &items))
+        .unwrap()
+        .expect("the item streams");
+    let row = resolve_own_slot(
+        &item,
+        world.resource::<Items>(),
+        None,
+        &NameCache::default(),
+        crate::items::RollCatalogs::NONE,
+    );
+    assert_eq!(row.link, None);
+    assert_eq!(
+        row.uncached_link.as_deref(),
+        Some("|cffffffff|Hitem:1234:1900:862:7|h[]|h|r")
     );
 }
 
@@ -401,8 +436,7 @@ fn feed_app() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
         .init_resource::<Items>()
         .init_resource::<crate::ui_action::UiErrorKeys>()
         .init_resource::<GuidIndex>()
-        .init_resource::<TradeTouchCursor>()
-        .add_message::<crate::item_watch::ItemNotice>()
+        .init_resource::<crate::item_lane::ItemLane>()
         .insert_resource(names)
         .insert_resource(NetCommands(tx));
     // The calls are kept, not applied: this app has no host, and its tests read the VM.
@@ -1293,10 +1327,18 @@ fn trade_update_comes_only_from_a_landed_record_a_getter_asked_for() {
         items.take_trade_waiters(4306)
     };
     assert_eq!(waiting, 2, "the drain registered one per call");
-    app.world_mut()
-        .resource_mut::<Messages<ItemNotice>>()
-        .write_batch(vec![ItemNotice::TradeRecord { entry: 4306 }; waiting]);
+    crate::item_lane::seat_item_lane(app.world_mut());
+    for _ in 0..waiting {
+        app.world_mut()
+            .resource_mut::<crate::item_lane::ItemLane>()
+            .push(crate::item_watch::Run {
+                notice: Some(ItemNotice::TradeRecord { entry: 4306 }),
+                signals: Vec::new(),
+                ..Default::default()
+            });
+    }
     app.update();
+    crate::item_lane::fire_item_lane(app.world_mut());
     assert_eq!(
         counts(&app).0,
         2,
@@ -1546,15 +1588,13 @@ fn the_trade_leg_cancels_with_no_trade_and_a_worldport_closes_once() {
 }
 
 /// The offered linen (backpack slot 1, our trade slot 1) as a live item object of ours, with
-/// our player, the re-signal system ahead of the feed, and the spy's list emptied.
+/// our player, the item lane's reads, and the spy's list emptied.
 fn resignal_app() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
     use benilla_protocol::field::{FIELD_ITEM_STACK_COUNT, FIELD_OBJECT_ENTRY};
     use benilla_protocol::ObjectFields;
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = offered_app();
-    app.insert_resource(NetCommands(tx))
-        .add_message::<crate::item_watch::ItemNotice>()
-        .add_systems(Update, resignal_trade_items.before(feed_trade));
+    app.insert_resource(NetCommands(tx));
     let world = app.world_mut();
     crate::items::test_spawn_item(
         world,
@@ -1563,6 +1603,7 @@ fn resignal_app() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
         false,
     );
     world.spawn(crate::net::SelfPlayer);
+    crate::item_lane::seat_item_lane(world);
     seen(&mut app);
     (app, rx)
 }
@@ -1570,11 +1611,22 @@ fn resignal_app() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
 /// The offered linen's guid in [`offered_app`].
 const LINEN: u64 = 0x4000_0000_0000_2589;
 
+/// `notice`'s watcher run on the item lane, as its packet readies it, then a frame and the lane.
 fn notify(app: &mut App, notice: crate::item_watch::ItemNotice) {
-    app.world_mut()
-        .resource_mut::<Messages<crate::item_watch::ItemNotice>>()
-        .write(notice);
+    queue(app, notice);
     app.update();
+    crate::item_lane::fire_item_lane(app.world_mut());
+}
+
+/// `notice`'s watcher run on the item lane, with no signals.
+fn queue(app: &mut App, notice: crate::item_watch::ItemNotice) {
+    app.world_mut()
+        .resource_mut::<crate::item_lane::ItemLane>()
+        .push(crate::item_watch::Run {
+            notice: Some(notice),
+            signals: Vec::new(),
+            ..Default::default()
+        });
 }
 
 /// `0x4bfb10` from the destroy: the slot holding the item clears on the wire and in the VM,
@@ -1636,12 +1688,13 @@ fn a_traded_away_item_clears_its_slot_before_trade_closed() {
         )
         .unwrap();
     // The packets of one drain: the destroy's notice, then the status, with no frame between.
-    app.world_mut()
-        .resource_mut::<Messages<crate::item_watch::ItemNotice>>()
-        .write(crate::item_watch::ItemNotice::Destroyed {
+    queue(
+        &mut app,
+        crate::item_watch::ItemNotice::Destroyed {
             guid: LINEN,
             entry: 2589,
-        });
+        },
+    );
     status(&mut app, TradeStatus::Complete);
     assert_eq!(
         seen(&mut app),
@@ -1659,6 +1712,7 @@ fn a_traded_away_item_clears_its_slot_before_trade_closed() {
         "and the handler finds the slot empty"
     );
     app.update();
+    crate::item_lane::fire_item_lane(app.world_mut());
     let sent: Vec<ClientCommand> = rx.try_iter().collect();
     assert_eq!(
         sent.iter()
@@ -1779,22 +1833,102 @@ fn a_restacked_offer_is_placed_again_with_its_live_count() {
     assert_eq!(app.world().resource::<TradeSession>().own_edits, 3);
 }
 
-/// Each item handler refreshes the action bar before it scans the trade (`0x5d8798` before
-/// `0x5d87a7`, `0x5d94e1` before `0x5d94f0`, `0x5d9afd` before `0x5d9b0c`), and the slot's
-/// signal lands before the feed's push of the column.
+/// Each item handler recounts the action bar before it scans the trade (`0x5d8798` before
+/// `0x5d87a7`, `0x5d94e1` before `0x5d94f0`, `0x5d9afd` before `0x5d9b0c`), in its run on the item
+/// lane.
 #[test]
-fn the_trade_re_signal_follows_the_bar_recount_and_precedes_the_feed() {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
-    assert!(crate::test_support::runs_before(
+fn the_trade_re_signal_follows_the_bar_recount_in_the_watchers_run() {
+    let (mut app, _rx) = resignal_app();
+    let world = app.world_mut();
+    let mut vm = world.non_send_resource_mut::<UiScript>();
+    vm.set_action(
+        4,
+        Some(benilla_ui::script::ActionSlot {
+            kind: benilla_protocol::messages::ACTION_KIND_ITEM,
+            action: 2589,
+            ..Default::default()
+        }),
+    );
+    vm.run(
+        "f = CreateFrame('Frame') f:RegisterEvent('ACTIONBAR_SLOT_CHANGED') \
+            f:SetScript('OnEvent', function() table.insert(SEEN, event) end)",
+    )
+    .unwrap();
+    notify(
         &mut app,
-        crate::ui_action::recount_item_actions,
-        resignal_trade_items
-    ));
-    assert!(crate::test_support::runs_before(
-        &mut app,
-        resignal_trade_items,
-        feed_trade
-    ));
+        crate::item_watch::ItemNotice::Destroyed {
+            guid: LINEN,
+            entry: 2589,
+        },
+    );
+    assert_eq!(
+        seen(&mut app),
+        ["ACTIONBAR_SLOT_CHANGED", "TRADE_PLAYER_ITEM_CHANGED"]
+    );
+}
+
+/// The destroy's handler (`0x5d8660`) runs whole in its order: the bar recount (`0x5d8798`), the
+/// trade scan (`0x5d87a7`), the quest log's ask for the item (`0x5d87b2`), then the slot's signal
+/// (`0x5d87c1`).
+#[test]
+fn the_destroy_run_recounts_scans_asks_then_signals() {
+    use benilla_ui::script::{QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS};
+    let (mut app, _rx) = resignal_app();
+    let world = app.world_mut();
+    let mut vm = world.non_send_resource_mut::<UiScript>();
+    vm.set_action(
+        4,
+        Some(benilla_ui::script::ActionSlot {
+            kind: benilla_protocol::messages::ACTION_KIND_ITEM,
+            action: 2589,
+            ..Default::default()
+        }),
+    );
+    let mut record = QuestRecordView {
+        title: "Cloth".into(),
+        ..Default::default()
+    };
+    record.objectives[0] = QuestObjectiveView {
+        item_id: 2589,
+        item_count: 4,
+        ..Default::default()
+    };
+    vm.seed_quest_record(77, record);
+    vm.set_quest_log_player(true);
+    let mut slots = [QuestSlotView::default(); QUEST_LOG_SLOTS];
+    slots[0].quest_id = 77;
+    vm.quest_log_changed(slots);
+    vm.run(
+        "f = CreateFrame('Frame') \
+         for _, e in ipairs({'ACTIONBAR_SLOT_CHANGED', 'QUEST_LOG_UPDATE', \
+             'UNIT_INVENTORY_CHANGED'}) do f:RegisterEvent(e) end \
+         f:SetScript('OnEvent', function() table.insert(SEEN, event) end)",
+    )
+    .unwrap();
+    seen(&mut app);
+    app.world_mut()
+        .resource_mut::<crate::item_lane::ItemLane>()
+        .push(crate::item_watch::Run {
+            notice: Some(crate::item_watch::ItemNotice::Destroyed {
+                guid: LINEN,
+                entry: 2589,
+            }),
+            signals: vec![crate::field_watch::FieldNotice::Player {
+                id: crate::field_watch::id::UNIT_INVENTORY_CHANGED,
+            }],
+            ..Default::default()
+        });
+    app.update();
+    crate::item_lane::fire_item_lane(app.world_mut());
+    assert_eq!(
+        seen(&mut app),
+        [
+            "ACTIONBAR_SLOT_CHANGED",
+            "TRADE_PLAYER_ITEM_CHANGED",
+            "QUEST_LOG_UPDATE",
+            "UNIT_INVENTORY_CHANGED"
+        ]
+    );
 }
 
 /// Slot 7's spell per side (`0x4bf2b0`): the partner's window carries the spell cast on our

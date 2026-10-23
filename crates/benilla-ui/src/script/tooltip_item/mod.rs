@@ -209,7 +209,8 @@ pub(super) fn owned_instance(model: &Model, item_id: u32) -> Option<render::Item
 }
 
 /// A worn (or inspected) slot's item as the builder's item: an object of the player's own, else
-/// the visible-item record (`0x533354`), which has no durability or creator to show.
+/// the visible-item record (`0x533354`), which has no durability to show and whose creator guid
+/// the leg copies to `+0x410` (`0x5333cd`).
 pub(super) fn worn_instance(s: &crate::script::InvSlotView, object: bool) -> render::ItemInstance {
     render::ItemInstance {
         // App-composed, with the suffix off `ITEM_FIELD_RANDOM_PROPERTIES_ID`.
@@ -452,10 +453,10 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // GameTooltip:SetInventoryItem(unit, slot [, nameOnly]) -> hasItem, hasCooldown, repairCost
     // (`0x532ee0`), three as `PaperDollFrame.lua:741` reads them; the arity is that consumer's,
     // not byte-read as `SetBagItem`'s two is (`0x534985`). Unit-keyed through `Model::inv_slot`:
-    // an inspected item (`InspectPaperDollFrame.xml:20`) has no durability or creator, so those
-    // lines do not show, as in the reference. An armed shopping tooltip renders the compare
-    // shape; the arm is consumed either way. repairCost is the item's cost (`0x5332fb`), 0 for an
-    // inspected unit's.
+    // an inspected item (`InspectPaperDollFrame.xml:20`) has no durability, so that line does not
+    // show, and its maker is the visible block's creator (`0x5333cd`). An armed shopping tooltip
+    // renders the compare shape; the arm is consumed either way. repairCost is the item's cost
+    // (`0x5332fb`), 0 for an inspected unit's.
     m.set(
         "SetInventoryItem",
         lua.create_function(
@@ -621,22 +622,16 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 // The cooldown query asks a missing record with the callback `0x6e2f70`
                 // (`0x53483a`, `0x6e2efb`).
+                // Its bag lookup, `0x4f93e0` (`0x534747`).
                 if let Some(entry) = model
-                    .containers
-                    .get(&bag)
-                    .and_then(|c| c.slots.get(&slot))
+                    .bag_slot(bag, slot)
                     .filter(|s| s.record_pending())
                     .map(|s| s.item_id)
                 {
                     model.cooldown_record_asks.push(entry);
                 }
                 let cost = model.repair_costs.bags.get(&(bag, slot)).copied();
-                match model
-                    .containers
-                    .get(&bag)
-                    .and_then(|c| c.slots.get(&slot))
-                    .filter(|s| s.item_id != 0)
-                {
+                match model.bag_slot(bag, slot).filter(|s| s.item_id != 0) {
                     // `0x534620` takes the p6=1 leg iff the cooldown query `0x6e2ed0` reports
                     // enable, start and duration all non-zero; that boolean is the inverse of the
                     // openable gate. `hasCooldown` is the builder's own return. A charged
@@ -849,11 +844,32 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     compare::install_methods(lua, m)?;
 
     // GameTooltip:SetMerchantItem(index) / SetBuybackItem(index): template sources, as the
-    // reference's `SetMerchantItem` (`0x534080`) is.
+    // reference's `SetMerchantItem` (`0x534080`) is. `SetBuybackItem` (`0x536300`) tests its slot
+    // with `lua_isnumber` before its receiver (`0x536322`, usage `0x855634`), then takes row
+    // `ftol(slot) - 1` when it is below the count, compared unsigned (`0x536401`-`0x53640f`).
     for (method, buyback) in [("SetMerchantItem", false), ("SetBuybackItem", true)] {
         m.set(
             method,
-            lua.create_function(move |lua, (this, index): (Table, usize)| {
+            lua.create_function(move |lua, (this, index): (Value, Value)| {
+                let (this, index) = if buyback {
+                    let Some(slot) = lua.coerce_number(index)? else {
+                        return Err(mlua::Error::runtime("Usage: SetBuybackItem(slot)"));
+                    };
+                    let this = crate::script::object::receiver_in(
+                        lua,
+                        &this,
+                        crate::script::tooltip::REG_TOOLTIP_METHODS,
+                    )?;
+                    let Ok(index) = usize::try_from(slot as i64) else {
+                        return Ok(());
+                    };
+                    (this, index)
+                } else {
+                    <(Table, usize) as mlua::FromLuaMulti>::from_lua_args(
+                        mlua::MultiValue::from_vec(vec![this, index]),
+                        lua,
+                    )?
+                };
                 let h = frame_handle_of(lua, &this)?;
                 let row = {
                     let model = lua.app_data_mut::<Model>().expect("model app_data");
@@ -865,7 +881,12 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     } else {
                         &merchant.items
                     };
-                    list.get(index.saturating_sub(1)).cloned()
+                    let row = if buyback {
+                        index.checked_sub(1)
+                    } else {
+                        Some(index.saturating_sub(1))
+                    };
+                    row.and_then(|i| list.get(i)).cloned()
                 };
                 let Some(row) = row else { return Ok(()) };
                 // Nothing to arm: the vendor tab's row seats `ShoppingTooltip1/2` itself

@@ -85,6 +85,7 @@ impl HeldUnits<'_> {
         let factions = self.rel.factions;
         let reaction = unit_reaction(&self.rel, &unit, self.me.as_ref());
         let mut s = snapshot(store, guid, name, reaction, self.unit_names, self.types);
+        s.is_pvp_ffa = super::pvp_free_for_all(&self.rel, &unit);
         s.player_reaction = player_reaction(&self.rel, &unit, self.me.as_ref());
         s.raid_target = self.group.raid_target_index(guid);
         s.faction_group = faction_group(store, factions);
@@ -121,7 +122,7 @@ pub(super) struct ChainMemo {
 /// held as anything but a unit gets no snapshot. A token without a hop reads its own push, not
 /// these.
 pub(super) fn feed_chain_units(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    mut vm: crate::script_calls::VmWith<crate::target::RelationWorld<'static, 'static>>,
     tables: super::SnapshotTables,
     // The object manager's lookup (`0x468460`) on its own, not through [`super::UnitTokens`],
     // whose pet-bar read would order this feed against the pet feed it does not depend on.
@@ -129,7 +130,6 @@ pub(super) fn feed_chain_units(
     stores: Query<&ObjectStore>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
-    world: crate::target::RelationWorld,
     group: Res<crate::ui_party::GroupState>,
     guild: Res<crate::ui_guild::GuildState>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
@@ -137,7 +137,7 @@ pub(super) fn feed_chain_units(
     mut removed: RemovedComponents<Guid>,
     mut memo: Local<VmMemo<ChainMemo>>,
 ) {
-    hosted_vm.run(|script| {
+    vm.turn(|script, world| {
         let Some(script) = script else {
             return;
         };
@@ -233,7 +233,7 @@ pub(super) fn feed_chain_units(
 /// nothing else. Off the roster it does not exist (`0x491900`); on it, the VM reads the row's push.
 /// The name is read without asking: the lookup asks when `UnitName` reads it, and the VM hands
 /// the miss back ([`UiScript::take_unit_name_asks`]).
-fn unheld_state(
+pub(crate) fn unheld_state(
     names: &NameCache,
     group: &crate::ui_party::GroupState,
     guid: u64,
@@ -297,7 +297,7 @@ pub(crate) struct CandidateMemo {
 /// change until the unit's next update. Without an active player object nothing is a candidate,
 /// as the reference resolves nothing then (`0x493ae0`).
 pub(crate) fn feed_name_candidates(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    mut vm: crate::script_calls::VmWith<crate::target::RelationWorld<'static, 'static>>,
     tables: super::SnapshotTables,
     // [`GlobalTransform`], as [`crate::target::PlayerLookup`] reads it: `Transform` would put
     // this feed in an undeclared order against every system that moves a unit.
@@ -305,14 +305,13 @@ pub(crate) fn feed_name_candidates(
     self_q: Query<(&Guid, &GlobalTransform, Option<&ObjectStore>), With<SelfPlayer>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
-    world: crate::target::RelationWorld,
     group: Res<crate::ui_party::GroupState>,
     guild: Res<crate::ui_guild::GuildState>,
     // The object manager's lookup, which the tooltip's owner line names an owner through.
     index: Option<Res<crate::net::GuidIndex>>,
     mut memo: Local<VmMemo<CandidateMemo>>,
 ) {
-    hosted_vm.run(|script| {
+    vm.turn(|script, world| {
         let Some(script) = script else {
             return;
         };
@@ -667,6 +666,51 @@ mod tests {
                 }),
             );
         assert_eq!(name(&app, "target").as_deref(), Some("Pushed"));
+    }
+
+    /// `UnitIsPVPFreeForAll` (`0x516540`) on a held unit: `UNIT_FIELD_FLAGS` 0x8
+    /// (`0x5165ad`-`0x5165bf`), then the player controlling it (`0x606170` at `0x5165c3`, its
+    /// charmer, else its creator, else itself, when that is a player) and that player's
+    /// `PLAYER_FLAGS` 0x80 (`0x5165cc`-`0x5165d5`). A creature charmed by a free-for-all player
+    /// answers 1 with no player flags of its own; a player without bit 0x8 answers nil though
+    /// flagged; a creature that answers to nobody is no player and answers nil.
+    #[test]
+    fn unit_is_pvp_free_for_all_reads_the_controlling_players_flag() {
+        const FLAGS: u16 = benilla_protocol::field::FIELD_UNIT_FLAGS;
+        const CHARMEDBY: u16 = 10;
+        const PLAYER_FLAGS: u16 = 190;
+        let mut app = app();
+        let set = |app: &mut App, guid: u64, pairs: &[(u16, u32)]| {
+            let e = app.world().resource::<GuidIndex>().0[&guid];
+            let mut store = app.world_mut().get_mut::<ObjectStore>(e).unwrap();
+            store.0.merge(ObjectFields::from_pairs(pairs));
+        };
+        // `MOB` (`playertarget`) is charmed by `A` (`targettarget`), free-for-all; `BOSS`
+        // (`party1target`) is player-controlled with no owner.
+        set(&mut app, A, &[(FLAGS, 0x8), (PLAYER_FLAGS, 0x80)]);
+        set(
+            &mut app,
+            MOB,
+            &[
+                (FLAGS, 0x8),
+                (CHARMEDBY, A as u32),
+                (CHARMEDBY + 1, (A >> 32) as u32),
+            ],
+        );
+        set(&mut app, BOSS, &[(FLAGS, 0x8), (PLAYER_FLAGS, 0x80)]);
+        app.update();
+        let ffa =
+            |app: &App, token: &str| holds(app, &format!("UnitIsPVPFreeForAll({token:?}) == 1"));
+        assert!(ffa(&app, "targettarget"), "a flagged player");
+        assert!(ffa(&app, "playertarget"), "a creature its charmer flags");
+        assert!(!ffa(&app, "party1target"), "a creature, its own controller");
+        set(&mut app, A, &[(FLAGS, 0)]);
+        app.update();
+        assert!(!ffa(&app, "targettarget"), "a player without bit 0x8");
+        assert!(
+            ffa(&app, "playertarget"),
+            "the charmer's own bit 0x8 is not asked"
+        );
     }
 
     /// A chain ending on a guid nobody holds answers what the client knows of it, each getter

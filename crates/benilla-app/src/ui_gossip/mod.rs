@@ -15,7 +15,7 @@ use crate::net::{Guid, NetCommands, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::ui_quest::row_is_active;
 use crate::ui_script::{SweepApp, SweepLeg, UiFeed};
-use crate::ui_session::{CoreCloses, LatchApp, LatchedWindow, NpcWindow};
+use crate::ui_session::{LatchApp, LatchedWindow, NpcWindow};
 
 /// The open gossip menu, plus the NPC-text records by id, which outlive it. The cache holds whole
 /// records: the reference draws the greeting afresh at each open, from the NPC's gender and a roll.
@@ -174,7 +174,9 @@ impl Plugin for UiGossipPlugin {
             .add_systems(
                 Update,
                 (
-                    feed_gossip.in_set(UiFeed),
+                    feed_gossip
+                        .in_set(UiFeed)
+                        .in_set(crate::ui_session::NpcWindowFeed),
                     drain_gossip.in_set(crate::ui_script::UiDrain),
                 ),
             );
@@ -280,9 +282,9 @@ fn snapshot(state: &GossipState) -> Option<GossipMenu> {
     })
 }
 
-/// Push the menu into the VM and, with the window open, fire `GOSSIP_SHOW` for each message and
-/// on a change; the close is the core's ([`close_core`]). The menu the VM holds is the memory:
-/// `SelectGossipOption`'s reset writes both sides, so it reads as no change. The slots wait
+/// Push the menu into the VM and, with the window open, fire `GOSSIP_SHOW` once for each message
+/// as its greeting is drawn; the close is the core's ([`close_core`]). The menu the VM holds is the
+/// memory: `SelectGossipOption`'s reset writes both sides, so it reads as no change. The slots wait
 /// outside the VM's turn, since the gossip verbs write them in the host.
 fn feed_gossip(
     mut vm: crate::script_calls::VmWith<Res<'static, GossipState>>,
@@ -292,28 +294,21 @@ fn feed_gossip(
     objects: crate::net::Objects,
     unit_names: crate::ui_unit::NameTables,
     states: Res<crate::world_state::WorldStates>,
-    mut last_name: crate::ui_script::WindowMemo<Option<String>>,
     mut shown_message: crate::ui_script::WindowMemo<u64>,
-    mut closes: CoreCloses,
 ) {
     vm.turn(|script, state| {
         let Some(script) = script else {
             return;
         };
-        let last_name = last_name.get(script);
         let shown_message = shown_message.get(script);
-        if closes.since_last(script, NpcWindow::Gossip) {
-            *last_name = None;
-        }
         let shown = script.gossip();
-        // `GOSSIP_SHOW` carries no argument (`SignalEvent` `0x4e22b5`) and the stock window titles
-        // with `UnitName("npc")` (`GossipFrame.lua:33`), so the name's landing alone re-fires it.
-        // Asked before the hold, so the name query goes out beside the text query; `UnitName` looks
-        // it up with a callback (`0x5171b8`), at the show a gossip packet brings.
+        // The stock window titles with `UnitName("npc")` (`GossipFrame.lua:33`), which looks the
+        // name up with a callback (`0x5171b8`) at the show a gossip packet brings; its landing
+        // fires nothing. Asked before the hold, so the name query goes out beside the text query.
         let ask = Ask::at(shown.is_none() || state.is_changed(), &commands);
-        let npc_name = state
-            .npc
-            .and_then(|g| names.resolve(&objects, g, ask).map(str::to_string));
+        if let Some(g) = state.npc {
+            let _ = names.resolve(&objects, g, ask);
+        }
         // While the text query is out, fire nothing and keep the last snapshot: the reference
         // returns at `0x4e2068` with no write and no event, so its frame keeps what it last showed.
         // Reading the hold as a close would flash an open window.
@@ -321,29 +316,35 @@ fn feed_gossip(
             return;
         }
         let mut fresh = snapshot(&state);
-        // Expand the greeting's `$N`/`$B`/`$G`/`$<n>w` macros client-side, as the reference does.
-        if let Some(greeting) = fresh.as_mut().map(|m| &mut m.greeting) {
-            let player = crate::npc_text::player_identity(&self_q, &names, unit_names.get());
-            *greeting = crate::npc_text::substitute(
-                greeting,
-                &crate::npc_text::MacroContext {
-                    subject: player.as_ref(),
-                    states: &states,
-                },
-            );
-        }
-        let name_changed = *last_name != npc_name;
         let new_message = std::mem::replace(shown_message, state.generation) != state.generation;
-        if fresh == shown && !name_changed && !new_message {
-            return;
+        // The greeting's `$N`/`$B`/`$G`/`$<n>w` macros expand once per message, at its draw: the
+        // reference writes the expanded text to `0xbbb678` there (`0x4e2274`, `0x4e229a`), which
+        // `GetGossipText` returns (`0x4e28c0`) until the next message draws.
+        if let Some(greeting) = fresh.as_mut().map(|m| &mut m.greeting) {
+            match shown.as_ref().filter(|_| !new_message) {
+                Some(drawn) => greeting.clone_from(&drawn.greeting),
+                None => {
+                    let player =
+                        crate::npc_text::player_identity(&self_q, &names, unit_names.get());
+                    *greeting = crate::npc_text::substitute(
+                        greeting,
+                        &crate::npc_text::MacroContext {
+                            subject: player.as_ref(),
+                            states: &states,
+                        },
+                    );
+                }
+            }
         }
-        script.set_gossip(fresh.clone());
-        // A message, or a change while open; a close is the core's, and a disconnect's clear
-        // tells the VM nothing.
-        if fresh.is_some() && state.npc.is_some() {
+        if fresh != shown {
+            script.set_gossip(fresh.clone());
+        }
+        // `GOSSIP_SHOW` has one producer, `0x4e2010` (`0x4e22b5`, no argument), run by a message
+        // (`0x4e27df`) and by its text's arrival (`0x4e22f2`), which the hold above waits on. A
+        // close is the core's, and a disconnect's clear tells the VM nothing.
+        if new_message && fresh.is_some() && state.npc.is_some() {
             script.fire_event("GOSSIP_SHOW", vec![]);
         }
-        *last_name = npc_name;
     })
 }
 
@@ -642,6 +643,27 @@ mod tests {
         );
     }
 
+    /// `GOSSIP_SHOW` fires only in `0x4e2010`, which a message (`0x4e27df`) or its text's arrival
+    /// (`0x4e22f2`) runs: the NPC's name landing fires nothing, and the next message fires again.
+    #[test]
+    fn the_npc_name_landing_fires_no_second_gossip_show() {
+        const SPEAKER: u64 = 0x10;
+        let (mut app, _rx) = feed_app(|s| s.run(RECORDER).unwrap());
+        let menu = |app: &mut App| {
+            let mut st = state(app);
+            st.remember_record(50, record("Well met."));
+            st.open_menu(SPEAKER, 50, option("Goodbye"), Vec::new(), 0);
+        };
+        menu(&mut app);
+        assert_eq!(tick(&mut app).0, ["GOSSIP_SHOW"]);
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(SPEAKER, "Gossiper".into(), None);
+        assert!(tick(&mut app).0.is_empty(), "a landed name fires nothing");
+        menu(&mut app);
+        assert_eq!(tick(&mut app).0, ["GOSSIP_SHOW"], "the next message does");
+    }
+
     /// The same sequence through stock `GossipFrame.xml`: the window stays up, silent, on the
     /// first menu, and the repaint plays no open kit, as `ShowUIPanel` returns early on a visible
     /// frame.
@@ -721,6 +743,41 @@ mod tests {
             ),
             "an in-place repaint: ShowUIPanel on a visible frame is a no-op, no kit"
         );
+    }
+
+    /// The greeting's macros expand once per message, as `0x4e2010` writes the expanded text to
+    /// `0xbbb678` at its draw (`0x4e2274`, `0x4e229a`) and `GetGossipText` returns that buffer
+    /// (`0x4e28c0`): a later change to the player's name leaves it until the next message.
+    #[test]
+    fn the_greeting_expands_once_per_message() {
+        const ME: u64 = 0x10;
+        let (mut app, _rx) = feed_app(|s| s.run(RECORDER).unwrap());
+        app.world_mut().spawn((
+            SelfPlayer,
+            Guid(ME),
+            ObjectStore(benilla_protocol::ObjectFields::default()),
+        ));
+        let named = |app: &mut App, name: &str| {
+            app.world_mut()
+                .resource_mut::<NameCache>()
+                .insert_player(ME, name.into(), None);
+        };
+        named(&mut app, "Ann");
+        let menu = |app: &mut App| {
+            let mut st = state(app);
+            st.remember_record(50, record("Well met, $N."));
+            st.open_menu(GUARD, 50, option("Goodbye"), Vec::new(), 0);
+        };
+        menu(&mut app);
+        assert_eq!(tick(&mut app).1, "Well met, Ann.");
+        named(&mut app, "Bea");
+        assert_eq!(
+            tick(&mut app).1,
+            "Well met, Ann.",
+            "held until the next message"
+        );
+        menu(&mut app);
+        assert_eq!(tick(&mut app).1, "Well met, Bea.");
     }
 
     #[test]

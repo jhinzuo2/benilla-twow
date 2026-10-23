@@ -64,6 +64,7 @@ mod go_anim;
 mod go_templates;
 #[cfg(feature = "dev")]
 mod hover_log;
+mod item_lane;
 mod item_watch;
 mod items;
 // iNilla: the iOS client around the game (touch, controllers, launcher, data, remote console).
@@ -193,6 +194,7 @@ mod vm_pass;
 mod vplates;
 mod weapon_trail;
 mod world_backdrop;
+mod world_console;
 mod world_state;
 mod world_state_ui;
 
