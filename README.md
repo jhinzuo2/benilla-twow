@@ -14,8 +14,8 @@ builds (`v*`) are published as one GitHub Release holding every platform:
 |---|---|---|
 | Windows x86_64 | `benilla-windows-x86_64.exe` | dev build (debug panel, perf HUD) |
 | Linux x86_64 | `benilla-linux-x86_64` | dev build; `chmod +x` after download |
-| macOS arm64 | `benilla-macos-aarch64` | dev build; `chmod +x` after download |
-| all desktop | `benilla-perf-*` | player build (`--profile ship`, no dev instruments) — the one to benchmark |
+| macOS universal (Apple silicon + Intel) | `benilla-macos-universal.zip` | dev build as `benilla.app`; see below |
+| all desktop | `benilla-perf-*` | player build (`--profile ship`, no dev instruments) — the one to benchmark; macOS: `benilla-perf-macos-universal.zip` |
 | Android arm64 | `benilla-android-aarch64.apk` | signed release APK |
 | iOS arm64 | `iNilla-<version>.ipa` | iOS 17+, ad-hoc signed — sideload with SideStore, AltStore or LiveContainer |
 
@@ -92,8 +92,10 @@ run and fixed against on real hardware, not just what compiles in CI.
 - **Linux (Ubuntu)** — builds in CI (`ubuntu-latest`) the same as upstream, and is presumed fine
   since it's the primary Bevy development target. Not independently verified by this fork beyond
   that CI build.
-- **macOS** — builds in CI (`macos-latest`, Apple silicon). No macOS-specific work has happened
-  in this fork — genuinely unverified; nobody here has run it.
+- **macOS** — one universal `benilla.app` (Apple silicon and Intel, macOS 11+), built in CI. Unzip
+  it and put it in your WoW folder, beside `Data`; its `benilla-config/` lands there too. The app
+  is ad-hoc signed, not notarized, so the first launch needs right-click → Open (or
+  `xattr -dr com.apple.quarantine benilla.app`). Not yet run by anyone here.
 
 ### Touch input (Android)
 
@@ -120,7 +122,8 @@ Where local state lives:
 - **Windows:** `C:\Users\USERNAME\Documents\benilla-twow\benilla-config`
 - **Android:** `/sdcard/Android/media/benilla-config`
 - **iOS:** Files → iNilla → `benilla-config`
-- **Linux / macOS dev build:** `benilla-config/` at the repo root
+- **macOS app:** `benilla-config/` beside `benilla.app`
+- **Linux / macOS dev build from source:** `benilla-config/` at the repo root
 
 Font support: put the five original font files in `benilla-config/fonts/` — `ARIALN.ttf`,
 `FRITZQT__.ttf`, `skurri.ttf`, `MORPHEUS.ttf`, `WarSansTT-Bliz-500.ttf`.

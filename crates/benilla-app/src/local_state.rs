@@ -90,11 +90,8 @@ fn resident_home() -> Option<PathBuf> {
     if let Some(root) = dev_project_root() {
         return Some(root.join(STATE_DIR));
     }
-    // 4 · beside the binary; a dev build never reaches here.
-    std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-        .map(|dir| dir.join(STATE_DIR))
+    // 4 · beside the binary (beside its macOS app bundle); a dev build only off its checkout.
+    benilla_formats::release_dir().map(|dir| dir.join(STATE_DIR))
 }
 
 /// The current user's Documents folder via the shell API Microsoft documents for exactly this
@@ -135,9 +132,11 @@ fn windows_documents_dir() -> Option<PathBuf> {
 }
 
 /// The project folder a dev build keeps its state in ([`benilla_formats::project_folder`]), through
-/// [`shared_root`].
+/// [`shared_root`]. TWoW: only while that folder exists, so a dev build downloaded from CI, whose
+/// baked-in checkout is the runner's, keeps its state beside itself (step 4) instead.
 fn dev_project_root() -> Option<PathBuf> {
-    Some(shared_root(benilla_formats::project_folder()?))
+    let here = benilla_formats::project_folder().filter(|p| p.is_dir())?;
+    Some(shared_root(here))
 }
 
 /// `here`, or for a linked worktree its primary checkout, whichever worktree built the binary, so

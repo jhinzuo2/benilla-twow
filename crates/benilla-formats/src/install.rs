@@ -4,7 +4,7 @@
 //! 1. `$WOW_DATA`. Set and empty (`WOW_DATA=`) means no install and ends the search, so the
 //!    no-install path runs on a machine that has one.
 //! 2. `<project folder>/WoW/Data`, `dev` builds only ([`project_folder`]).
-//! 3. `<exe dir>/Data`, then `<exe dir>/WoW/Data`, the release layouts.
+//! 3. `<exe dir>/Data`, then `<exe dir>/WoW/Data`, the release layouts ([`release_dir`]).
 //!
 //! `dev` is a default feature here, so every dependent declares `default-features = false` and
 //! re-exports it; otherwise feature unification puts the source-tree path in a player build.
@@ -62,10 +62,31 @@ pub fn candidates() -> Vec<PathBuf> {
     candidates_from(
         std::env::var_os("WOW_DATA").map(PathBuf::from),
         project_folder(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(Path::to_path_buf)),
+        release_dir(),
     )
+}
+
+/// The folder a release build lives in: the binary's own, or for one inside a macOS app bundle
+/// (`benilla.app/Contents/MacOS`) the folder holding the bundle, so `benilla.app` dropped beside
+/// `Data` finds it and never writes into its own signed contents. TWoW: the macOS release is an
+/// app. `None` when `current_exe` fails.
+pub fn release_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(outside_app_bundle(exe.parent()?))
+}
+
+/// [`release_dir`] for the binary's folder `dir`.
+fn outside_app_bundle(dir: &Path) -> PathBuf {
+    if dir.ends_with("Contents/MacOS") {
+        let bundle = dir.parent().and_then(Path::parent);
+        if let Some(beside) = bundle
+            .filter(|b| b.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
+            .and_then(Path::parent)
+        {
+            return beside.to_path_buf();
+        }
+    }
+    dir.to_path_buf()
 }
 
 /// [`candidates`] with the environment passed in: a test that set `$WOW_DATA` would change the
@@ -203,6 +224,17 @@ macro_rules! addon_corpus_or_skip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary inside a macOS `.app` lives beside the bundle; any other folder is itself.
+    #[test]
+    fn an_app_bundle_lives_beside_the_bundle() {
+        let inside = Path::new("/Applications/Games/benilla.app/Contents/MacOS");
+        assert_eq!(outside_app_bundle(inside), Path::new("/Applications/Games"));
+        let plain = Path::new("/Users/me/benilla");
+        assert_eq!(outside_app_bundle(plain), plain);
+        let not_a_bundle = Path::new("/Users/me/benilla/Contents/MacOS");
+        assert_eq!(outside_app_bundle(not_a_bundle), not_a_bundle);
+    }
 
     /// No test here touches the process environment (see [`candidates_from`]), or records a
     /// launcher's folder, which is process-wide (`tests/project_folder.rs` has a process of its own).

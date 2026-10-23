@@ -19,8 +19,8 @@ pub use tga::{tga_texture_size, tga_to_rgba, TGA_GATE_PREFIX};
 /// Where the WoW install is; [`Chain`] opens it.
 mod install;
 pub use install::{
-    addon_corpus, addon_corpus_candidates, candidates, project_folder, set_project_folder, skipped,
-    wow_data,
+    addon_corpus, addon_corpus_candidates, candidates, project_folder, release_dir,
+    set_project_folder, skipped, wow_data,
 };
 /// The install's loose files, asked before the archives by the opens that set the loose flag.
 mod loose;

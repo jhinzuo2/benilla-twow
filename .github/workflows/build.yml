@@ -1,6 +1,7 @@
 # Every platform's build, in parallel, and one GitHub Release that bundles them.
 #
-#   desktop      (Linux / Windows / macOS)  dev build and perf build per OS      -> benilla-*
+#   desktop      (Linux / Windows)          dev build and perf build per OS      -> benilla-*
+#   macos        (macOS)                    dev and perf, universal benilla.app  -> benilla-*macos-universal.zip
 #   android      (Linux)                    signed release APK                   -> benilla-android-aarch64.apk
 #   ios-staticlib (Linux, 1× minutes)       the whole Rust build -> libinilla_ios.a
 #   ios-package  (macOS, 10× minutes)       link + bundle + sign + zip           -> iNilla-<version>.ipa
@@ -64,17 +65,15 @@ jobs:
         include:
           - { os: ubuntu-latest, flavor: dev, cargo_args: "--release", out_dir: release, bin: benilla, asset: benilla-linux-x86_64 }
           - { os: windows-latest, flavor: dev, cargo_args: "--release", out_dir: release, bin: benilla.exe, asset: benilla-windows-x86_64.exe }
-          - { os: macos-latest, flavor: dev, cargo_args: "--release", out_dir: release, bin: benilla, asset: benilla-macos-aarch64 }
           - { os: ubuntu-latest, flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, bin: benilla, asset: benilla-perf-linux-x86_64 }
           - { os: windows-latest, flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, bin: benilla.exe, asset: benilla-perf-windows-x86_64.exe }
-          - { os: macos-latest, flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, bin: benilla, asset: benilla-perf-macos-aarch64 }
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
       # bevy_audio pulls alsa on Linux and gilrs (gamepad support) pulls udev; both link against
       # system libs, so the dev headers have to exist before `cargo build` touches those crates.
-      # x11/xkbcommon/wayland are dlopen'd at runtime by winit. Windows and macOS need nothing extra.
+      # x11/xkbcommon/wayland are dlopen'd at runtime by winit. Windows needs nothing extra.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -103,6 +102,90 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: target/${{ matrix.out_dir }}/${{ matrix.bin }}
+          if-no-files-found: error
+
+  # One universal `benilla.app` per flavor: both architectures built on the Apple-silicon runner
+  # (the Intel half cross-compiles against the same SDK), `lipo`-merged, bundled, ad-hoc signed and
+  # zipped with `ditto`, which keeps the executable bit and the signature an artifact upload would
+  # drop. Put the app beside the WoW `Data` folder; its settings land beside it too
+  # (`benilla_formats::release_dir`).
+  macos:
+    name: ${{ matrix.flavor }} build (macos universal)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { flavor: dev, cargo_args: "--release", out_dir: release, asset: benilla-macos-universal.zip }
+          - { flavor: perf, cargo_args: "--profile ship --no-default-features", out_dir: ship, asset: benilla-perf-macos-universal.zip }
+    env:
+      # Both halves target the same floor, the first macOS that runs on Apple silicon.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `rust-toolchain.toml` pins the channel; both targets go into the pinned toolchain.
+      - name: Add both macOS targets to the pinned toolchain
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.flavor }}
+          cache-on-failure: true
+
+      - name: cargo build ${{ matrix.cargo_args }} (arm64)
+        run: cargo build ${{ matrix.cargo_args }} --locked -p benilla --target aarch64-apple-darwin
+
+      - name: cargo build ${{ matrix.cargo_args }} (x86_64)
+        run: cargo build ${{ matrix.cargo_args }} --locked -p benilla --target x86_64-apple-darwin
+
+      - name: Bundle benilla.app
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "benilla") | .version')
+          fi
+          APP=benilla.app
+          ARM=target/aarch64-apple-darwin/${{ matrix.out_dir }}/benilla
+          X86=target/x86_64-apple-darwin/${{ matrix.out_dir }}/benilla
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create -output "$APP/Contents/MacOS/benilla" "$ARM" "$X86"
+          lipo -info "$APP/Contents/MacOS/benilla"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>benilla</string>
+            <key>CFBundleDisplayName</key><string>benilla-TWOW</string>
+            <key>CFBundleIdentifier</key><string>io.github.jhinzuo2.benilla-twow</string>
+            <key>CFBundleExecutable</key><string>benilla</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>${MACOSX_DEPLOYMENT_TARGET}</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSApplicationCategoryType</key><string>public.app-category.role-playing-games</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --force --sign - "$APP"
+          codesign --verify --verbose "$APP"
+          ditto -c -k --keepParent "$APP" "${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
           if-no-files-found: error
 
   # Not a desktop matrix row: Android needs the NDK, a second Rust target and `cargo-apk` instead of
@@ -331,7 +414,7 @@ jobs:
   # One GitHub Release with every platform's artifact. Runs on a `v*` tag, or on a manual run with
   # `release` set; any failed build job skips it. Pre-release until a build is marked tested by hand.
   release:
-    needs: [desktop, android, ios-package]
+    needs: [desktop, macos, android, ios-package]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release != '')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -345,8 +428,8 @@ jobs:
         with:
           path: dist
 
-      # Each asset is named after its artifact, so the two `benilla` binaries (Linux, macOS) do not
-      # collide. The staticlib and the notes are intermediates, not assets.
+      # Each asset is named after its artifact, so the Linux binaries and the macOS zips keep
+      # distinct names. The staticlib and the notes are intermediates, not assets.
       - name: Bundle release assets
         run: |
           shopt -s nullglob
