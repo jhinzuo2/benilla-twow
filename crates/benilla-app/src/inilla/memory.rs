@@ -26,6 +26,9 @@ pub(crate) fn census(
 
     let mut compressed = 0u64;
     let mut plain = 0u64;
+    // Pixels still held main-side after upload: a texture whose usage keeps `MAIN_WORLD` is in
+    // memory twice.
+    let mut kept = 0u64;
     let mut sized: Vec<(u64, AssetId<Image>)> = Vec::with_capacity(images.len());
     for (id, image) in images.iter() {
         let bytes = benilla_assets::image_gpu_bytes(image) as u64;
@@ -34,6 +37,7 @@ pub(crate) fn census(
         } else {
             plain += bytes;
         }
+        kept += image.data.as_ref().map_or(0, |d| d.len() as u64);
         sized.push((bytes, id));
     }
     sized.sort_unstable_by_key(|&(bytes, _)| std::cmp::Reverse(bytes));
@@ -51,7 +55,8 @@ pub(crate) fn census(
         .map_or_else(|| "?".to_string(), |b| format!("{:.0}", mb(b)));
     println!(
         "inilla: mem headroom {headroom} MB | textures {}: {:.0} MB block-compressed, {:.0} MB \
-         uncompressed (DXT upload {}) | world texture arrays {:.0} MB | largest: {}",
+         uncompressed (DXT upload {}), {:.0} MB of pixels also kept on the CPU | world texture \
+         arrays {:.0} MB | largest: {}",
         sized.len(),
         mb(compressed),
         mb(plain),
@@ -60,6 +65,7 @@ pub(crate) fn census(
         } else {
             "off"
         },
+        mb(kept),
         mb(benilla_world::static_gx::pool_vram_bytes()),
         largest.join(", ")
     );
