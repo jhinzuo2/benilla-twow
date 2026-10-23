@@ -278,13 +278,18 @@ jobs:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           CARGO_APK_RELEASE_KEYSTORE: ${{ env.ANDROID_RELEASE_KEYSTORE_PATH }}
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
-        run: cargo apk build --release -p benilla-android
+        # A cached target dir can hold an APK from an earlier build; start the folder empty so
+        # exactly one APK is uploaded.
+        run: |
+          rm -rf target/release/apk
+          cargo apk build --release -p benilla-android
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: benilla-android-aarch64.apk
-          path: target/release/apk/*.apk
+          # `apk_name = "benilla"` in crates/benilla-android/Cargo.toml.
+          path: target/release/apk/benilla.apk
           if-no-files-found: error
 
   # The repository is private: GitHub bills macOS minutes at 10×. This reports the month's use
