@@ -144,6 +144,62 @@ pub fn gpu_allocated() -> Option<u64> {
     }
 }
 
+/// The GPU's own answer to `MTLDevice.supportsBCTextureCompression` (iOS 16.4+), whatever wgpu
+/// makes of it.
+pub fn bc_texture_compression() -> Option<bool> {
+    #[cfg(target_os = "ios")]
+    {
+        use objc2::msg_send;
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyObject, Sel};
+        #[link(name = "Metal", kind = "framework")]
+        extern "C" {
+            fn MTLCreateSystemDefaultDevice() -> *mut AnyObject;
+        }
+        // SAFETY: as in `gpu_allocated`; the selector is asked for before it is sent, so an iOS
+        // older than 16.4 answers `None`.
+        let device: Retained<AnyObject> =
+            unsafe { Retained::from_raw(MTLCreateSystemDefaultDevice()) }?;
+        let sel = Sel::register(c"supportsBCTextureCompression");
+        let known: bool = unsafe { msg_send![&*device, respondsToSelector: sel] };
+        if !known {
+            return None;
+        }
+        Some(unsafe { msg_send![&*device, supportsBCTextureCompression] })
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        None
+    }
+}
+
+/// Bytes the process's malloc zones hand out right now (`mstats().bytes_used`): Rust's heap and
+/// every C library's, without Metal's buffers or mapped files.
+pub fn malloc_in_use() -> Option<u64> {
+    #[cfg(target_os = "ios")]
+    {
+        // `struct mstats` from <malloc/malloc.h>; every field is there for the layout.
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct MStats {
+            bytes_total: usize,
+            chunks_used: usize,
+            bytes_used: usize,
+            chunks_free: usize,
+            bytes_free: usize,
+        }
+        extern "C" {
+            fn mstats() -> MStats;
+        }
+        // SAFETY: a libmalloc query with no arguments, returning the struct by value.
+        Some(unsafe { mstats() }.bytes_used as u64)
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        None
+    }
+}
+
 /// Keep `path` (and, for a folder, everything in it) out of iCloud/iTunes backups.
 pub fn exclude_from_backup(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "ios")]

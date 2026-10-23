@@ -129,7 +129,7 @@ impl Plugin for InillaPlugin {
         )
         .add_systems(OnEnter(ClientState::InWorld), synth::release_all)
         .add_systems(OnExit(ClientState::InWorld), synth::release_all)
-        .add_systems(Update, memory::census)
+        .add_systems(Update, (memory::census, memory::census_cpu, memory::report_gpu_caps))
         .add_systems(Last, save_when_changed);
     }
 }

@@ -1,4 +1,4 @@
-//! **The memory census**: every 30 s on a touch device, two `inilla: mem …` lines on stdout, so the
+//! **The memory census**: every 30 s on a touch device, three `inilla: mem` lines on stdout, so the
 //! live log, the log file and the remote console carry them. They split what the process holds
 //! into what benilla can count, beside the headroom iOS reports: every Metal allocation (textures,
 //! buffers, render targets), the textures in `Assets<Image>` (block-compressed or not, pixels still
@@ -114,6 +114,116 @@ pub(crate) fn census(
         mb(sfx_bytes),
         largest.join(", ")
     );
+}
+
+/// Once, at the first look: where BC is lost, if it is. The GPU's own answer, the adapter wgpu
+/// built from it, and the device Bevy opened.
+pub(crate) fn report_gpu_caps(
+    adapter: Option<Res<bevy::render::renderer::RenderAdapter>>,
+    device: Option<Res<bevy::render::renderer::RenderDevice>>,
+    mut done: Local<bool>,
+) {
+    if *done || !super::touch_device() {
+        return;
+    }
+    *done = true;
+    let bc = bevy::render::settings::WgpuFeatures::TEXTURE_COMPRESSION_BC;
+    println!(
+        "inilla: gpu BC: Metal says {:?}, adapter {:?}, device {:?}",
+        inilla_platform::device::bc_texture_compression(),
+        adapter.map(|a| a.features().contains(bc)),
+        device.map(|d| d.features().contains(bc)),
+    );
+}
+
+/// The third line: what the heap holds that the first two cannot see. The malloc total against
+/// the footprint, then the CPU copies the world keeps: model geometry and collision data, the
+/// physics colliders' triangles, the animation assets and the entity count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn census_cpu(
+    m2s: Option<Res<Assets<M2Model>>>,
+    wmos: Option<Res<Assets<WmoModel>>>,
+    clips: Option<Res<Assets<AnimationClip>>>,
+    graphs: Option<Res<Assets<AnimationGraph>>>,
+    colliders: Query<&avian3d::prelude::Collider>,
+    entities: Query<Entity>,
+    time: Res<Time<Real>>,
+    mut next: Local<f64>,
+) {
+    let now = time.elapsed_secs_f64();
+    if now < *next || !super::touch_device() {
+        return;
+    }
+    *next = now + EVERY;
+
+    // A submesh's geometry is shared (`Arc`) across the models that load it: counted once.
+    let mut seen = std::collections::HashSet::<*const ()>::new();
+    let mut geometry = 0u64;
+    let mut collision = 0u64;
+    let mut add_submeshes = |submeshes: &[benilla_assets::ModelSubmesh], geometry: &mut u64| {
+        for sub in submeshes {
+            if !seen.insert(std::sync::Arc::as_ptr(&sub.geometry).cast()) {
+                continue;
+            }
+            let g = &sub.geometry;
+            *geometry += (g.positions.len() * 12
+                + g.normals.len() * 12
+                + g.uvs.len() * 8
+                + g.indices.len() * 4
+                + g.joints.len() * 8
+                + g.weights.len() * 16
+                + g.vertex_colors.len() * 16) as u64;
+        }
+    };
+    if let Some(m2s) = &m2s {
+        for (_, m2) in m2s.iter() {
+            add_submeshes(&m2.submeshes, &mut geometry);
+            collision += m2.collision.as_ref().map_or(0, collision_mesh_bytes);
+        }
+    }
+    if let Some(wmos) = &wmos {
+        for (_, wmo) in wmos.iter() {
+            add_submeshes(&wmo.submeshes, &mut geometry);
+            collision += wmo.collision.as_ref().map_or(0, collision_mesh_bytes);
+            // Triangle soup: three points of three `f32`s each.
+            let soup: usize = wmo
+                .group_collision_tris
+                .iter()
+                .chain(&wmo.group_camera_only_tris)
+                .map(Vec::len)
+                .sum();
+            collision += (soup * 36 + wmo.portal_vertices.len() * 12) as u64;
+        }
+    }
+
+    // A trimesh holds its vertices and triangles, plus a BVH this does not size.
+    let mut trimeshes = 0usize;
+    let mut tri_bytes = 0u64;
+    for collider in &colliders {
+        if let Some(t) = collider.shape_scaled().as_trimesh() {
+            trimeshes += 1;
+            tri_bytes += (t.vertices().len() * 12 + t.indices().len() * 12) as u64;
+        }
+    }
+
+    let heap = inilla_platform::device::malloc_in_use()
+        .map_or_else(|| "?".to_string(), |b| format!("{:.0}", mb(b)));
+    println!(
+        "inilla: mem cpu malloc {heap} MB | model geometry {:.0} MB, model collision {:.0} MB | \
+         colliders {} ({trimeshes} trimesh, {:.0} MB + BVH) | animation clips {}, graphs {} | \
+         entities {}",
+        mb(geometry),
+        mb(collision),
+        colliders.iter().count(),
+        mb(tri_bytes),
+        clips.as_ref().map_or(0, |a| a.len()),
+        graphs.as_ref().map_or(0, |a| a.len()),
+        entities.iter().count(),
+    );
+}
+
+fn collision_mesh_bytes(m: &benilla_formats::CollisionMesh) -> u64 {
+    (m.positions.len() * 12 + m.indices.len() * 4) as u64
 }
 
 fn mb(bytes: u64) -> f64 {
