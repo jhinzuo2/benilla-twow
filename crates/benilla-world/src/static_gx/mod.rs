@@ -104,6 +104,11 @@ pub(crate) fn gx_perf_enabled() -> bool {
 /// Lifetime bytes of texture-array VRAM the pool has allocated, never decremented.
 pub(crate) static GX_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// iNilla: [`GX_VRAM`], for the memory census.
+pub fn pool_vram_bytes() -> u64 {
+    GX_VRAM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Nanosecond accumulators: flush, cull, publish, prepare, node.
 pub(crate) static GX_PERF: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0),

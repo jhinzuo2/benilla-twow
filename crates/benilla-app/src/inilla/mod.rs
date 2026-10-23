@@ -15,6 +15,7 @@
 //!   keyboard, the safe area, the frame cap.
 //! - [`console`] — the remote console: the session log, Lua and commands from a browser on the
 //!   same Wi-Fi, for fast debugging without a Mac.
+//! - [`memory`] — the memory census: what the textures hold, in the log every 30 s.
 //!
 //! Input from the HUD, the controller and the console reaches the game through two seams only:
 //! [`synth`] (binding commands by name, into `BindingsState`) and [`mouse`] (an ordinary mouse,
@@ -26,6 +27,7 @@ mod data;
 mod hints;
 mod hud;
 mod icons;
+mod memory;
 mod mouse;
 mod pad;
 mod platform;
@@ -127,6 +129,7 @@ impl Plugin for InillaPlugin {
         )
         .add_systems(OnEnter(ClientState::InWorld), synth::release_all)
         .add_systems(OnExit(ClientState::InWorld), synth::release_all)
+        .add_systems(Update, memory::census)
         .add_systems(Last, save_when_changed);
     }
 }

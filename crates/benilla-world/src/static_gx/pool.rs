@@ -134,7 +134,8 @@ impl GxTexturePool {
             .map_or(POOL_BASE_CAPACITY, |c| c.saturating_mul(4))
             .min(max_layers);
         // `GX_VRAM`: the array at capacity, BC at block rate else 4 B/texel, ×4/3 with mips.
-        if super::gx_perf_enabled() {
+        // iNilla: counted always, for the memory census ([`super::pool_vram_bytes`]).
+        {
             let per_layer = match key.1 {
                 TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc1RgbaUnormSrgb => {
                     u64::from(key.0.width) * u64::from(key.0.height) / 2
