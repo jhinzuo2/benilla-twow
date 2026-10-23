@@ -119,6 +119,31 @@ pub fn available_memory() -> Option<u64> {
     }
 }
 
+/// Bytes of every Metal resource this process holds (`MTLDevice.currentAllocatedSize`): textures,
+/// buffers and render targets. On an iPhone they count against the same budget as the heap.
+pub fn gpu_allocated() -> Option<u64> {
+    #[cfg(target_os = "ios")]
+    {
+        use objc2::msg_send;
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        #[link(name = "Metal", kind = "framework")]
+        extern "C" {
+            fn MTLCreateSystemDefaultDevice() -> *mut AnyObject;
+        }
+        // SAFETY: returns the system GPU (+1 retained), released when `device` drops; every
+        // iOS device has one. `currentAllocatedSize` is an `NSUInteger` property since iOS 11.
+        let device: Retained<AnyObject> =
+            unsafe { Retained::from_raw(MTLCreateSystemDefaultDevice()) }?;
+        let bytes: usize = unsafe { msg_send![&*device, currentAllocatedSize] };
+        Some(bytes as u64)
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        None
+    }
+}
+
 /// Keep `path` (and, for a folder, everything in it) out of iCloud/iTunes backups.
 pub fn exclude_from_backup(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "ios")]

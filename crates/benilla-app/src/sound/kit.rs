@@ -54,6 +54,18 @@ impl Rng {
     }
 }
 
+impl SoundKits {
+    /// iNilla: the decoded SFX cache's entries and PCM bytes, for the memory census.
+    pub(crate) fn cache_size(&self) -> (usize, u64) {
+        let bytes = self
+            .cache
+            .values()
+            .map(|d| (d.frames.len() * std::mem::size_of::<kira::Frame>()) as u64)
+            .sum();
+        (self.cache.len(), bytes)
+    }
+}
+
 /// The kit catalog and play-side caches; present only when the client data loaded.
 #[derive(Resource)]
 pub(crate) struct SoundKits {
