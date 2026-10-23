@@ -8,27 +8,29 @@ use benilla_ui::script::{
 
 use super::test_ui::{bag_open, load_ui as load_xml, BAG_UI};
 
-/// The stock menu over what it needs (`GameMenuButtonTemplate` is `UIPanelTemplates.xml:403`),
-/// with `extra` in its way and the layer's reshaping, each file once, in the production order.
+/// The stock menu, what it needs (`GameMenuButtonTemplate` is `UIPanelTemplates.xml:403`) and
+/// the layer's reshaping.
+const MENU: &[&str] = &[
+    "Interface\\FrameXML\\GlobalStrings.lua",
+    "Interface\\FrameXML\\Fonts.xml",
+    "Interface\\FrameXML\\BasicControls.xml",
+    "Interface\\FrameXML\\LocaleProperties.lua",
+    // Before the menu: its `parent="UIParent"` resolves at load.
+    r"Interface\FrameXML\UIParent.xml",
+    r"Interface\FrameXML\MoneyFrame.lua",
+    r"Interface\FrameXML\MoneyFrame.xml",
+    r"Interface\FrameXML\UIPanelTemplates.lua",
+    r"Interface\FrameXML\UIPanelTemplates.xml",
+    r"Interface\FrameXML\GameMenuFrame.xml",
+    "Interface\\FrameXML\\StaticPopup.xml",
+    "GameMenuAdapters.xml",
+];
+
+/// [`MENU`] with `extra` in its way, each file once, in the production order.
 fn harness_with(extra: &[&str]) -> UiScript {
     let mut s = UiScript::new().unwrap();
     s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
-    const MENU: &[&str] = &[
-        "Interface\\FrameXML\\GlobalStrings.lua",
-        "Interface\\FrameXML\\Fonts.xml",
-        "Interface\\FrameXML\\BasicControls.xml",
-        "Interface\\FrameXML\\LocaleProperties.lua",
-        // Before the menu: its `parent="UIParent"` resolves at load.
-        r"Interface\FrameXML\UIParent.xml",
-        r"Interface\FrameXML\MoneyFrame.lua",
-        r"Interface\FrameXML\MoneyFrame.xml",
-        r"Interface\FrameXML\UIPanelTemplates.lua",
-        r"Interface\FrameXML\UIPanelTemplates.xml",
-        r"Interface\FrameXML\GameMenuFrame.xml",
-        "Interface\\FrameXML\\StaticPopup.xml",
-        "GameMenuAdapters.xml",
-    ];
     for file in super::test_ui::production_order(&[MENU, extra]) {
         load_xml(&s, file);
     }
@@ -98,6 +100,53 @@ fn the_menu_has_the_era_frame_and_button_ladder() {
         );
     }
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// TWoW's `GameMenuFrame.xml` opens with a Donation Rewards rung (`GameMenuButtonShop`), has no
+/// Sound Options rung and ships Options hidden: the layer puts the shop on top, the era ladder one
+/// rung lower, and the frame one rung taller, with no script error.
+#[test]
+fn a_turtle_menu_puts_its_shop_rung_on_top_of_the_ladder() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
+    s.set_screen_size(1024.0, 768.0);
+    for file in super::test_ui::production_order(&[MENU]) {
+        if file == "GameMenuAdapters.xml" {
+            s.run(
+                r#"
+                CreateFrame("Button", "GameMenuButtonShop", GameMenuFrame, "GameMenuButtonTemplate")
+                GameMenuButtonShop:SetPoint("CENTER", GameMenuFrame, "TOP", 0, -42)
+                GameMenuButtonSoundOptions:Hide()
+                GameMenuButtonSoundOptions = nil
+                GameMenuButtonOptions:Hide()
+                "#,
+            )
+            .unwrap();
+        }
+        load_xml(&s, file);
+    }
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    s.run("ShowUIPanel(GameMenuFrame)").unwrap();
+    s.resolve();
+
+    let h = s.eval::<f64>("return GameMenuFrame:GetHeight()").unwrap();
+    benilla_ui::assert_near!(h, 288.0, "the era frame, one rung taller");
+    let top = s.eval::<f64>("return GameMenuFrame:GetTop()").unwrap();
+    let rungs = std::iter::once("GameMenuButtonShop").chain(LADDER);
+    const TOPS: [f64; 8] = [32.0, 53.0, 94.0, 115.0, 136.0, 177.0, 198.0, 239.0];
+    for (name, down) in rungs.zip(TOPS) {
+        let (btop, shown) = s
+            .eval::<(f64, bool)>(&format!("return {name}:GetTop(), {name}:IsVisible() == 1"))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(shown, "{name} is shown");
+        assert!(
+            (btop - (top - down)).abs() < 0.001,
+            "{name} top: expected {} down {down}, got {}",
+            top - down,
+            btop
+        );
+    }
 }
 
 /// Support closes the menu and toggles the stock help window, as the "?" micro button does

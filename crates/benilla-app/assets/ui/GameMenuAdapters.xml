@@ -44,20 +44,34 @@
         GameMenuButtonOptions:SetText("Options")
         GameMenuButtonOptions:ClearAllPoints()
         GameMenuButtonOptions:SetPoint("TOP", GameMenuFrame, "TOP", 0, -32)
+        -- TWoW: its GameMenuFrame.xml opens with a Donation Rewards rung (GameMenuButtonShop) and
+        -- ships Options hidden. The shop takes the top rung, Options hangs under it, and the frame
+        -- grows by the one rung.
+        GameMenuButtonOptions:Show()
+        if GameMenuButtonShop then
+            GameMenuButtonShop:ClearAllPoints()
+            GameMenuButtonShop:SetPoint("TOP", GameMenuFrame, "TOP", 0, -32)
+            GameMenuButtonOptions:ClearAllPoints()
+            GameMenuButtonOptions:SetPoint("TOP", GameMenuButtonShop, "BOTTOM", 0, 0)
+            GameMenuFrame:SetHeight(267 + GameMenuButtonShop:GetHeight())
+        end
         GameMenuButtonOptions:SetScript("OnClick", function()
             PlaySound("igMainMenuOption")
             HideUIPanel(GameMenuFrame)
             ShowUIPanel(BenillaOptionsFrame)
         end)
 
-        for _, fold in ipairs({
-            { GameMenuButtonSoundOptions, GameMenuButtonOptions },
-            { GameMenuButtonUIOptions, GameMenuButtonSoundOptions },
-        }) do
-            local button, above = fold[1], fold[2]
-            button:Hide()
-            button:ClearAllPoints()
-            button:SetPoint("TOP", above, "BOTTOM", 0, button:GetHeight())
+        -- By name, each over the last one present: TWoW's menu has no Sound Options rung, and a
+        -- missing one must not end this script.
+        local above = GameMenuButtonOptions
+        for _, name in ipairs({ "GameMenuButtonSoundOptions", "GameMenuButtonUIOptions" }) do
+            local button = getglobal(name)
+            if button then
+                button:Hide()
+                button:ClearAllPoints()
+                button:SetPoint("TOP", above, "BOTTOM", 0, button:GetHeight())
+                above = button
+            end
         end
         -- Key Bindings keeps its stock anchor, 1 under UI Options: the era rungs hang from its
         -- top, so an addon that inserts a button above it and re-anchors it under that button
