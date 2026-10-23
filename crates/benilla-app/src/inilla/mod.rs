@@ -65,9 +65,11 @@ pub(crate) struct Inilla {
 #[derive(Resource, Default)]
 pub(crate) struct EguiWanted(pub(crate) bool);
 
-/// Is this a touch device — iOS, or a desktop run with `$INILLA_TOUCH=1` rehearsing one.
+/// Is this a touch device — iOS, Android (TWoW: the same HUD and screens as iOS, in place of the
+/// fork's own `touch` layer), or a desktop run with `$INILLA_TOUCH=1` rehearsing one.
 pub(crate) fn touch_device() -> bool {
-    cfg!(target_os = "ios") || std::env::var("INILLA_TOUCH").as_deref() == Ok("1")
+    cfg!(any(target_os = "ios", target_os = "android"))
+        || std::env::var("INILLA_TOUCH").as_deref() == Ok("1")
 }
 
 pub(crate) struct InillaPlugin;

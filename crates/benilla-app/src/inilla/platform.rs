@@ -287,6 +287,8 @@ fn keyboard_policy(
     for mut w in &mut windows {
         w.ime_enabled = want;
     }
+    // Android's keyboard is raised through the activity, not the window (a no-op elsewhere).
+    crate::android_keyboard::soft_keyboard(want);
 }
 
 /// iNilla settings → benilla CVars, when they move.

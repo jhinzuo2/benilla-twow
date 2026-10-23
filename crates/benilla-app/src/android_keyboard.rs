@@ -50,12 +50,23 @@ fn drive_soft_keyboard(
     client_state: Res<State<ClientState>>,
     mut was_typing: ResMut<WasTyping>,
 ) {
+    // iNilla's `keyboard_policy` owns the keyboard on a touch device (its `auto_keyboard` setting,
+    // its HUD's keyboard button) and raises it through [`soft_keyboard`]; two drivers would fight.
+    if crate::inilla::touch_device() {
+        return;
+    }
     let typing = capture.typing || *client_state.get() == ClientState::Login;
     if typing == was_typing.0 {
         return;
     }
     was_typing.0 = typing;
     keyboard_edge(typing);
+}
+
+/// Show or hide the Android soft keyboard; a no-op elsewhere. For iNilla's keyboard policy, which
+/// sets `Window::ime_enabled` too — enough on iOS, not on Android, whose winit leaves it unwired.
+pub(crate) fn soft_keyboard(show: bool) {
+    keyboard_edge(show);
 }
 
 /// Show or hide the real IME. `show_implicit`/`hide_implicit_only` both `false`: this is an

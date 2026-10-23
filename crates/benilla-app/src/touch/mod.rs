@@ -187,8 +187,9 @@ pub(crate) struct JoystickCfg {
     /// camera. Strafing is what every touch port of this control scheme settles on. Set
     /// `WOW_TOUCH_STRAFE=0` for the literal A/D-turn behaviour.
     pub strafe_mode: bool,
-    /// Master switch. Defaults on for Android, off elsewhere, and force-on with `WOW_TOUCH=1`
-    /// (which is how you test the whole layer on a desktop box with a touchscreen).
+    /// Master switch. Off wherever iNilla's touch HUD runs (`inilla::touch_device`: iOS, Android,
+    /// `INILLA_TOUCH=1`), which then owns every finger; elsewhere off unless `WOW_TOUCH=1` (how
+    /// you test this layer on a desktop box with a touchscreen).
     pub enabled: bool,
 }
 
@@ -220,7 +221,8 @@ impl Default for JoystickCfg {
             tap_max_secs: env_f("WOW_TOUCH_TAP_SECS", 0.35).max(0.05),
             tap_max_px: env_f("WOW_TOUCH_TAP_PX", 16.0).max(1.0),
             strafe_mode: env_b("WOW_TOUCH_STRAFE", true),
-            enabled: env_b("WOW_TOUCH", cfg!(target_os = "android")),
+            // iNilla: one touch layer per run, or every finger acts twice.
+            enabled: env_b("WOW_TOUCH", false) && !crate::inilla::touch_device(),
         }
     }
 }
