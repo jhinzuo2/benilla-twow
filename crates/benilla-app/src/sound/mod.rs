@@ -51,8 +51,8 @@ pub(crate) fn kit_decodes() -> u32 {
 }
 pub(crate) use glue::GlueMusicRequest;
 pub(crate) use greeting::NpcGreetingRequest;
-/// Named by the schedule tests' class table (`game_plugins::schedule_tests::Classes`).
-#[cfg(test)]
+/// Named by the schedule tests' class table (`game_plugins::schedule_tests::Classes`) and by
+/// iNilla's memory census.
 pub(crate) use kit::SoundKits;
 pub(crate) use message::MessageSounds;
 pub(crate) use mixer::Mixer;
