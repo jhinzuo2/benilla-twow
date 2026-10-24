@@ -9,10 +9,46 @@ use bevy::prelude::*;
 /// One channel's keyframes, normalized as `UnevenCore::new` does (stable sort by time, the first
 /// sample at a time kept), so [`Self::sample`] matches the clip's curve. Empty: the clip does not
 /// key the channel, and the joint keeps its value.
-#[derive(Clone)]
 pub struct PoseTrack<T> {
     times: Vec<f32>,
     values: Vec<T>,
+}
+
+/// iNilla: the bytes every live [`PoseTrack`] holds, for the memory census. A track never changes
+/// after it is built, so construction and clone add and drop subtracts. The clips' curves hold the
+/// same keys again.
+static POSE_KEY_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// iNilla: [`POSE_KEY_BYTES`].
+pub fn pose_key_bytes() -> u64 {
+    POSE_KEY_BYTES.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64
+}
+
+impl<T> PoseTrack<T> {
+    fn key_bytes(&self) -> i64 {
+        (self.times.len() * 4 + self.values.len() * std::mem::size_of::<T>()) as i64
+    }
+
+    fn counted(self) -> Self {
+        POSE_KEY_BYTES.fetch_add(self.key_bytes(), std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+}
+
+impl<T: Clone> Clone for PoseTrack<T> {
+    fn clone(&self) -> Self {
+        Self {
+            times: self.times.clone(),
+            values: self.values.clone(),
+        }
+        .counted()
+    }
+}
+
+impl<T> Drop for PoseTrack<T> {
+    fn drop(&mut self) {
+        POSE_KEY_BYTES.fetch_sub(self.key_bytes(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 // Manual: the derive would add a needless `T: Default` bound.
@@ -34,7 +70,8 @@ impl<T: Animatable + Clone> PoseTrack<T> {
             1 => Self {
                 times: vec![keys[0].0],
                 values: vec![keys[0].1.clone()],
-            },
+            }
+            .counted(),
             _ => {
                 let mut sorted: Vec<(f32, T)> = keys.to_vec();
                 sorted.sort_by(|(t0, _), (t1, _)| t0.total_cmp(t1));
@@ -43,7 +80,7 @@ impl<T: Animatable + Clone> PoseTrack<T> {
                     return Self::default();
                 }
                 let (times, values) = sorted.into_iter().unzip();
-                Self { times, values }
+                Self { times, values }.counted()
             }
         }
     }

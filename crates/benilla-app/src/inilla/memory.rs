@@ -210,15 +210,32 @@ pub(crate) fn census_cpu(
         .map_or_else(|| "?".to_string(), |b| format!("{:.0}", mb(b)));
     println!(
         "inilla: mem cpu malloc {heap} MB | model geometry {:.0} MB, model collision {:.0} MB | \
-         colliders {} ({trimeshes} trimesh, {:.0} MB + BVH) | animation clips {}, graphs {} | \
-         entities {}",
+         colliders {} ({trimeshes} trimesh, {:.0} MB + BVH) | animation clips {}, graphs {}, pose \
+         keyframes {:.0} MB (the clips' curves hold about as much again) | entities {}",
         mb(geometry),
         mb(collision),
         colliders.iter().count(),
         mb(tri_bytes),
         clips.as_ref().map_or(0, |a| a.len()),
         graphs.as_ref().map_or(0, |a| a.len()),
+        mb(benilla_assets::pose_key_bytes()),
         entities.iter().count(),
+    );
+}
+
+/// One line at every client-state change (login, character select, world): the malloc total and
+/// the headroom at that moment, so the census can tell what boot costs from what the world adds.
+pub(crate) fn phase_snapshot(state: Res<State<crate::client_state::ClientState>>) {
+    if !state.is_changed() || !super::touch_device() {
+        return;
+    }
+    let show = |b: Option<u64>| b.map_or_else(|| "?".to_string(), |b| format!("{:.0}", mb(b)));
+    println!(
+        "inilla: mem at {:?}: malloc {} MB, Metal {} MB, headroom {} MB",
+        state.get(),
+        show(inilla_platform::device::malloc_in_use()),
+        show(inilla_platform::device::gpu_allocated()),
+        show(inilla_platform::device::available_memory()),
     );
 }
 

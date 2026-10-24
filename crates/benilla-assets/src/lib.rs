@@ -34,6 +34,8 @@ pub use model::{
     PoseNode, PoseSource, PoseTrack, Stage1, ATTRIBUTE_WOW_FADE_SPHERE, ATTRIBUTE_WOW_JOINT_INDEX,
     ATTRIBUTE_WOW_JOINT_WEIGHT, ATTRIBUTE_WOW_MERGED_SLOT,
 };
+/// iNilla: the live pose keyframe bytes, for the memory census.
+pub use model::pose_key_bytes;
 mod adt;
 mod terrain;
 mod wdt;

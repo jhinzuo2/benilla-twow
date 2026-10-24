@@ -18,7 +18,7 @@ use crate::coords::wow_to_bevy;
 mod anims;
 mod pose;
 pub use anims::{AnimClip, ClipEvent, ModelAnimations};
-pub use pose::{PoseBone, PoseClip, PoseNode, PoseSource, PoseTrack};
+pub use pose::{pose_key_bytes, PoseBone, PoseClip, PoseNode, PoseSource, PoseTrack};
 
 /// A billboarded batch's card in Bevy space; its mesh is centred on `pivot` (model-local).
 #[derive(Clone)]
