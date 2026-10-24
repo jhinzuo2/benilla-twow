@@ -799,6 +799,8 @@ pub(crate) struct Model {
     /// `Wow.ini`'s `Region` as start-up hands it to the name check (`0x402b7f` → `0x6c91b8`,
     /// `[0x86c9e0]`): 0 until the host seats the install's.
     pub(crate) client_region: i32,
+    /// TWoW: whether the install is Turtle WoW, for the glue `GetBuildInfo`; false until seated.
+    pub(crate) turtle_data: bool,
     /// A Slider thumb drag, left press to release or pointer leave, handled here with no Lua.
     pub(crate) slider_drag: Option<slider::SliderDrag>,
     /// A ColorSelect wheel or value-bar drag, press to release.
@@ -1655,6 +1657,7 @@ impl Model {
             european_numbers: false,
             locale: 0,
             client_region: 0,
+            turtle_data: false,
             slider_drag: None,
             color_drag: None,
             gossip: None,

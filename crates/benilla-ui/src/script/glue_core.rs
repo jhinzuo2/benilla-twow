@@ -887,12 +887,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetBuildInfo",
         lua.create_function(|lua, _: MultiValue| {
+            // TWoW: Turtle's version, build and date on a Turtle install.
+            let [version, build, date] = super::client::glue_build_info(lua);
             Ok(MultiValue::from_vec(vec![
                 Value::String(lua.create_string(global_text(lua, "BETA_BUILD"))?),
                 Value::String(lua.create_string(global_text(lua, "RELEASE_BUILD"))?),
-                Value::String(lua.create_string(super::client::VERSION)?),
-                Value::String(lua.create_string(super::client::BUILD)?),
-                Value::String(lua.create_string(super::client::BUILD_DATE)?),
+                Value::String(lua.create_string(version)?),
+                Value::String(lua.create_string(build)?),
+                Value::String(lua.create_string(date)?),
             ]))
         })?,
     )?;
@@ -1442,6 +1444,19 @@ mod tests {
         assert_eq!(
             s.eval::<Vec<String>>("return { GetBuildInfo() }").unwrap(),
             ["Version", "Release", "1.12.1", "5875", "Sep 19 2006"]
+        );
+    }
+
+    /// TWoW: on a Turtle install the glue answers Turtle's version, build and date.
+    #[test]
+    fn the_glue_build_info_is_turtles_on_turtle_data() {
+        let mut s = UiScript::new_glue().unwrap();
+        s.set_turtle_data(true);
+        s.run("BETA_BUILD = 'Version' RELEASE_BUILD = 'Release'")
+            .unwrap();
+        assert_eq!(
+            s.eval::<Vec<String>>("return { GetBuildInfo() }").unwrap(),
+            ["Version", "Release", "1.18.1", "7272", "Mar 20 2026"]
         );
     }
 

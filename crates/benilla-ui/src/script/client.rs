@@ -11,6 +11,14 @@ pub(super) const VERSION: &str = "1.12.1";
 pub(super) const BUILD: &str = "5875";
 pub(super) const BUILD_DATE: &str = "Sep 19 2006";
 
+/// TWoW: the version, build and date a Turtle WoW client's login screen shows, 1.18.1 (7272), the
+/// build realmd is already told. Only the glue `GetBuildInfo` answers it, when the host seats
+/// [`UiScript::set_turtle_data`]; the in-game one stays 1.12.1, which addons gate on (pfUI reads
+/// a version past 1.12 as a later expansion).
+pub(super) const TURTLE_VERSION: &str = "1.18.1";
+pub(super) const TURTLE_BUILD: &str = "7272";
+pub(super) const TURTLE_BUILD_DATE: &str = "Mar 20 2026";
+
 /// The release client's debug globals that do nothing (`0x83dec0`-`0x83ded0`, `0x83df80`-`0x83dfa0`).
 const DEBUG_TOGGLES: [&str; 8] = [
     "ToggleTris",
@@ -368,6 +376,22 @@ impl UiScript {
     pub fn set_client_region(&mut self, region: i32) {
         self.model_mut().client_region = region;
     }
+
+    /// TWoW: seat whether the install is Turtle WoW, which the glue `GetBuildInfo` answers with
+    /// Turtle's version, build and date.
+    pub fn set_turtle_data(&mut self, turtle: bool) {
+        self.model_mut().turtle_data = turtle;
+    }
+}
+
+/// TWoW: the glue `GetBuildInfo`'s version, build and date: stock 1.12.1, or Turtle WoW's when
+/// the host seated a Turtle install.
+pub(super) fn glue_build_info(lua: &Lua) -> [&'static str; 3] {
+    if lua.app_data_ref::<Model>().is_some_and(|m| m.turtle_data) {
+        [TURTLE_VERSION, TURTLE_BUILD, TURTLE_BUILD_DATE]
+    } else {
+        [VERSION, BUILD, BUILD_DATE]
+    }
 }
 
 /// The locale name table `0x8558a4` at the VM's locale index, `GetLocale`'s answer in either state.
@@ -393,6 +417,17 @@ mod tests {
             s.arity("GetBuildInfo()").unwrap(),
             3,
             "three values, never a fourth"
+        );
+    }
+
+    /// TWoW: a Turtle install leaves the in-game answer stock; only the glue one is Turtle's.
+    #[test]
+    fn the_in_game_build_info_stays_1_12_1_on_turtle_data() {
+        let mut s = UiScript::new().unwrap();
+        s.set_turtle_data(true);
+        assert_eq!(
+            s.eval::<Vec<String>>("return { GetBuildInfo() }").unwrap(),
+            vec!["1.12.1", "5875", "Sep 19 2006"]
         );
     }
 

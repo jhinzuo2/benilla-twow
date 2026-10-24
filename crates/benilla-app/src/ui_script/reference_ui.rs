@@ -214,6 +214,19 @@ pub(crate) fn client_region() -> i32 {
     chain().map_or(0, |c| benilla_formats::client_region(c) as i32)
 }
 
+/// TWoW: whether the install is Turtle WoW: its FrameXML ships `Turtle_`-prefixed files beside the
+/// stock ones (`Turtle_ArenaUI.lua`, `Turtle_TransmogUI.lua`), which the archives' listfiles name.
+/// The prefix matches without ASCII case. Read once per process; false with no install.
+pub(crate) fn turtle_data() -> bool {
+    static TURTLE: OnceLock<bool> = OnceLock::new();
+    *TURTLE.get_or_init(|| {
+        chain().is_some_and(|c| !c.enumerate_archive_files(TURTLE_FRAMEXML_PREFIX).is_empty())
+    })
+}
+
+/// TWoW: the chain path every Turtle-only FrameXML file starts with.
+const TURTLE_FRAMEXML_PREFIX: &str = r"Interface\FrameXML\Turtle_";
+
 /// Files a test lays over the chain, per test thread: an entry with bytes reads as a chain file,
 /// one with `None` as a file the chain lacks, and any other path falls through to the chain.
 #[cfg(test)]

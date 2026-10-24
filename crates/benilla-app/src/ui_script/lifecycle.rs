@@ -151,6 +151,8 @@ fn new_vm<E: std::fmt::Display>(
     script.set_locale(super::client_locale().index());
     // `[0x882730]`, `Wow.ini`'s `Region`, read once alike and handed to the name check.
     script.set_client_region(super::client_region());
+    // TWoW: a Turtle install's glue `GetBuildInfo` answers Turtle's 1.18.1 (7272).
+    script.set_turtle_data(super::turtle_data());
     seed_vm_clock(world, &mut script);
     seed_game_time(world, &mut script);
     // The reference seeds `rand` with the clock before `WinMain` (`0x5b800b`). Deviation: a
