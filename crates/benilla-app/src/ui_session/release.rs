@@ -1,15 +1,13 @@
-//! The unit events that release the interaction latch (`0x4931c0`), off the field edges the apply
-//! pass emits, as the reference's mirror handlers see them.
+//! The unit events that release the interaction latch (`0x4931c0`), off the field edges the update
+//! packet's notify pass writes, run inside the packet as the reference's watchers run there
+//! ([`crate::field_callbacks`]), their signals parked at their places.
 //!
-//! A unit whose health falls from above 0 to 0 or below, compared signed
-//! ([`FieldChanged::unit_died`]), runs `CGUnit_C::OnDied` (`0x605860`, from the health watcher
-//! `0x6046f0` at `0x6047a3`). For a player it calls `0x5e99b0` first, which for the active player
-//! releases the latch with the goodbye (`0x5e9a51`, `dl = 0`); then, for any unit, it releases the
-//! latch if it names the dying unit, without a goodbye (`0x605950`, `dl = 1`). A change of the
-//! active player's shapeshift form (`UNIT_FIELD_BYTES_1` byte 2, watcher `0x5de010`) into a form
-//! that is not a stance (`0x60e9f0`) and lacks flag `0x8` releases it with the goodbye
-//! (`0x5de07f`, `dl = 0`). The release closes the window through `0x493310`; the goodbye is
-//! [`super::LatchVocal`], which a dead player does not hear (`0x605f30`).
+//! A change of the active player's shapeshift form (`UNIT_FIELD_BYTES_1` byte 2, watcher
+//! `0x5de010`) into a form that is not a stance (`0x60e9f0`) and lacks flag `0x8` releases it with
+//! the goodbye (`0x5de07f`, `dl = 0`). The release closes the window through `0x493310`; the
+//! goodbye is [`super::LatchVocal`], which a dead player does not hear (`0x605f30`). A death's
+//! releases (`0x5e9a51`, `0x605950`) run inside its handler, in its order (`crate::target`'s
+//! `died`).
 //!
 //! A unit's `UNIT_NPC_FLAGS` edge runs `0x60b420` (from the watcher `0x604a20`), which closes the
 //! window a lost service flag served ([`close_lost_services`]).
@@ -20,10 +18,11 @@ use bevy::prelude::*;
 
 use benilla_formats::ShapeshiftForm;
 use benilla_protocol::field::{FIELD_UNIT_BYTES_1, FIELD_UNIT_NPC_FLAGS};
-use benilla_protocol::messages::ObjectType;
 
-use super::latch::{release_cell, release_latch};
-use crate::net::{FieldChanged, SelfPlayer};
+use super::latch::release_latch;
+use crate::field_callbacks::Parked;
+use crate::field_watch::{FieldNotice, NoticeLane};
+use crate::net::{FieldChanged, SelfGuid};
 use crate::ui_action::Spells;
 
 /// `UNIT_FIELD_BYTES_1` byte 2, the shapeshift form (`[+0x110]+0x212`).
@@ -92,35 +91,38 @@ fn close_lost_services(world: &mut World, guid: u64, old: u32, new: u32) {
     }
 }
 
-/// The death of a unit and the active player's form change release the latch, and a unit's lost
-/// service flags close their windows. The edges are read after the apply pass, and the releases
-/// run in order at the next sync point, before the `"npc"` feed.
-pub(super) fn release_on_field_edges(
-    mut edges: MessageReader<FieldChanged>,
-    me: Query<Entity, With<SelfPlayer>>,
-    spells: Option<Res<Spells>>,
-    mut commands: Commands,
-) {
-    let me = me.single().ok();
-    for e in edges.read() {
-        if e.unit_died() {
-            // `0x605860` → `0x5e99b0` for the active player, then its own guid for any unit.
-            if e.kind == ObjectType::Player && Some(e.entity) == me {
-                commands.queue(|world: &mut World| release_latch(world, true));
-            }
-            let guid = e.guid;
-            commands.queue(move |world: &mut World| release_cell(world, guid, false));
-        } else if e.unit_field(FIELD_UNIT_BYTES_1)
-            && Some(e.entity) == me
-            && form_of(e.old) != form_of(e.new)
-            && spells
-                .as_ref()
-                .is_some_and(|s| form_bars_interaction(&s.forms, form_of(e.new)))
-        {
-            commands.queue(|world: &mut World| release_latch(world, true));
-        } else if e.unit_field(FIELD_UNIT_NPC_FLAGS) {
-            let (guid, old, new) = (e.guid, e.old, e.new);
-            commands.queue(move |world: &mut World| close_lost_services(world, guid, old, new));
-        }
+/// The callbacks of one field edge: the active player's form change releases the latch, and a
+/// unit's lost service flags close their windows.
+pub(crate) fn on_field_edge(world: &mut World, e: FieldChanged) {
+    if e.unit_field(FIELD_UNIT_BYTES_1) {
+        form_changed(world, e);
+    } else if e.unit_field(FIELD_UNIT_NPC_FLAGS) && (e.old ^ e.new) & !e.new != 0 {
+        // `0x604a20` → `0x60b420(old)` at the edge's own place, a type watcher's.
+        let (guid, old, new) = (e.guid, e.old, e.new);
+        crate::lanes::firing(e.at, || {
+            Parked::new(world).leg(world, |world| close_lost_services(world, guid, old, new));
+        });
     }
+}
+
+/// `OnShapeshiftFormChanged` (`0x5de010`), our own watch on our form byte: past its usable
+/// refresh and its state signals (`0x5de011`-`0x5de01b`, the block's [`FieldNotice::Shapeshift`],
+/// which the notify pass wrote after the edge), a form that bars interaction releases the latch
+/// with the goodbye (`0x5de07f`, `dl = 0`).
+fn form_changed(world: &mut World, e: FieldChanged) {
+    if Some(e.guid) != world.get_resource::<SelfGuid>().and_then(|s| s.0)
+        || form_of(e.old) == form_of(e.new)
+        || !world
+            .get_resource::<Spells>()
+            .is_some_and(|s| form_bars_interaction(&s.forms, form_of(e.new)))
+    {
+        return;
+    }
+    let place = world
+        .get_resource::<NoticeLane>()
+        .and_then(|lane| lane.first_after(e.at, |n| *n == FieldNotice::Shapeshift))
+        .unwrap_or(e.at);
+    crate::lanes::firing(place, || {
+        Parked::new(world).leg(world, |world| release_latch(world, true));
+    });
 }

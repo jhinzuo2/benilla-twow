@@ -37,12 +37,45 @@ fn wire(events: impl IntoIterator<Item = SessionEvent>) -> Vec<SessionEvent> {
         .collect()
 }
 
-/// A create block of `kind` whose fields are `pairs`, as the wire's whole descriptor.
+/// Each of `packets` one packet: its events, then the update end when it holds a block.
+pub(super) fn wire_packets(packets: Vec<Vec<SessionEvent>>) -> Vec<SessionEvent> {
+    packets
+        .into_iter()
+        .flat_map(|events| {
+            let block = events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    SessionEvent::ObjectCreate { .. }
+                        | SessionEvent::ObjectValues { .. }
+                        | SessionEvent::ObjectsRemoved(_)
+                )
+            });
+            events
+                .into_iter()
+                .chain(block.then_some(SessionEvent::ObjectUpdateEnd))
+        })
+        .collect()
+}
+
+/// A create block of `kind` whose fields are `pairs`, as the wire's whole descriptor, with the
+/// `OBJECT_FIELD_TYPE` every create carries (object, unit and, for a player, player bits) unless
+/// `pairs` sets its own: the resolver's hop and the getters' lookups test it (typemask 8,
+/// `0x515a0f`).
 pub(super) fn created(guid: u64, kind: EntityKind, pairs: &[(u16, u32)]) -> SessionEvent {
     let as_type = match kind {
         EntityKind::Player => ObjectType::Player,
         _ => ObjectType::Unit,
     };
+    const OBJECT_TYPE: u16 = 2;
+    let mut pairs = pairs.to_vec();
+    if !pairs.iter().any(|&(i, _)| i == OBJECT_TYPE) {
+        let mask = match as_type {
+            ObjectType::Player => 0x19,
+            _ => 0x9,
+        };
+        pairs.insert(0, (OBJECT_TYPE, mask));
+    }
+    let pairs = &pairs[..];
     SessionEvent::ObjectCreate {
         guid,
         kind,
@@ -92,7 +125,7 @@ pub(super) fn health(n: u32) -> [(u16, u32); 1] {
 /// with [`BOAR`] (50 health) beside it; a VM whose spy records `UNIT_HEALTH`, `UNIT_MANA` and
 /// `UNIT_COMBAT`, each with its token and what `Look(event, token)` reads as it fires.
 pub(super) fn client() -> App {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.insert_resource(crate::net::NetCommands(tx));
     let world = app.world_mut();
@@ -139,6 +172,9 @@ pub(super) fn client() -> App {
     // Our create tagged as ours, as the net stage's pass does (`net::apply`).
     let me = world.resource::<crate::net::GuidIndex>().0[&ME];
     world.entity_mut(me).insert(crate::net::SelfPlayer);
+    // The world entry first, as a session has it: the target comes after.
+    frame(&mut app, vec![]);
+    let world = app.world_mut();
     let wolf = world.resource::<crate::net::GuidIndex>().0[&WOLF];
     *world.resource_mut::<crate::target::Selection>() = crate::target::Selection {
         target: Some(wolf),
@@ -373,9 +409,9 @@ fn a_write_the_log_missed_fails_the_rewind() {
     );
 }
 
-/// A worldport drops every streamed object without an update block (`SMSG_NEW_WORLD`): logged as
-/// the stores it takes, the rewind of the target the frame creates again lands on the store the
-/// frame started from.
+/// A worldport drops every streamed object without an update block (`SMSG_NEW_WORLD`), logged as
+/// the stores it takes: the transfer ends the selection, so no seat reads the dropped target's
+/// store, and the target the frame creates again is read live.
 #[test]
 fn a_worldport_is_logged_as_the_stores_it_takes() {
     let mut app = client();
@@ -397,10 +433,7 @@ fn a_worldport_is_logged_as_the_stores_it_takes() {
     );
     let views = app.world().resource::<crate::ui_unit::views::UnitViews>();
     #[cfg(debug_assertions)]
-    assert_eq!(
-        views.starts_checked, 1,
-        "the target, checked against the snapshot"
-    );
+    assert_eq!(views.starts_checked, 0, "no seat reads a dropped store");
     assert!(!views.holds(WOLF), "and read live again");
 }
 
@@ -439,4 +472,233 @@ fn a_drain_that_stops_early_leaves_no_rewound_store() {
         .eval::<f64>("return UnitHealth('target')")
         .unwrap();
     assert_eq!(health, 70.0);
+}
+
+/// Updates to units no view reads, between events, build nothing: the lane rewinds only a unit a
+/// token can name, and a gap whose entries name none is no build.
+#[test]
+fn updates_to_units_no_view_reads_build_nothing() {
+    const FAR: [u64; 3] = [
+        0xF130_0000_0050_0001,
+        0xF130_0000_0050_0002,
+        0xF130_0000_0050_0003,
+    ];
+    let mut app = client();
+    let mob = |hp: u32| [(FIELD_UNIT_HEALTH, hp), (FIELD_UNIT_MAXHEALTH, 100)];
+    frame(
+        &mut app,
+        FAR.iter()
+            .map(|&g| created(g, EntityKind::Unit, &mob(100)))
+            .collect(),
+    );
+    lane_counts(&mut app);
+    let mut packets = vec![fall(1)];
+    for (i, &g) in FAR.iter().enumerate() {
+        packets.push(values(g, &health(90 - i as u32)));
+        packets.push(fall(1));
+    }
+    frame(&mut app, packets);
+    let (builds, pushes, _) = lane_counts(&mut app);
+    assert_eq!((builds, pushes), (0, 0));
+}
+
+/// Our own death signals `PLAYER_DEAD` inside its packet (`0x6046f0` at `0x6047a3`, then
+/// `0x6058ae` → `0x6251cc` → `0x495850`), after the packets before it ran whole: it fires after
+/// the combat line an earlier packet of the frame queued, and `UnitHealth("player")` reads the
+/// health its packet left, 0.
+#[test]
+fn player_dead_reads_its_packets_health_after_an_earlier_packets_line() {
+    let mut app = client();
+    app.world_mut()
+        .resource_mut::<crate::net::NetStatus>()
+        .connected = true;
+    app.world()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"local d = CreateFrame("Frame") d:RegisterEvent("PLAYER_DEAD")
+            d:SetScript("OnEvent", function()
+                table.insert(Seen, event .. ":" .. UnitHealth("player"))
+            end)"#,
+        )
+        .unwrap();
+    let seen = frame(&mut app, vec![fall(30), values(ME, &health(0))]);
+    let at = |prefix: &str| seen.iter().position(|s| s.starts_with(prefix));
+    let (line, dead) = (at("UNIT_COMBAT:player"), at("PLAYER_DEAD"));
+    assert!(line.is_some() && dead.is_some(), "{seen:?}");
+    assert!(line < dead, "the earlier packet's line first: {seen:?}");
+    assert_eq!(seen[dead.unwrap()], "PLAYER_DEAD:0", "{seen:?}");
+}
+
+/// Our own death's list signals ahead of its death line and `PLAYER_DEAD` after it: `0x5e99b0`'s
+/// deselect (`0x5e9a45`) at `0x60588d`, then `PresentUnitDeath` (`0x6058ae`), which writes the
+/// line (`0x62c160`) and ends in `SignalDeathState` (`0x6251cc` → `0x495850`).
+#[test]
+fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
+    #[cfg(debug_assertions)]
+    use bevy::ecs::system::RunSystemOnce;
+
+    let mut app = client();
+    app.world_mut()
+        .resource_mut::<crate::net::NetStatus>()
+        .connected = true;
+    app.world()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"UNITDIESSELF = "You die." UNITDIESOTHER = "%s dies."
+            local d = CreateFrame("Frame")
+            for _, e in ipairs({"PLAYER_TARGET_CHANGED", "CHAT_MSG_COMBAT_FRIENDLY_DEATH",
+                    "CHAT_MSG_COMBAT_HOSTILE_DEATH", "PLAYER_DEAD"}) do
+                d:RegisterEvent(e)
+            end
+            d:SetScript("OnEvent", function()
+                local death = string.find(event, "^CHAT_MSG_COMBAT_.*_DEATH$")
+                table.insert(Seen, death and "death line" or event)
+            end)"#,
+        )
+        .unwrap();
+    let world = app.world_mut();
+    #[cfg(debug_assertions)]
+    world
+        .run_system_once(crate::ui_unit::views::mark_frame_start)
+        .unwrap();
+    // The packet's end writes the line among the death's legs.
+    crate::net::handlers::dispatch(world, wire([values(ME, &health(0))]));
+    crate::ui_unit::run_feed_units_once(world);
+    crate::lanes::fire_in_order(world);
+    let seen = world
+        .non_send_resource::<UiScript>()
+        .eval::<Vec<String>>("return Seen")
+        .unwrap();
+    let ours: Vec<&str> = seen
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.starts_with("UNIT_"))
+        .collect();
+    assert_eq!(ours, ["PLAYER_TARGET_CHANGED", "death line", "PLAYER_DEAD"]);
+}
+
+/// The death line's listener runs where the health watcher wrote it, inside its update packet
+/// (`0x465277` → `0x6046f0` → `0x605860` → `0x62c160`), before the next packet's handler runs
+/// (`0x537ae5`): its `SendChatMessage` goes out ahead of the name query the next packet's create
+/// asks in its handler (`0x5dec12` → `0x609210`). The lanes fire after the whole dispatch until
+/// they fire inside it, so the query goes first today.
+#[test]
+#[ignore = "the lanes fire inside the dispatch only from the flip on"]
+fn a_death_lines_listener_sends_ahead_of_the_next_packets_handler() {
+    const STRANGER: u64 = 0x31;
+    let mut app = client();
+    let (tx, sent) = crossbeam_channel::unbounded();
+    app.insert_resource(crate::net::NetCommands(tx));
+    app.world_mut()
+        .resource_mut::<crate::net::NetStatus>()
+        .connected = true;
+    app.world()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"UNITDIESOTHER = "%s dies."
+            local d = CreateFrame("Frame")
+            d:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+            d:SetScript("OnEvent", function() SendChatMessage("down", "SAY") end)"#,
+        )
+        .unwrap();
+    let world = app.world_mut();
+    crate::net::handlers::dispatch(
+        world,
+        wire_packets(vec![
+            vec![values(BOAR, &health(0))],
+            vec![created(
+                STRANGER,
+                EntityKind::Player,
+                &[(FIELD_UNIT_HEALTH, 100)],
+            )],
+        ]),
+    );
+    crate::lanes::fire_in_order(world);
+    let order: Vec<&str> = sent
+        .try_iter()
+        .filter_map(|c| match c {
+            crate::net::ClientCommand::Chat { .. } => Some("chat"),
+            crate::net::ClientCommand::NameQuery { guid: STRANGER } => Some("name query"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["chat", "name query"]);
+}
+
+/// A spy on the level-up's events, each with its arguments, into the client's `Seen`.
+fn spy_level_up(app: &mut App) {
+    app.world()
+        .resource::<crate::tutorial::Tutorials>()
+        .lock()
+        .apply_flags(&[0u8; 32]);
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .run(
+            r#"
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("PLAYER_LEVEL_UP")
+            f:RegisterEvent("TUTORIAL_TRIGGER")
+            f:SetScript("OnEvent", function()
+                local args = {}
+                for _, v in ipairs({arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9}) do
+                    table.insert(args, tostring(v))
+                end
+                table.insert(Seen, event .. ":" .. table.concat(args, ","))
+            end)
+            "#,
+        )
+        .unwrap();
+}
+
+/// `SMSG_LEVELUP_INFO`'s arm of the notice handler `0x5e38c0`, while the active player exists
+/// (`0x5e4071`): the level tutorials the message's level reaches (`0x5e4086`-`0x5e410e`), then
+/// `PLAYER_LEVEL_UP` with the packet's level, health, first power, `level >= 10` and five stats
+/// (`0x5e413e`), each at its packet's place among the other lanes.
+#[test]
+fn the_level_up_message_signals_its_tutorials_then_player_level_up_at_its_packet() {
+    let mut app = client();
+    spy_level_up(&mut app);
+    let ding = SessionEvent::LevelUp(benilla_protocol::messages::LevelUpInfo {
+        level: 10,
+        health: 20,
+        powers: [15, 0, 0, 0, 0],
+        stats: [1, 2, 3, 4, -5],
+    });
+    let seen = frame(&mut app, vec![fall(1), ding, fall(1)]);
+    // Each published id is the tutorial's own plus one (`0x4b5390`).
+    let tutorial = |id: u32| format!("TUTORIAL_TRIGGER:{}", id + 1);
+    let mut want = vec!["UNIT_COMBAT:player:100".to_string()];
+    want.extend([0x16, 0x0d, 0x02, 0x26, 0x15, 0x25, 0x20, 0x0c].map(tutorial));
+    want.push("PLAYER_LEVEL_UP:10,20,15,1,1,2,3,4,-5".into());
+    want.push("UNIT_COMBAT:player:100".into());
+    assert_eq!(seen, want);
+
+    // Below 10 no talent point, and only the tutorials the level reaches, each once.
+    let ding = SessionEvent::LevelUp(benilla_protocol::messages::LevelUpInfo {
+        level: 4,
+        health: 9,
+        powers: [0; 5],
+        stats: [0; 5],
+    });
+    assert_eq!(
+        frame(&mut app, vec![ding]),
+        ["PLAYER_LEVEL_UP:4,9,0,0,0,0,0,0,0"],
+        "the tutorials fire once"
+    );
+}
+
+/// A level written to our descriptor signals no `PLAYER_LEVEL_UP`: the event's one source is the
+/// message (`0x5e413e`), so a GM's level change or a demotion with no `SMSG_LEVELUP_INFO` is
+/// silent.
+#[test]
+fn a_descriptor_level_change_alone_signals_no_level_up() {
+    const LEVEL: u16 = 34;
+    let mut app = client();
+    spy_level_up(&mut app);
+    frame(&mut app, vec![values(ME, &[(LEVEL, 10)])]);
+    let seen = frame(&mut app, vec![values(ME, &[(LEVEL, 11)])]);
+    assert!(
+        !seen.iter().any(|e| e.starts_with("PLAYER_LEVEL_UP")),
+        "{seen:?}"
+    );
 }

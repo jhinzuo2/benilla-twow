@@ -870,17 +870,26 @@ fn spell_cast_line(
 /// takes absorb and resist trailers, and on you raises [`combat::damage_word`] (`0x62ac74`). Then,
 /// for the active player (`0x624f83`), `UNIT_COMBAT` `WOUND` in the type's school, marked `0x20`
 /// for an absorb and `0x40` for a resist (`0x624f8c`-`0x624fc4`).
+///
+/// A victim the client holds as a unit, within its class's range (the one-sided test, strictly
+/// inside), of a type below 6 (`0x62aae7`) flashes its nameplate (`0x62abac`) ahead of the line;
+/// the answer is that victim.
 pub(super) fn environmental_damage_log(
     e: EnvironmentalDamageLog,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
     log: &ChatLog,
-) {
+) -> Option<u64> {
     if e.damage == 0 && e.absorb == 0 && e.resist == 0 {
-        return;
+        return None;
     }
     let victim = ctx.classify(e.victim, stores);
+    let flash = (e.victim != 0
+        && usize::from(e.damage_type) < ENV_DAMAGE_SCHOOLS.len()
+        && ctx.holds_unit(e.victim, stores)
+        && ctx.in_range(e.victim, victim, poses))
+    .then_some(e.victim);
     let kind = combat::combat_kind(victim, victim, false);
     if let (Some(family), Some(kind)) = (combat::env_family(e.damage_type), kind) {
         queue_worded(
@@ -910,6 +919,7 @@ pub(super) fn environmental_damage_log(
         let marks = super::feedback::hit_flags(false, e.absorb, e.resist, 0);
         super::feedback::wound(log, e.victim, e.damage, marks, school);
     }
+    flash
 }
 
 /// The school of each environmental damage type 0 to 5, the table `0x809274` that `0x624fb3`
@@ -926,56 +936,71 @@ const ENV_DAMAGE_SCHOOLS: [u32; 6] = [0, 0, 0, 2, 3, 2];
 /// update silently. No range gate or classifier: the chat type is the literal `0x55`
 /// `COMBAT_FACTION_CHANGE`. The wire's list id is `Faction.dbc`'s `rep_index`. The line
 /// (`0x62c5f0`) raises `FACTION` with the faction's name and the signed change, whoever's line it
-/// is (`0x62c661`-`0x62c667`).
+/// is (`0x62c661`-`0x62c667`). The tests' form, for a whole message ahead of its overwrite; the
+/// handler prints each entry where the reference does ([`faction_standing_change`]).
+#[cfg(test)]
 pub(crate) fn faction_standing(
     deltas: &[(u32, i32)],
     reputations: &Reputations,
     factions: Option<&crate::target::ring::Factions>,
     log: &ChatLog,
 ) {
+    for &(list_id, standing) in deltas.iter().take(1) {
+        let (flags, old) = reputations.slot(list_id as usize);
+        faction_standing_change(list_id, flags, old, standing, factions, log);
+    }
+}
+
+/// The line of one entry whose slot was `old` under `flags`, for the handler that prints it
+/// where `0x4d6330` does: with the new standing stored (`0x4d634a`) and the flags not yet moved.
+pub(crate) fn faction_standing_change(
+    list_id: u32,
+    flags: u8,
+    old: i32,
+    standing: i32,
+    factions: Option<&crate::target::ring::Factions>,
+    log: &ChatLog,
+) {
     let Some(catalog) = factions.map(|f| f.catalog()) else {
         return;
     };
-    for &(list_id, standing) in deltas.iter().take(1) {
-        let (flags, old) = reputations.slot(list_id as usize);
-        if flags & benilla_formats::faction_flags::HIDDEN != 0 {
-            continue;
-        }
-        let delta = standing - old;
-        if delta == 0 {
-            continue;
-        }
-        let Ok(index) = i32::try_from(list_id) else {
-            continue;
-        };
-        let Some(name) = catalog
-            .reputation_factions()
-            .find(|(_, f)| f.rep_index == index)
-            .and_then(|(id, _)| catalog.faction_name(id))
-        else {
-            continue;
-        };
-        log.push_combat(combat::PendingCombat {
-            kind: crate::ui_chat::ChatEventKind::CombatFactionChange,
-            family: if delta > 0 {
-                combat::FACTION_STANDING_INCREASED
-            } else {
-                combat::FACTION_STANDING_DECREASED
-            },
-            // A `Single` family reads no variant; `OtherOther` is what `tests::variants_of` sweeps.
-            variant: combat::Variant::OtherOther,
-            subject: 0,
-            object: 0,
-            fills: Fills {
-                named: name.to_string(),
-                amount: i64::from(delta.abs()),
-                ..Default::default()
-            },
-            named: combat::Named::Ready,
-            tries: 0,
-            word: Some(LineWord::text_number("FACTION", name, delta)),
-        });
+    if flags & benilla_formats::faction_flags::HIDDEN != 0 {
+        return;
     }
+    let delta = standing - old;
+    if delta == 0 {
+        return;
+    }
+    let Ok(index) = i32::try_from(list_id) else {
+        return;
+    };
+    let Some(name) = catalog
+        .reputation_factions()
+        .find(|(_, f)| f.rep_index == index)
+        .and_then(|(id, _)| catalog.faction_name(id))
+    else {
+        return;
+    };
+    log.push_combat(combat::PendingCombat {
+        kind: crate::ui_chat::ChatEventKind::CombatFactionChange,
+        family: if delta > 0 {
+            combat::FACTION_STANDING_INCREASED
+        } else {
+            combat::FACTION_STANDING_DECREASED
+        },
+        // A `Single` family reads no variant; `OtherOther` is what `tests::variants_of` sweeps.
+        variant: combat::Variant::OtherOther,
+        subject: 0,
+        object: 0,
+        fills: Fills {
+            named: name.to_string(),
+            amount: i64::from(delta.abs()),
+            ..Default::default()
+        },
+        named: combat::Named::Ready,
+        tries: 0,
+        word: Some(LineWord::text_number("FACTION", name, delta)),
+    });
 }
 
 /// The tail every arm ends in: build the queued line (dropping a class-9 endpoint) and park it

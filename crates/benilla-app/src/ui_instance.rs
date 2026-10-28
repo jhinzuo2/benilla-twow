@@ -1,7 +1,8 @@
 //! The instance lockout messages, the bookkeeping behind `CanShowResetInstances()`, and
 //! `CMSG_RESET_INSTANCES`. No 1.12 Lua handles the lines: the client fills the `GlobalStrings.lua`
-//! template itself and hands it to the chat composer `0x49a870` as `CHAT_MSG_SYSTEM`; here the net
-//! handlers queue them and [`feed_instance`] resolves them against the VM.
+//! template itself and hands it to the chat composer `0x49a870` as `CHAT_MSG_SYSTEM` inside the
+//! handler; here the net handlers queue them on the dialogs' lane at the packet's place, and the
+//! two getters read the terms through the call host ([`crate::ui_dialog_verbs::DialogLive`]).
 //!
 //! Deviation: walking out of a party dungeon ourselves also counts as holding a bind
 //! ([`InstanceState::saw_own_dungeon`]), because vmangos reports only permanent binds
@@ -12,8 +13,6 @@ use benilla_protocol::messages::{InstanceResetFailure, RaidInstanceMessage, Raid
 use bevy::prelude::*;
 
 use crate::net::{ClientCommand, NetCommands};
-use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
-use crate::ui_script::UiFeed;
 
 /// `CanShowResetInstances()`'s window, 25 hours: `cmp eax, 0x15f90` at `0x495ce6` against
 /// `time(0)` minus when we left, unsigned, so the boundary is inclusive.
@@ -42,8 +41,7 @@ pub(crate) struct InstanceState {
     /// the current map, which [`benilla_world::world_map::CurrentMap`] reaches only after the
     /// drain's deferred insert.
     pending_last_instance: Vec<u32>,
-    /// Lines for [`feed_instance`] to resolve against the VM's `GlobalStrings.lua`; the wire drain
-    /// cannot reach the VM.
+    /// The lines the handler being run adds, taken onto the dialogs' lane before it returns.
     lines: Vec<LockoutLine>,
 }
 
@@ -163,13 +161,13 @@ impl InstanceState {
 /// One queued line's text: `GetText`, the `%s` and `%d` fills, then the debug wrapper; `None` for
 /// a token the player's `GlobalStrings.lua` lacks or leaves empty, as the reference's null and
 /// empty guards do.
-fn lockout_text(
+pub(crate) fn lockout_text(
     line: &LockoutLine,
     map_name: Option<&str>,
-    get: &dyn Fn(&str) -> Option<String>,
+    strings: benilla_ui::strings::Strings<'_>,
 ) -> Option<String> {
-    // `GetText(token, nil, ordinal)`'s own plural pick, through the shared primitive.
-    let template = benilla_ui::strings::plural(line.token, line.ordinal, get)?;
+    // `GetText(token, nil, ordinal)`, the VM's own when one runs.
+    let template = benilla_ui::strings::plural(line.token, line.ordinal, strings)?;
     // Every lockout template takes its `%s` before its `%d`s, so one ordered list is exact.
     let mut args: Vec<benilla_ui::strings::Arg<'_>> = Vec::new();
     args.extend(map_name.map(benilla_ui::strings::Arg::S));
@@ -250,10 +248,28 @@ pub(crate) mod net {
             .net_handler(K::InstanceReset, on_packet)
             .net_handler(K::InstanceResetFailed, on_packet)
             .net_handler(K::UpdateLastInstance, on_packet)
-            .net_handler(K::UpdateInstanceOwnership, on_packet);
+            .net_handler(K::UpdateInstanceOwnership, on_packet)
+            .net_handler(K::LoggedOut, on_logged_out);
     }
 
-    fn on_packet(In(ev): In<SessionEvent>, mut state: ResMut<InstanceState>) {
+    /// Drop the witness at `SMSG_LOGOUT_COMPLETE`, as the next login may be another character. The
+    /// three globals stay, as the reference keeps them (`0x495d00` runs only on
+    /// `SMSG_INSTANCE_RESET`): its bind term is re-sent at the next world entry, where ours has no
+    /// server to correct it.
+    fn on_logged_out(In(ev): In<SessionEvent>, mut state: ResMut<InstanceState>) {
+        if let SessionEvent::LoggedOut = ev {
+            state.forget_witness();
+        }
+    }
+
+    /// Each packet's line, its `%s` named off `Map.dbc` at the packet (`0x49e228`), onto the
+    /// dialogs' lane.
+    fn on_packet(
+        In(ev): In<SessionEvent>,
+        mut state: ResMut<InstanceState>,
+        mut lane: ResMut<crate::ui_dialog_verbs::DialogLane>,
+        maps: Option<Res<benilla_assets::MapCatalogRes>>,
+    ) {
         match ev {
             SessionEvent::RaidInstanceMessage { message } => {
                 raid_instance_message(&mut state, message)
@@ -268,6 +284,10 @@ pub(crate) mod net {
                 update_instance_ownership(&mut state, owns)
             }
             _ => {}
+        }
+        for line in state.take_lines() {
+            let name = line.map.map(|m| map_name(m, maps.as_deref()));
+            lane.push(crate::ui_dialog_verbs::DialogSignal::Lockout(line, name));
         }
     }
 
@@ -382,70 +402,16 @@ fn track_instance_state(
     }
 }
 
-/// Show every queued line as `CHAT_MSG_SYSTEM`, then publish `IsInInstance` and
-/// `CanShowResetInstances` every frame, as both move with the map and the clock (the setters diff).
-fn feed_instance(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    mut state: ResMut<InstanceState>,
-    chat: Res<ChatLog>,
-    maps: Option<Res<benilla_assets::MapCatalogRes>>,
-    current_map: Option<Res<benilla_world::world_map::CurrentMap>>,
-    time: Res<Time<Real>>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            // No VM (an engine-only run): drop the queue rather than let it grow; a real session
-            // seats the VM before any of these packets can arrive.
-            let dropped = state.take_lines().len();
-            if dropped > 0 {
-                debug!("ui_instance: no VM — dropped {dropped} lockout line(s)");
-            }
-            return;
-        };
-        let here = current_map.as_ref().map(|m| m.0);
-        let now = time.elapsed().as_secs();
-
-        for line in state.take_lines() {
-            let name = line.map.map(|m| map_name(m, maps.as_deref()));
-            let get = |key: &str| script.lua().globals().get::<String>(key).ok();
-            match lockout_text(&line, name.as_deref(), &get) {
-                Some(text) => {
-                    debug!("ui_instance: {} -> {text:?}", line.token);
-                    chat.push_event(ChatEvent::text_only(ChatEventKind::System, text));
-                }
-                // A missing or empty key: silence.
-                None => debug!("ui_instance: {} resolves to nothing — no line", line.token),
-            }
-        }
-
-        script
-            .set_instance_type(here.and_then(|m| maps.as_ref().and_then(|c| c.0.instance_type(m))));
-        let party_dungeon = |m: u32| maps.as_ref().is_some_and(|c| c.0.is_party_dungeon(m));
-        script.set_can_reset_instances(state.can_reset(here, &party_dungeon, now));
-    })
+/// `ResetInstances()` inside its call ([`benilla_ui::script::InstanceCall`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct InstanceSteps<'w> {
+    net: Res<'w, NetCommands>,
 }
 
-/// Turn the `ResetInstances()` calls the dialog made into `CMSG_RESET_INSTANCES` sends.
-fn drain_instance(mut hosted_vm: crate::script_calls::HostedVm, commands: Res<NetCommands>) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        for _ in 0..script.take_reset_instance_asks() {
-            let _ = commands.0.send(ClientCommand::ResetInstances);
-        }
-    })
-}
-
-/// Drop the witness at logout, as the next login may be another character. The three globals stay,
-/// as the reference keeps them (`0x495d00` runs only on `SMSG_INSTANCE_RESET`): its bind term is
-/// re-sent at the next world entry, where ours has no server to correct it.
-fn clear_witness_on_logout(
-    mut state: ResMut<InstanceState>,
-    mut logged_out: MessageReader<crate::net::LoggedOutMessage>,
-) {
-    if logged_out.read().next().is_some() {
-        state.forget_witness();
+impl InstanceSteps<'_> {
+    /// `0x48a6b0`: `CMSG_RESET_INSTANCES` (`0x48a6e6`), ungated.
+    pub(crate) fn reset(&self) {
+        let _ = self.net.0.send(ClientCommand::ResetInstances);
     }
 }
 
@@ -454,14 +420,15 @@ pub(crate) struct UiInstancePlugin;
 impl Plugin for UiInstancePlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        crate::ui_dialog_verbs::add_dialog_lane(app);
         app.init_resource::<InstanceState>().add_systems(
             Update,
             (
                 // The latch before the feed, so a map change and its answer share a frame.
-                clear_witness_on_logout.before(track_instance_state),
-                track_instance_state.before(feed_instance),
-                feed_instance.in_set(UiFeed),
-                drain_instance.in_set(crate::ui_script::UiDrain),
+                // In the frame time, ahead of the pass: `CanShowResetInstances` reads the latch.
+                track_instance_state
+                    .after(benilla_world::schedule::WorldStage::Net)
+                    .before(crate::vm_pass::VmPass::Resume),
             ),
         );
     }
@@ -507,7 +474,7 @@ mod tests {
     }
 
     fn line_text(line: &LockoutLine, name: Option<&str>) -> Option<String> {
-        lockout_text(line, name, &globals)
+        lockout_text(line, name, benilla_ui::strings::Strings::Host(&globals))
     }
 
     fn warning(message_type: u32, map: u32, reset: u32) -> Option<LockoutLine> {
@@ -676,21 +643,41 @@ mod tests {
         };
         let plural = benilla_ui::strings::plural;
         assert_eq!(
-            plural("RAID_INSTANCE_WARNING_HOURS", Some(5), &sparse).as_deref(),
+            plural(
+                "RAID_INSTANCE_WARNING_HOURS",
+                Some(5),
+                benilla_ui::strings::Strings::Host(&sparse)
+            )
+            .as_deref(),
             Some("<bare>"),
             "no twin: GetText's own `if ( not string )` arm"
         );
         assert_eq!(
-            plural("RAID_INSTANCE_WARNING_HOURS", Some(5), &both).as_deref(),
+            plural(
+                "RAID_INSTANCE_WARNING_HOURS",
+                Some(5),
+                benilla_ui::strings::Strings::Host(&both)
+            )
+            .as_deref(),
             Some("<twin>")
         );
         assert_eq!(
-            plural("RAID_INSTANCE_WARNING_HOURS", Some(1), &both).as_deref(),
+            plural(
+                "RAID_INSTANCE_WARNING_HOURS",
+                Some(1),
+                benilla_ui::strings::Strings::Host(&both)
+            )
+            .as_deref(),
             Some("<bare>"),
             "exactly 1 is the bare token"
         );
         assert_eq!(
-            plural("RAID_INSTANCE_WELCOME", None, &both).as_deref(),
+            plural(
+                "RAID_INSTANCE_WELCOME",
+                None,
+                benilla_ui::strings::Strings::Host(&both)
+            )
+            .as_deref(),
             Some("<welcome>"),
             "no ordinal is the bare token"
         );
@@ -910,7 +897,11 @@ mod tests {
             let twin = real(&format!("{token}_P1"));
             assert!(twin.is_some(), "{token} has a shipped plural twin");
             assert_eq!(
-                benilla_ui::strings::plural(token, Some(2), &real),
+                benilla_ui::strings::plural(
+                    token,
+                    Some(2),
+                    benilla_ui::strings::Strings::Host(&real)
+                ),
                 twin,
                 "{token} at two takes its twin"
             );
@@ -925,7 +916,12 @@ mod tests {
         // Every warning template names the instance and takes exactly the fills we hand it.
         for (ty, fills) in [(1u32, 1usize), (2, 1), (3, 1), (4, 3)] {
             let line = warning(ty, 409, 3_600).expect("a template");
-            let template = benilla_ui::strings::plural(line.token, line.ordinal, &real).unwrap();
+            let template = benilla_ui::strings::plural(
+                line.token,
+                line.ordinal,
+                benilla_ui::strings::Strings::Host(&real),
+            )
+            .unwrap();
             assert!(template.contains("%s"), "{} names the instance", line.token);
             assert_eq!(
                 template.matches("%d").count(),
@@ -939,7 +935,12 @@ mod tests {
         // Two lines end to end against the real strings: the welcome and a refusal.
         let welcome = warning(4, 409, 3 * 86_400 + 2 * 3_600 + 5 * 60).expect("type 4");
         assert_eq!(
-            lockout_text(&welcome, Some("Molten Core"), &real).as_deref(),
+            lockout_text(
+                &welcome,
+                Some("Molten Core"),
+                benilla_ui::strings::Strings::Host(&real)
+            )
+            .as_deref(),
             Some("Welcome to Molten Core. This raid instance is scheduled to reset in 3d 2h 5m.")
         );
         let mut state = InstanceState::default();
@@ -948,7 +949,12 @@ mod tests {
             benilla_protocol::messages::InstanceResetFailed { reason: 0, map: 36 },
         );
         assert_eq!(
-            lockout_text(&state.take_lines()[0], Some("Deadmines"), &real).as_deref(),
+            lockout_text(
+                &state.take_lines()[0],
+                Some("Deadmines"),
+                benilla_ui::strings::Strings::Host(&real)
+            )
+            .as_deref(),
             Some("Cannot reset Deadmines.  There are players still inside the instance.")
         );
     }

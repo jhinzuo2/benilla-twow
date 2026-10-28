@@ -33,6 +33,7 @@ pub(crate) mod idle;
 mod input;
 /// The language gate: the exemptions and fluency lookup behind the chat garble.
 mod language;
+pub(crate) use language::ChatLanguages;
 /// `LoggingChat`/`LoggingCombat`: the two log files `/chatlog` and `/combatlog` toggle.
 pub(crate) mod logging;
 #[cfg(test)]
@@ -63,7 +64,9 @@ pub(crate) use edit::ChannelState;
 #[cfg(test)]
 pub(crate) use event::event_name;
 pub(crate) use event::{default_color, ChatEvent, ChatEventKind};
-pub(crate) use feed::{Answer, ChatLog};
+#[cfg(test)]
+pub(crate) use feed::EmoteTexts;
+pub(crate) use feed::{release_display, Answer, ChatLog};
 /// The chat applier off a bare world, for the tests that send through it.
 #[cfg(test)]
 pub(crate) use input::{chat_world, run_chat};
@@ -124,9 +127,14 @@ pub(crate) struct ChatDrain;
 
 impl Plugin for UiChatPlugin {
     fn build(&self, app: &mut App) {
+        use crate::ui_script::SweepApp;
         net::register(app);
         add_chat_lane(app);
         app.add_observer(combat::on_cvar);
+        app.add_sweep_leg(
+            crate::ui_script::SweepLeg::ChatLatch,
+            feed::latch_on_leave_world,
+        );
         app.init_resource::<ChatLog>()
             .init_resource::<away::AfkMirror>()
             .init_resource::<away::AfkMirrorMemo>()
@@ -160,16 +168,6 @@ impl Plugin for UiChatPlugin {
                     language::load_language_words,
                     language::feed_language_skills,
                     language::feed_default_language,
-                )
-                    .before(crate::lanes::UiLanes),
-            )
-            // Descriptor-diff combat-log lines, ahead of the drain so none lands a frame late.
-            .add_systems(
-                Update,
-                (
-                    combat::watch::death_lines,
-                    combat::watch::aura_lines,
-                    combat::watch::pet_loyalty_lines,
                 )
                     .before(crate::lanes::UiLanes),
             )
@@ -230,9 +228,12 @@ impl Plugin for UiChatPlugin {
                     .after(benilla_world::terrain_stream::AreaAuthoritySet)
                     .after(crate::player::WorldFocusSet),
             )
+            // After the shutdown's `PLAYER_LOGOUT`, whose handlers read the windows and the
+            // channels as they stood, and before the glue VM goes in.
             .add_systems(
                 OnExit(crate::client_state::ClientState::InWorld),
-                (channels::end_session_channels, end_session_chat),
+                (channels::end_session_channels, end_session_chat)
+                    .in_set(crate::ui_script::SessionEnd::Clears),
             );
         settings::plugin(app);
         logging::plugin(app);

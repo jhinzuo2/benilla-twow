@@ -1,13 +1,14 @@
-//! The trainer feed's tests: the laws, service resolution, the snapshot and the re-evaluator.
+//! The trainer window's tests: the laws, service resolution, the snapshot, the re-evaluator and the lane.
 
 use super::*;
+use crate::names::NameCache;
 use benilla_formats::{
     ItemDisplay, ItemDisplayCatalog, SpellDisplay, SPELL_ATTR_IS_TRADESKILL,
     SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_LEARN_PET_SPELL, SPELL_EFFECT_LEARN_SPELL,
     SPELL_EFFECT_SKILL_STEP,
 };
 use benilla_protocol::messages::trainer_spell_state;
-use benilla_ui::script::TrainerTooltip;
+use benilla_ui::script::{TrainerServiceCategory, TrainerTooltip};
 use std::collections::HashMap;
 
 /// An empty spell catalog, as before `Spell.dbc` loads.
@@ -25,6 +26,7 @@ fn probe_strings(key: &str) -> Option<String> {
         "TRADESKILL_SERVICE_LEARN" => Some("<LEARN>".into()),
         "KNOWN_TALENTS_HEADER" => Some("<KNOWN>".into()),
         "INCREASE_POTENTIAL" => Some("Increases potential in %s by %d".into()),
+        "HOME_INN" => Some("<INN>".into()),
         _ => None,
     }
 }
@@ -41,15 +43,17 @@ fn with_text<R>(
     let durations = benilla_formats::SpellDurationCatalog::default();
     let radii = benilla_formats::SpellRadiusCatalog::default();
     let lookup = |id: u32| spells.get(id);
-    let skill_of = |_: u32| player_skill;
-    let pet_of = |_: u32| pet_skill;
+    let skill_of = |d: &benilla_formats::SpellDisplay| d.skill_level(player_skill);
+    let pet_of = |d: &benilla_formats::SpellDisplay| d.skill_level(pet_skill);
     let ctx = TokenContext {
         durations: &durations,
         radii: &radii,
         ranges: None,
-        skill: &skill_of,
+        level: &skill_of,
         lookup: &lookup,
         mods: None,
+        power_cost: &|_| -1,
+        power_per_second: &|_| 0,
         unmodified_points: false,
         gender: &|| 0,
         home_area: &|| home,
@@ -57,7 +61,7 @@ fn with_text<R>(
         printf: &crate::ui_script::token_printf,
     };
     let pet_ctx = TokenContext {
-        skill: &pet_of,
+        level: &pet_of,
         ..ctx
     };
     f(&ServiceText {
@@ -74,6 +78,18 @@ fn resolve_service(
     skill_lines: Option<&SkillLineCatalog>,
     known: &BTreeSet<u32>,
 ) -> TrainerService {
+    resolve_service_skilled(wire, trainer_type, spells, skill_lines, known, Some(&[]))
+}
+
+/// [`resolve_service`] with the player's skill slots, `None` for no player object.
+fn resolve_service_skilled(
+    wire: &TrainerSpell,
+    trainer_type: u32,
+    spells: &SpellCatalog,
+    skill_lines: Option<&SkillLineCatalog>,
+    known: &BTreeSet<u32>,
+    skills: Option<&[benilla_protocol::messages::PlayerSkillSlot]>,
+) -> TrainerService {
     let deps = Deps::new();
     with_text(spells, 0, 0, None, |text| {
         super::resolve_service(
@@ -84,12 +100,14 @@ fn resolve_service(
             &ReqBooks {
                 player: known,
                 pet: None,
+                race_class: (1, 1),
+                skills,
             },
             None,
             &deps.items,
             Ask::New(&deps.commands),
             text,
-            &probe_strings,
+            benilla_ui::strings::Strings::Host(&probe_strings),
         )
     })
 }
@@ -119,12 +137,14 @@ fn snap(open: &TrainerOpen, spells: &SpellCatalog) -> Option<TrainerState> {
             &ReqBooks {
                 player: &BTreeSet::new(),
                 pet: None,
+                race_class: (1, 1),
+                skills: Some(&[]),
             },
             None,
             &deps.items,
             Ask::New(&deps.commands),
             text,
-            &probe_strings,
+            benilla_ui::strings::Strings::Host(&probe_strings),
         )
     })
 }
@@ -528,17 +548,11 @@ fn resolve_reads_cost_state_and_gates_with_no_catalog() {
     assert_eq!(svc.cost, 1000);
     assert_eq!(svc.category, TrainerServiceCategory::Unavailable);
     assert_eq!(svc.level_req, 20);
-    // The skill gate follows the category; the ability gate reads met, as no service spell
-    // record reaches the known test (`0x4d9842`), and a requirement with no record answers nil
-    // (`0x4d97c8`, `0x4d98d1`). Every slot stays in place (`0x4d97a5`).
-    assert_eq!(
-        svc.skill_req,
-        Some(TrainerSkillReq {
-            name: "Skill 164".to_string(),
-            rank: 100,
-            met: false,
-        })
-    );
+    // A skill line with no `SkillLine.dbc` row is no requirement (`0x4d94c5` → `0x4d95bc`); the
+    // ability gate reads met, as no service spell record reaches the known test (`0x4d9842`), and
+    // a requirement with no record answers nil (`0x4d97c8`, `0x4d98d1`). Every slot stays in place
+    // (`0x4d97a5`).
+    assert_eq!(svc.skill_req, None);
     assert_eq!(
         svc.ability_reqs,
         vec![
@@ -873,8 +887,8 @@ fn service_description_expands_against_the_pet_for_a_learn_pet_row() {
     });
 }
 
-/// The `$z` token: the bind point's area name (`AreaTable.dbc`), and raw where no bind point has
-/// arrived, as the item and tooltip feeds' `$z` behaves.
+/// The `$z` token: the bind point's area name (`AreaTable.dbc`), and the `HOME_INN` text where no
+/// bind point has arrived (`0x507f3a`), as the item and spell tooltips' `$z` behaves.
 #[test]
 fn service_description_expands_z_to_the_bind_area() {
     let d = SpellDisplay {
@@ -885,7 +899,7 @@ fn service_description_expands_z_to_the_bind_area() {
     let deps = Deps::new();
     for (home, want) in [
         (Some("Razor Hill"), "Returns you to Razor Hill."),
-        (None, "Returns you to $z."),
+        (None, "Returns you to <INN>."),
     ] {
         with_text(&spells, 0, 0, home, |text| {
             assert_eq!(
@@ -952,12 +966,14 @@ fn service_description_on_real_data_reads_astral_recalls_bind_area() {
             &ReqBooks {
                 player: &BTreeSet::new(),
                 pet: None,
+                race_class: (1, 1),
+                skills: Some(&[]),
             },
             None,
             &deps.items,
             Ask::New(&deps.commands),
             text,
-            &probe_strings,
+            benilla_ui::strings::Strings::Host(&probe_strings),
         )
     });
     assert_eq!(
@@ -1058,8 +1074,10 @@ fn service_description_on_real_data_reaches_for_the_recipes_product() {
     assert_eq!(describe(&landed), Some("Needed by Enchanters.".into()));
 }
 
+/// No list, no snapshot; a close zeroes only the cell (`0x4d747c`), the records staying until the
+/// next list, and the session's end takes them.
 #[test]
-fn snapshot_is_none_when_closed_and_lists_services_when_open() {
+fn snapshot_is_none_before_a_list_and_keeps_the_records_through_a_close() {
     let spells = empty_catalog();
     let mut open = TrainerOpen::default();
     assert!(snap(&open, &spells).is_none());
@@ -1083,9 +1101,12 @@ fn snapshot_is_none_when_closed_and_lists_services_when_open() {
     assert_eq!(state.services[1].category, TrainerServiceCategory::Used);
 
     open.clear();
-    assert!(snap(&open, &spells).is_none());
     assert_eq!(open.trainer, None);
+    assert_eq!(snap(&open, &spells).map(|s| s.services.len()), Some(2));
+    open.clear_session();
+    assert!(snap(&open, &spells).is_none());
 }
+
 /// A wrapper spell whose slot `slot` carries `effect` and triggers `trigger`.
 fn wrapper(effect: u32, slot: usize, trigger: u32) -> SpellDisplay {
     let mut d = SpellDisplay {
@@ -1232,38 +1253,28 @@ fn tooltip_falls_back_to_the_wire_spell() {
     );
 }
 
-/// The builder resets per list packet (`0x4d75d9`), and an open window repaints through the
-/// re-evaluator (`0x4d7d40`), never a second list, so every list opens and resets.
+/// Every list steps the window's list, which the VM's rows carry so a live read answers only for
+/// its own; a pass is owed only with a window open (`0x4d7d46`'s early-out).
 #[test]
 fn every_list_packet_begins_a_window_session() {
     const TRAINER: u64 = 0xabc;
     let list = || vec![wire(1, trainer_spell_state::GREEN, 10, 1, 0)];
     let mut open = TrainerOpen::default();
+    let mut lane = TrainerLane::default();
 
     open.open(TRAINER, 0, list(), "Greetings".into());
-    assert!(open.fresh_list, "a first list opens the window: reset");
-    open.fresh_list = false; // the feed consumes it
-
+    let first = open.list;
     open.open(TRAINER, 0, list(), "Greetings".into());
-    assert!(
-        open.fresh_list,
-        "the same trainer's list again is a session start again"
+    assert_ne!(
+        open.list, first,
+        "the same trainer's list again is a list again"
     );
 
-    // A pending re-derivation never survives a list: the packet carries the server's own states.
-    open.fresh_list = false;
-    open.trigger_re_derive();
-    assert!(open.re_derive_owed());
-    open.open(TRAINER, 0, list(), "Greetings".into());
-    assert!(
-        !open.re_derive_owed(),
-        "a fresh list is the server's states — nothing pending against it"
-    );
-
-    // A trigger with no window open does nothing (`0x4d7d46`'s early-out).
+    pass_owed(Some(&open), Some(&mut lane));
+    assert_eq!(lane.stamped().len(), 1);
     open.clear();
-    open.trigger_re_derive();
-    assert!(!open.re_derive_owed());
+    pass_owed(Some(&open), Some(&mut lane));
+    assert_eq!(lane.stamped().len(), 1, "no window, no pass");
 }
 
 mod re_derive {
@@ -1646,12 +1657,7 @@ mod re_derive {
             .resource_mut::<PlayerActions>()
             .spells
             .insert(RANK2);
-        app.world_mut().resource_mut::<TrainerOpen>().open(
-            0x10,
-            1,
-            vec![service(RANK1_WRAPPER)],
-            String::new(),
-        );
+        super::list(&mut app, 0x10, 1, vec![service(RANK1_WRAPPER)]);
         assert_eq!(super::tick(&mut app), ["TRAINER_SHOW"]);
         let every_filter = "SetTrainerServiceTypeFilter('available', 1) \
                             SetTrainerServiceTypeFilter('unavailable', 1) \
@@ -1662,9 +1668,7 @@ mod re_derive {
             2,
             "the server's red row and its header"
         );
-        app.world_mut()
-            .resource_mut::<TrainerOpen>()
-            .trigger_re_derive();
+        super::trigger(&mut app);
         assert_eq!(super::tick(&mut app), ["TRAINER_UPDATE"]);
         assert_eq!(super::lua_count(&mut app, every_filter), 0);
         let kinds = app
@@ -1690,11 +1694,7 @@ mod re_derive {
             .unwrap();
         let mut known = service(RANK1_WRAPPER);
         known.state = trainer_spell_state::GRAY;
-        let list = |app: &mut App, row: TrainerSpell| {
-            app.world_mut()
-                .resource_mut::<TrainerOpen>()
-                .open(0x10, 1, vec![row], String::new());
-        };
+        let list = |app: &mut App, row: TrainerSpell| super::list(app, 0x10, 1, vec![row]);
         let header = |app: &mut App| -> String {
             app.world_mut()
                 .non_send_resource_mut::<UiScript>()
@@ -1708,9 +1708,7 @@ mod re_derive {
         assert_eq!(super::tick(&mut app), ["TRAINER_SHOW"]);
         assert_eq!(header(&mut app), "My Talents");
         // RANK1 is not in the book: the pass reads it learnable, and the key stays -1.
-        app.world_mut()
-            .resource_mut::<TrainerOpen>()
-            .trigger_re_derive();
+        super::trigger(&mut app);
         assert_eq!(super::tick(&mut app), ["TRAINER_UPDATE"]);
         assert_eq!(header(&mut app), "My Talents");
         // The next list files it by its state again.
@@ -1741,93 +1739,23 @@ fn the_group_header_keys_resolve_in_the_real_global_strings() {
     }
 }
 
-/// `OpenTrainer` (`0x4d8cf0`): the open window closes and `CMSG_TRAINER_LIST` goes out for the
-/// player's own guid (`TalkToTrainer`, `0x5df680`); with no player nothing happens at all
-/// (`0x4d8d24`), the open window included.
+/// The list asks no product: the reference's list and its passes look no item up, and a product
+/// is asked by the icon and description getters' calls alone (`0x4d9096`, `0x4d9d07`), inside
+/// them. No list, no pass and no frame asks.
 #[test]
-fn open_trainer_closes_the_window_and_asks_for_the_players_own_list() {
-    use bevy::ecs::system::RunSystemOnce;
-    const ME: u64 = 0x10;
-    const TRAINER: u64 = 0xF130_0000_4500_0001;
-    let run = |with_player: bool| {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.insert_resource(NetCommands(tx))
-            .init_resource::<TrainerOpen>()
-            .add_systems(Update, drain_trainer);
-        app.insert_non_send_resource(UiScript::new().unwrap());
-        if with_player {
-            app.world_mut().spawn((Guid(ME), SelfPlayer));
-        }
-        app.world_mut()
-            .resource_mut::<TrainerOpen>()
-            .open(TRAINER, 0, Vec::new(), String::new());
-        let mut calls = {
-            let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
-            script.keep_calls();
-            script.run("OpenTrainer()").unwrap();
-            script.take_trainer_calls()
-        };
-        let tails = app
-            .world_mut()
-            .run_system_once(move |mut steps: TrainerSteps| {
-                std::mem::take(&mut calls)
-                    .into_iter()
-                    .filter_map(|call| steps.apply(call))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap();
-        for tail in tails {
-            tail(&mut app.world_mut().non_send_resource_mut::<UiScript>());
-        }
-        app.update();
-        let open = app.world().resource::<TrainerOpen>().trainer;
-        (open, rx.try_iter().collect::<Vec<_>>())
-    };
-    let (open, sent) = run(true);
-    assert_eq!(open, None, "the window closes");
-    assert!(
-        matches!(sent.as_slice(), [ClientCommand::TrainerList { trainer }] if *trainer == ME),
-        "{sent:?}"
-    );
-    let (open, sent) = run(false);
-    assert_eq!(open, Some(TRAINER), "no player: nothing happens");
-    assert!(sent.is_empty(), "no player, no request: {sent:?}");
-}
-
-/// The stock window calls `GetTrainerServiceIcon` at `TRAINER_SHOW` and `TRAINER_UPDATE`, which
-/// looks the product up with a callback (`0x4d9096`); the frames between ask only what the cache
-/// holds nothing for. A refused product is asked by no frame, and again by the trainer's next list.
-#[test]
-fn a_refused_product_is_asked_at_the_next_list_never_by_a_frame() {
+fn the_list_asks_no_product() {
     let (tx, rx) = crossbeam_channel::unbounded();
-    let mut app = App::new();
-    app.add_message::<crate::net::FieldChanged>()
-        .insert_resource(NetCommands(tx))
-        .init_resource::<TrainerOpen>()
-        .init_resource::<TrainerErrors>()
-        .init_resource::<TrainerTooltipSubjects>()
-        .init_resource::<PlayerActions>()
-        .init_resource::<Items>()
-        .init_resource::<NameCache>()
-        .init_resource::<GuidIndex>()
-        .init_resource::<crate::ui_pet::PetBar>()
-        .init_resource::<crate::spell::SpellModifiers>()
-        .insert_resource(Spells {
-            catalog: icon_catalog(),
-            ..Spells::empty_for_tests()
-        })
-        .insert_resource(SkillLines {
-            catalog: benilla_formats::SkillLineCatalog::from_spell_lines([]),
-        })
-        .add_systems(Update, feed_trainer);
-    app.insert_non_send_resource(UiScript::new().unwrap());
+    let mut app = feed_app(
+        icon_catalog(),
+        benilla_formats::SkillLineCatalog::from_spell_lines([]),
+    );
+    app.insert_resource(NetCommands(tx));
     let list = |app: &mut App| {
-        app.world_mut().resource_mut::<TrainerOpen>().open(
+        list(
+            app,
             0xF130_0000_4500_0001,
             TRAINER_TYPE_TRADESKILL,
             vec![wire(100, trainer_spell_state::GREEN, 10, 1, 0)],
-            String::new(),
         );
     };
     let product_asks = |rx: &crossbeam_channel::Receiver<ClientCommand>| {
@@ -1837,18 +1765,14 @@ fn a_refused_product_is_asked_at_the_next_list_never_by_a_frame() {
             .count()
     };
     list(&mut app);
-    app.update();
-    assert_eq!(product_asks(&rx), 1);
-    app.world_mut()
-        .resource_mut::<Items>()
-        .insert_template(777, None);
-    for _ in 0..600 {
-        app.update();
+    for _ in 0..3 {
+        tick(&mut app);
     }
-    assert_eq!(product_asks(&rx), 0, "no frame asks the refusal");
+    assert_eq!(product_asks(&rx), 0, "the list and its drains");
     list(&mut app);
-    app.update();
-    assert_eq!(product_asks(&rx), 1, "the next list does, once");
+    trigger(&mut app);
+    tick(&mut app);
+    assert_eq!(product_asks(&rx), 0, "the next list and a pass");
 }
 
 /// [`resolve_service`] with the pet's book beside the player's, as `GetTrainerServiceAbilityReq`
@@ -1867,12 +1791,17 @@ fn resolve_with_pet(
             0,
             spells,
             skill_lines,
-            &ReqBooks { player, pet },
+            &ReqBooks {
+                player,
+                pet,
+                race_class: (1, 1),
+                skills: Some(&[]),
+            },
             None,
             &deps.items,
             Ask::New(&deps.commands),
             text,
-            &probe_strings,
+            benilla_ui::strings::Strings::Host(&probe_strings),
         )
     })
 }
@@ -1973,66 +1902,38 @@ fn ability_req_asks_the_pets_book_for_a_pet_spell_and_none_without_a_record() {
 #[test]
 fn the_trainer_rows_sort_only_at_a_list_and_a_re_derive() {
     const TRAINER: u64 = 0x10;
-    let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut app = App::new();
-    app.add_message::<crate::net::FieldChanged>()
-        .insert_resource(NetCommands(tx))
-        .init_resource::<TrainerOpen>()
-        .init_resource::<TrainerErrors>()
-        .init_resource::<TrainerTooltipSubjects>()
-        .init_resource::<PlayerActions>()
-        .init_resource::<Items>()
-        .init_resource::<NameCache>()
-        .init_resource::<GuidIndex>()
-        .init_resource::<crate::ui_pet::PetBar>()
-        .init_resource::<crate::spell::SpellModifiers>()
-        .insert_resource(Spells {
-            catalog: icon_catalog(),
-            ..Spells::empty_for_tests()
-        })
-        .insert_resource(SkillLines {
-            catalog: benilla_formats::SkillLineCatalog::from_spell_lines([]),
-        })
-        .add_systems(Update, feed_trainer);
-    app.insert_non_send_resource(UiScript::new().unwrap());
+    let mut app = feed_app(
+        icon_catalog(),
+        benilla_formats::SkillLineCatalog::from_spell_lines([]),
+    );
     let list = |app: &mut App| {
-        app.world_mut().resource_mut::<TrainerOpen>().open(
+        list(
+            app,
             TRAINER,
             TRAINER_TYPE_TRADESKILL,
             (1..=4)
                 .map(|cost| wire(300 + cost, trainer_spell_state::GREEN, cost, 1, 0))
                 .collect(),
-            String::new(),
         );
     };
-    // Each row by its cost, a header as 0.
-    let rows = |app: &mut App| -> Vec<i64> {
-        app.world_mut()
-            .non_send_resource_mut::<UiScript>()
-            .eval::<Vec<i64>>(
-                "local out = {} for i = 1, 5 do out[i] = (GetTrainerServiceCost(i)) end return out",
-            )
-            .unwrap()
-    };
+    let rows = |app: &mut App| costs(app, 5);
     list(&mut app);
-    app.update();
+    tick(&mut app);
     let first = rows(&mut app);
     app.world_mut()
         .resource_mut::<NameCache>()
         .insert_player(TRAINER, "Trainer".into(), None);
-    app.update();
+    tick(&mut app);
     assert_eq!(rows(&mut app), first, "a landed name re-sorts nothing");
     list(&mut app);
-    app.update();
+    tick(&mut app);
     assert_eq!(
         rows(&mut app),
         first,
         "an identical re-list lays the rows out anew"
     );
-    app.world_mut()
-        .resource_mut::<TrainerOpen>()
-        .trigger_re_derive();
-    app.update();
+    trigger(&mut app);
+    tick(&mut app);
     let carried = rows(&mut app);
     assert_ne!(
         carried, first,
@@ -2040,16 +1941,13 @@ fn the_trainer_rows_sort_only_at_a_list_and_a_re_derive() {
     );
 }
 
-/// The real [`feed_trainer`] over a VM that records `TRAINER_SHOW` and `TRAINER_UPDATE` in
-/// `SEEN`, with `spells` and `lines` loaded.
+/// The trainer lane over a VM that records `TRAINER_SHOW` and `TRAINER_UPDATE` in `SEEN`, with
+/// `spells` and `lines` loaded.
 fn feed_app(spells: SpellCatalog, lines: SkillLineCatalog) -> App {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    app.add_message::<crate::net::FieldChanged>()
-        .insert_resource(NetCommands(tx))
+    app.insert_resource(NetCommands(tx))
         .init_resource::<TrainerOpen>()
-        .init_resource::<TrainerErrors>()
-        .init_resource::<TrainerTooltipSubjects>()
         .init_resource::<PlayerActions>()
         .init_resource::<Items>()
         .init_resource::<NameCache>()
@@ -2060,9 +1958,10 @@ fn feed_app(spells: SpellCatalog, lines: SkillLineCatalog) -> App {
             catalog: spells,
             ..Spells::empty_for_tests()
         })
-        .insert_resource(SkillLines { catalog: lines })
-        .add_systems(Update, feed_trainer);
-    let script = UiScript::new().unwrap();
+        .insert_resource(SkillLines { catalog: lines });
+    lane::add_trainer_lane(&mut app);
+    let mut script = UiScript::new().unwrap();
+    script.keep_calls();
     script
         .run(
             "SEEN = {} local f = CreateFrame('Frame') f:RegisterEvent('TRAINER_SHOW') \
@@ -2074,14 +1973,69 @@ fn feed_app(spells: SpellCatalog, lines: SkillLineCatalog) -> App {
     app
 }
 
-/// One frame, then the trainer events the VM saw.
+/// A list's handler on `trainer`: the window filled and its `TRAINER_SHOW` on the lane, as
+/// [`open_trainer`] leaves them, the latch left out.
+pub(super) fn list(app: &mut App, trainer: u64, trainer_type: u32, services: Vec<TrainerSpell>) {
+    let world = app.world_mut();
+    world
+        .resource_mut::<TrainerOpen>()
+        .open(trainer, trainer_type, services, String::new());
+    world.resource_mut::<TrainerLane>().push(TrainerEvent::Show);
+}
+
+/// One of the state pass's callers ([`pass_owed`]).
+pub(super) fn trigger(app: &mut App) {
+    let world = app.world_mut();
+    world.resource_scope(|world, mut lane: Mut<TrainerLane>| {
+        pass_owed(world.get_resource::<TrainerOpen>(), Some(&mut lane));
+    });
+}
+
+/// The lanes' drain, then the trainer events the VM saw.
 fn tick(app: &mut App) -> Vec<String> {
-    app.update();
+    crate::lanes::fire_in_order(app.world_mut());
     let s = app.world_mut().non_send_resource_mut::<UiScript>();
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
     let seen = s.eval::<Vec<String>>("return SEEN").unwrap();
     s.run("SEEN = {}").unwrap();
     seen
+}
+
+/// Run `chunk`, then make the item lookups its getters kept as the host makes them inside the
+/// call ([`super::ask_item_record`]).
+fn run_getters(app: &mut App, chunk: &str) {
+    let entries = {
+        let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+        s.run(chunk).unwrap();
+        s.take_item_asks(benilla_ui::script::ItemCallback::Trainer)
+    };
+    let world = app.world();
+    for entry in entries {
+        super::ask_item_record(
+            world.resource::<Items>(),
+            world.resource::<NetCommands>(),
+            entry,
+            0,
+        );
+    }
+}
+
+/// `entry`'s record lands, and each trainer callback its lookups left runs the state pass, as the
+/// answer's handler runs them (`crate::net::objects`).
+fn land(app: &mut App, entry: u32) {
+    let callbacks = {
+        let mut items = app.world_mut().resource_mut::<Items>();
+        items.insert_template(
+            entry,
+            Some(crate::items::test_template("Copper Shortsword")),
+        );
+        items.take_callbacks(entry)
+    };
+    for callback in callbacks {
+        if callback == crate::items::RecordCallback::Trainer {
+            trigger(app);
+        }
+    }
 }
 
 /// `chunk`'s number.
@@ -2096,6 +2050,49 @@ fn lua_numbers(app: &mut App, chunk: &str) -> Vec<i64> {
     s.eval::<Vec<i64>>(chunk).unwrap()
 }
 
+/// The icon and description getters' product lookups pass the taught spell's id under
+/// `0xb0000000` as the owner: the icon takes the record of the learn slot's trigger and reads its
+/// id (`0x4d9050`-`0x4d9074`), the description the taught record's (`0x4d9c98`, `0x4d9cdf`), never
+/// the wire spell's.
+#[test]
+fn the_product_lookups_pass_the_taught_spell_as_their_owner() {
+    use benilla_ui::script::{spell_owner, ItemCallback, RecordAsk};
+    let wire_spell = SpellDisplay {
+        name: "Copper Shortsword".into(),
+        effects: [SPELL_EFFECT_LEARN_SPELL, 0, 0],
+        effect_trigger_spell: [200, 0, 0],
+        ..Default::default()
+    };
+    let taught = SpellDisplay {
+        name: "Copper Shortsword".into(),
+        attributes: SPELL_ATTR_IS_TRADESKILL,
+        effects: [SPELL_EFFECT_CREATE_ITEM, 0, 0],
+        effect_item_type: [777, 0, 0],
+        ..Default::default()
+    };
+    let mut app = feed_app(
+        SpellCatalog::from_displays(HashMap::from([(100, wire_spell), (200, taught)])),
+        benilla_formats::SkillLineCatalog::from_spell_lines([]),
+    );
+    list(
+        &mut app,
+        0x10,
+        TRAINER_TYPE_TRADESKILL,
+        vec![wire(100, trainer_spell_state::GREEN, 1, 1, 0)],
+    );
+    tick(&mut app);
+    let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+    // Row 1 is the group's header.
+    s.run("GetTrainerServiceIcon(2) GetTrainerServiceDescription(2)")
+        .unwrap();
+    let ask = RecordAsk::Item {
+        entry: 777,
+        owner: spell_owner(200),
+        callback: ItemCallback::Trainer,
+    };
+    assert_eq!(s.take_record_asks(), [ask, ask]);
+}
+
 /// `TRAINER_SHOW` fires from the list builder alone (`0x4d7b73`), so the open trainer's second
 /// list fires it again; `TRAINER_UPDATE` from the state pass (`0x4d83f9`) and the mask commits
 /// (`0x4d8ca0`-`0x4d8ce0`) alone. The trainer's name landing fires neither.
@@ -2107,11 +2104,11 @@ fn the_trainer_events_fire_only_from_their_producers() {
         benilla_formats::SkillLineCatalog::from_spell_lines([]),
     );
     let list = |app: &mut App| {
-        app.world_mut().resource_mut::<TrainerOpen>().open(
+        list(
+            app,
             TRAINER,
             TRAINER_TYPE_TRADESKILL,
             vec![wire(301, trainer_spell_state::GREEN, 1, 1, 0)],
-            String::new(),
         );
     };
     list(&mut app);
@@ -2122,9 +2119,7 @@ fn the_trainer_events_fire_only_from_their_producers() {
     assert!(tick(&mut app).is_empty(), "a landed name fires nothing");
     list(&mut app);
     assert_eq!(tick(&mut app), ["TRAINER_SHOW"], "every list shows");
-    app.world_mut()
-        .resource_mut::<TrainerOpen>()
-        .trigger_re_derive();
+    trigger(&mut app);
     assert_eq!(tick(&mut app), ["TRAINER_UPDATE"]);
     assert!(tick(&mut app).is_empty());
 }
@@ -2153,17 +2148,7 @@ fn an_item_record_a_getter_missed_runs_the_state_pass() {
         let mut services = vec![wire(100, trainer_spell_state::GREEN, 5, 1, 0)];
         services
             .extend((1..=4).map(|cost| wire(300 + cost, trainer_spell_state::GREEN, cost, 1, 0)));
-        app.world_mut().resource_mut::<TrainerOpen>().open(
-            TRAINER,
-            TRAINER_TYPE_TRADESKILL,
-            services,
-            String::new(),
-        );
-    };
-    let land = |app: &mut App| {
-        app.world_mut()
-            .resource_mut::<Items>()
-            .insert_template(777, Some(crate::items::test_template("Copper Shortsword")));
+        list(app, TRAINER, TRAINER_TYPE_TRADESKILL, services);
     };
 
     // No getter asked: the landing is silent and moves nothing.
@@ -2174,7 +2159,7 @@ fn an_item_record_a_getter_missed_runs_the_state_pass() {
     open(&mut app);
     assert_eq!(tick(&mut app), ["TRAINER_SHOW"]);
     let listed = costs(&mut app, 6);
-    land(&mut app);
+    land(&mut app, 777);
     assert!(tick(&mut app).is_empty(), "no callback, no pass");
     assert_eq!(costs(&mut app, 6), listed);
 
@@ -2186,12 +2171,9 @@ fn an_item_record_a_getter_missed_runs_the_state_pass() {
     open(&mut app);
     assert_eq!(tick(&mut app), ["TRAINER_SHOW"]);
     assert_eq!(costs(&mut app, 6), listed);
-    app.world_mut()
-        .non_send_resource_mut::<UiScript>()
-        .run("for i = 1, 6 do GetTrainerServiceIcon(i) end")
-        .unwrap();
+    run_getters(&mut app, "for i = 1, 6 do GetTrainerServiceIcon(i) end");
     assert!(tick(&mut app).is_empty(), "the record is still out");
-    land(&mut app);
+    land(&mut app, 777);
     assert_eq!(tick(&mut app), ["TRAINER_UPDATE"]);
     assert_ne!(
         costs(&mut app, 6),
@@ -2210,29 +2192,227 @@ fn the_state_pass_runs_once_per_trigger_and_per_callback() {
         icon_catalog(),
         benilla_formats::SkillLineCatalog::from_spell_lines([]),
     );
-    app.world_mut().resource_mut::<TrainerOpen>().open(
+    list(
+        &mut app,
         0x10,
         TRAINER_TYPE_TRADESKILL,
         vec![wire(100, trainer_spell_state::GREEN, 5, 1, 0)],
-        String::new(),
     );
     assert_eq!(tick(&mut app), ["TRAINER_SHOW"]);
-    {
-        let mut open = app.world_mut().resource_mut::<TrainerOpen>();
-        open.trigger_re_derive();
-        open.trigger_re_derive();
-    }
+    trigger(&mut app);
+    trigger(&mut app);
     assert_eq!(tick(&mut app), ["TRAINER_UPDATE", "TRAINER_UPDATE"]);
     assert!(tick(&mut app).is_empty());
 
-    app.world_mut()
-        .non_send_resource_mut::<UiScript>()
-        .run("for i = 1, 2 do GetTrainerServiceIcon(i) end GetTrainerServiceIcon(2)")
-        .unwrap();
+    run_getters(
+        &mut app,
+        "for i = 1, 2 do GetTrainerServiceIcon(i) end GetTrainerServiceIcon(2)",
+    );
     assert!(tick(&mut app).is_empty(), "the record is still out");
-    app.world_mut()
-        .resource_mut::<Items>()
-        .insert_template(777, Some(crate::items::test_template("Copper Shortsword")));
+    land(&mut app, 777);
     assert_eq!(tick(&mut app), ["TRAINER_UPDATE", "TRAINER_UPDATE"]);
     assert!(tick(&mut app).is_empty(), "the callbacks are spent");
+}
+
+/// A pet-learn row's pet is the unit `UNIT_FIELD_SUMMON` names (`0x4d7f2d`, mask 8 at
+/// `0x4d7f49`), its level its own (`0x4d7f99`); its book is the pet bar's only when the bar names
+/// that unit (`0x60c77a`-`0x60c790`). No such unit is no pet (`0x4d7f5a` → `0x4d803c`).
+#[test]
+fn a_pet_rows_pet_is_the_summon_not_the_bar() {
+    use benilla_protocol::messages::{PetActionEntry, PetSpells};
+    use benilla_protocol::ObjectFields;
+    const SUMMON: u64 = 0xF140_0000_0000_0001;
+    const POSSESSED: u64 = 0xF130_0000_0000_0002;
+    let unit = |level: u32| ObjectStore(ObjectFields::from_pairs(&[(2, 0x9), (34, level)]));
+    let (summon, possessed) = (unit(10), unit(30));
+    let store_of = |guid: u64| match guid {
+        SUMMON => Some(&summon),
+        POSSESSED => Some(&possessed),
+        _ => None,
+    };
+    let bar = |guid: u64| PetSpells {
+        pet_guid: guid,
+        spells: vec![PetActionEntry {
+            packed: (1 << 24) | 100,
+        }],
+        ..Default::default()
+    };
+    let view = |level: u32, known: &[u32]| reeval::PetView {
+        level,
+        known: known.iter().copied().collect(),
+    };
+    assert_eq!(
+        pet_view(Some(SUMMON), store_of, &bar(POSSESSED)),
+        Some(view(10, &[])),
+        "the summon, whose book the bar does not hold"
+    );
+    assert_eq!(
+        pet_view(Some(SUMMON), store_of, &bar(SUMMON)),
+        Some(view(10, &[100]))
+    );
+    assert_eq!(
+        pet_view(Some(SUMMON), store_of, &bar(0)),
+        Some(view(10, &[]))
+    );
+    assert_eq!(
+        pet_view(None, store_of, &bar(POSSESSED)),
+        None,
+        "a possessed unit's bar is no pet"
+    );
+    assert_eq!(
+        pet_view(Some(0xF140_0000_0000_0099), store_of, &bar(0)),
+        None
+    );
+}
+
+fn skill_slot(
+    skill_id: u16,
+    value: u16,
+    perm_bonus: i16,
+) -> benilla_protocol::messages::PlayerSkillSlot {
+    benilla_protocol::messages::PlayerSkillSlot {
+        skill_id,
+        step: 0,
+        value,
+        max: 300,
+        temp_bonus: 0,
+        perm_bonus,
+    }
+}
+
+/// `GetTrainerServiceSkillReq`'s flag (`0x4d9570`) compares the player's rank plus the permanent
+/// bonus, added only to a nonzero rank, with the required value: a row that is red for its level
+/// still reports the skill met, and an unmet skill shows on a green row. No player, no slot for
+/// the line, and an unknown line keep the default 1 or fail as the scan ends (`0x4d945a`,
+/// `0x4d9575`, `0x4d95bc`).
+#[test]
+fn skill_req_met_compares_the_players_skill_not_the_rows_colour() {
+    const ALCHEMY: u32 = 171;
+    let spells = empty_catalog();
+    let lines = SkillLineCatalog::from_spell_lines([]).with_line_names([(ALCHEMY, "Alchemy")]);
+    let met = |state: u8, skills: Option<&[benilla_protocol::messages::PlayerSkillSlot]>| {
+        let mut w = wire(2018, state, 100, 10, ALCHEMY);
+        w.req_skill_value = 50;
+        resolve_service_skilled(
+            &w,
+            TRAINER_TYPE_TRADESKILL,
+            &spells,
+            Some(&lines),
+            &BTreeSet::new(),
+            skills,
+        )
+        .skill_req
+        .map(|r| r.met)
+    };
+    let red = trainer_spell_state::RED;
+    let green = trainer_spell_state::GREEN;
+    assert_eq!(
+        met(red, Some(&[skill_slot(171, 50, 0)])),
+        Some(true),
+        "50 of 50, red for level"
+    );
+    assert_eq!(
+        met(green, Some(&[skill_slot(171, 40, 9)])),
+        Some(false),
+        "49 of 50"
+    );
+    assert_eq!(
+        met(green, Some(&[skill_slot(171, 40, 10)])),
+        Some(true),
+        "bonus counts"
+    );
+    assert_eq!(
+        met(green, Some(&[skill_slot(171, 0, 80)])),
+        Some(false),
+        "no bonus on rank 0"
+    );
+    assert_eq!(
+        met(green, Some(&[skill_slot(164, 300, 0)])),
+        Some(false),
+        "no slot for the line"
+    );
+    assert_eq!(met(red, None), None, "no player is the miss `nil, 0, 1`");
+    // A zero value and a line with no row are the miss too (`0x4d94a0`, `0x4d94c5`).
+    let skill_req = |req_skill: u32, value: u32| {
+        let mut w = wire(2018, green, 100, 10, req_skill);
+        w.req_skill_value = value;
+        resolve_service_skilled(
+            &w,
+            TRAINER_TYPE_TRADESKILL,
+            &spells,
+            Some(&lines),
+            &BTreeSet::new(),
+            Some(&[]),
+        )
+        .skill_req
+    };
+    assert_eq!(skill_req(ALCHEMY, 0), None, "a zero value");
+    assert_eq!(skill_req(0, 50), None, "a zero line");
+    assert_eq!(skill_req(999, 50), None, "a line with no row");
+    assert_eq!(
+        skill_req(ALCHEMY, 50).map(|r| r.name),
+        Some("Alchemy".into())
+    );
+}
+
+/// `GetTrainerServiceSkillLine` (`0x4d9160`) names the line of the ability row of the spell the
+/// first learn effect teaches (`0x4d91e6`), else of the sent spell, and falls on to the spell the
+/// record's third `EffectMiscValue` numbers (`0x4d9261`); nil without a player or a match. It is
+/// not the group's name, which at a tradeskill trainer is the learn header.
+#[test]
+fn skill_line_name_is_the_taught_spells_line_not_the_group() {
+    let learn = |taught: u32| SpellDisplay {
+        name: "Alchemy".into(),
+        effects: [SPELL_EFFECT_LEARN_SPELL, 0, 0],
+        effect_trigger_spell: [taught, 0, 0],
+        ..Default::default()
+    };
+    let spells = SpellCatalog::from_displays(HashMap::from([
+        (2018, learn(2259)),
+        (2019, learn(31337)),
+        (2259, taught_ability()),
+        (78, taught_ability()),
+        (
+            5000,
+            SpellDisplay {
+                effect_misc_value: [0, 0, 78],
+                ..taught_ability()
+            },
+        ),
+    ]));
+    let lines = SkillLineCatalog::from_spell_lines([(2259, 171), (78, 26)])
+        .with_line_names([(171, "Alchemy"), (26, "Arms")]);
+    let name = |spell: u32, trainer_type: u32, skills: Option<&[_]>| {
+        resolve_service_skilled(
+            &wire(spell, trainer_spell_state::GREEN, 100, 1, 0),
+            trainer_type,
+            &spells,
+            Some(&lines),
+            &BTreeSet::new(),
+            skills,
+        )
+        .skill_line
+    };
+    let player = Some(&[][..]);
+    assert_eq!(
+        name(2018, TRAINER_TYPE_TRADESKILL, player).as_deref(),
+        Some("Alchemy")
+    );
+    assert_eq!(name(2018, TRAINER_TYPE_TRADESKILL, None), None, "no player");
+    assert_eq!(
+        name(2019, 0, player),
+        None,
+        "a taught spell with no ability row"
+    );
+    assert_eq!(
+        name(78, 0, player).as_deref(),
+        Some("Arms"),
+        "the sent spell's own row"
+    );
+    assert_eq!(
+        name(5000, 0, player).as_deref(),
+        Some("Arms"),
+        "the third misc value's spell"
+    );
+    assert_eq!(name(31337, 0, player), None, "no record");
 }

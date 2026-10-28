@@ -243,6 +243,11 @@ impl ObjectFields {
     pub fn player_logging_out(&self) -> bool {
         self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x4 != 0
     }
+    /// `PLAYER_FIELD_BYTES` byte 0 bit `0x1` (vmangos `PLAYER_FIELD_BYTE_CONTROLLING_PET`): the
+    /// cast validator's tame rung refuses a no-active-pets spell with it `0x17` (`0x60a011`).
+    pub fn player_controlling_pet(&self) -> bool {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x1 != 0
+    }
     /// `PLAYER_QUEST_LOG_<slot+1>_*`: one quest-log slot, `quest_id == 0` when the server cleared
     /// it; the count-state and timer are written with the id (`Player.h:1094-1099`).
     pub fn player_quest_log(&self, slot: u8) -> Option<QuestLogSlot> {
@@ -384,11 +389,6 @@ impl ObjectFields {
     /// drained 1:1 while kills pay double (`GetXPRestBonus`), so the bar's rested span is twice it.
     pub fn player_rest_state_experience(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_REST_STATE_EXPERIENCE)
-    }
-    /// `PLAYER_BYTES_3` byte 0: the player's gender, 1 female, which `CGPlayer_C::GetGender`
-    /// (`0x5ed5b0`) reads for the active player in place of `UNIT_FIELD_BYTES_0` byte 2.
-    pub fn player_gender(&self) -> Option<u8> {
-        self.get_u32(FIELD_PLAYER_BYTES_3).map(|v| v as u8)
     }
     /// `PLAYER_BYTES_3` byte 1: drunkenness, the high byte of `drunk & 0xFFFE` in the low half
     /// (`SetDrunkValue`); the reference clamps it to 100 and scales by 0.01 (`0x5e2a90`).
@@ -547,6 +547,13 @@ impl ObjectFields {
     pub fn player_lifetime_dishonorable_kills(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_FIELD_LIFETIME_DISHONORABLE_KILLS)
     }
+    /// `PLAYER_FIELD_BYTES2` byte 1: the auras the player can see, bit `n - 1` for a spell whose
+    /// `RequiredAuraVision` is `n` (`0x5198b0`); vmangos sets bit 0 for Detect Amore
+    /// (`PLAYER_FIELD_BYTE2_DETECT_AMORE`, `Player.h:388`). 0 when the field is absent.
+    pub fn player_aura_vision(&self) -> u8 {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES2)
+            .map_or(0, |b| (b >> 8) as u8)
+    }
     /// `PLAYER_FIELD_BYTES2` byte 0 (private): progress through the current rank, 0-255
     /// (`HonorMgr.cpp:905-909`); a negative rank's `-255` scale wraps in the `uint8` cast.
     pub fn player_honor_rank_bar(&self) -> Option<u8> {
@@ -561,7 +568,11 @@ impl ObjectFields {
     pub fn unit_class(&self) -> Option<u8> {
         self.unit_bytes_0().map(|b| ((b >> 8) & 0xff) as u8)
     }
-    /// `UNIT_FIELD_BYTES_0` byte 2: gender.
+    /// `UNIT_FIELD_BYTES_0` byte 2: gender, 1 female.
+    ///
+    /// Deviation: the active player's gender is this byte too, where `CGPlayer_C::GetGender`
+    /// (`0x5ed5b0`) reads `PLAYER_BYTES_3` byte 0 whole, because that byte also carries the drunk
+    /// bits (`gender | drunk & 0xFFFE` on vmangos), so a drunk female reads as male.
     pub fn unit_gender(&self) -> Option<u8> {
         self.unit_bytes_0().map(|b| ((b >> 16) & 0xff) as u8)
     }

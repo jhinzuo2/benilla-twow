@@ -174,11 +174,15 @@ pub(crate) fn cancel_move_action_on_ui_shutdown(
     follow.stop()
 }
 
-pub(crate) fn can_auto_interact(enabled: bool, me: Option<&ObjectStore>, player: &Player) -> bool {
+pub(crate) fn can_auto_interact(
+    enabled: bool,
+    me: Option<&ObjectStore>,
+    lock: &super::MoverLock,
+) -> bool {
     enabled
         && me.is_some_and(|s| s.0.unit_health().unwrap_or(0) > 0)
-        && player.foreign_mover.is_none()
-        && !player.control_lost
+        && lock.foreign_mover.is_none()
+        && !lock.control_lost
 }
 
 /// The start: the gates (`0x60fed0`, `0x610300`, `CanAutoInteract` for the rest) and the arm
@@ -188,6 +192,7 @@ pub(crate) struct AutoMove<'w, 's> {
     pub(crate) approach: ResMut<'w, Approach>,
     follow: ResMut<'w, FollowState>,
     player: Res<'w, Player>,
+    lock: Res<'w, super::MoverLock>,
     me: Query<'w, 's, (&'static Guid, &'static ObjectStore), With<SelfPlayer>>,
     transports: Query<'w, 's, &'static Transform>,
 }
@@ -197,7 +202,7 @@ impl AutoMove<'_, '_> {
         can_auto_interact(
             self.approach.enabled,
             self.me.single().ok().map(|(_, s)| s),
-            &self.player,
+            &self.lock,
         )
     }
 
@@ -223,8 +228,8 @@ impl AutoMove<'_, '_> {
         };
         if !admitted
             || guid == me.0
-            || self.player.foreign_mover.is_some()
-            || self.player.control_lost
+            || self.lock.foreign_mover.is_some()
+            || self.lock.control_lost
             || store.0.unit_health().unwrap_or(0) == 0
         {
             return Err(Refused::Silent);
@@ -343,7 +348,10 @@ impl AutoMove<'_, '_> {
             pitch: None,
         });
         if !standing {
-            stand.write(super::StandStateRequest { state: 0 });
+            stand.write(super::StandStateRequest {
+                state: 0,
+                sent: false,
+            });
         }
         Ok(())
     }
@@ -635,6 +643,7 @@ mod tests {
             .init_resource::<Approach>()
             .init_resource::<FollowState>()
             .init_resource::<Player>()
+            .init_resource::<super::super::MoverLock>()
             .init_resource::<GuidIndex>()
             .init_resource::<ButtonInput<MouseButton>>()
             .init_resource::<crate::bindings::BindingsState>()
@@ -825,6 +834,8 @@ mod tests {
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .press(MouseButton::Forward);
+        // Autorun's on press, which the command press toggled ahead of this (`super::press`).
+        app.world_mut().resource_mut::<Player>().autorun = true;
         frame(&mut app, true);
         let approach = app.world().resource::<Approach>();
         assert!(!approach.active() && approach.arrived.is_none());
@@ -956,6 +967,7 @@ mod tests {
             guid: 0xB0A7,
             local_pos: Vec3::ZERO,
             boat_yaw: 0.0,
+            placed: true,
         });
         let point = Vec3::new(0.0, 0.0, -10.0);
         assert!(app
@@ -1040,6 +1052,7 @@ mod tests {
             guid: 0xB0A7,
             local_pos: Vec3::ZERO,
             boat_yaw: 0.0,
+            placed: true,
         });
         let point = Vec3::new(0.0, 0.0, -10.0);
         assert!(app

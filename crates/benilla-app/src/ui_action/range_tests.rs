@@ -31,14 +31,15 @@ fn range_answers(
 ) -> (bool, Option<i64>) {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
-    actions.buttons.insert(button.slot, button);
+    let mut slots = crate::ui_action::ActionSlots::default();
+    slots.buttons.insert(button.slot, button);
     let bolt = SpellDisplay {
         range_index: BOLT_RANGE,
         effect_implicit_target_a: [6, 0, 0],
         ..Default::default()
     };
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .insert_resource(crate::ui_macro::MacroBoundSpells::default())
         .insert_resource(Spells {
             catalog: benilla_formats::SpellCatalog::from_displays(
@@ -59,7 +60,6 @@ fn range_answers(
         .init_resource::<crate::creature_anim::UnitEdits>()
         .add_message::<crate::player::StandStateRequest>()
         .add_message::<crate::net::FieldChanged>()
-        .add_message::<crate::net::WorldEnterCascadeMessage>()
         .init_resource::<crate::item_lane::ItemLane>()
         .insert_resource(crate::net::SelfGuid(Some(ME)))
         .init_resource::<crate::spell::AutoSelfCast>()

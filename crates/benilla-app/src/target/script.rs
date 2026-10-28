@@ -27,6 +27,9 @@ pub(crate) struct ScriptSelect<'w, 's> {
     scan: scan::TargetScan<'w, 's>,
     history: ResMut<'w, scan::TabHistory>,
     time: Res<'w, Time>,
+    /// The deselects a call's own steps owe, its loot close's (`0x48f369`), run inside it; absent
+    /// in a harness without targets.
+    owed: Option<ResMut<'w, scan::OwedSelects>>,
 }
 
 impl ScriptSelect<'_, '_> {
@@ -106,7 +109,6 @@ impl ScriptSelect<'_, '_> {
         mode: benilla_ui::script::NearestMode,
         reverse: bool,
     ) -> SelectDebt {
-        let engaged = self.commit.engaged();
         let now = self.time.elapsed_secs_f64();
         let (scan, history) = (&self.scan, &mut self.history);
         self.commit.owing(|commit| {
@@ -119,7 +121,6 @@ impl ScriptSelect<'_, '_> {
                 &mut commit.selection,
                 &mut commit.seam,
                 &mut commit.front,
-                engaged,
             );
             commit.owe_all(owed);
         })
@@ -156,6 +157,24 @@ impl ScriptSelect<'_, '_> {
     #[cfg(test)]
     pub(crate) fn pay_now(&mut self, debt: SelectDebt) {
         self.commit.pay_now(debt);
+    }
+
+    /// StartAttack (`0x5ecb70`) at `guid` from an engine writer, its own select (`0x5eccaa`)
+    /// owing the swing past its signals ([`SelectCommit::start_attack`]).
+    pub(crate) fn start_attack(&mut self, guid: u64) -> SelectDebt {
+        self.commit.owing(|commit| commit.start_attack(guid))
+    }
+
+    /// Where the selects a call owes begin, for [`Self::owed_deselect`].
+    pub(crate) fn owed_mark(&self) -> usize {
+        self.owed.as_deref().map_or(0, scan::OwedSelects::mark)
+    }
+
+    /// The next deselect the call owed since `from` (`0x493910(guid, 1)`), torn down now and
+    /// owing what its signals owe, for the call to signal before it returns.
+    pub(crate) fn owed_deselect(&mut self, from: usize) -> Option<SelectDebt> {
+        let guid = self.owed.as_deref_mut()?.take_deselect(from)?;
+        Some(self.commit.owing(|commit| commit.tear_down(guid)))
     }
 
     /// `ClearTarget()` (`0x489ff0`): deselect whatever the calls before it left selected.
@@ -461,9 +480,6 @@ mod tests {
                 None,
                 Some(ME),
             );
-        let mut bar = crate::ui_pet::PetBar::default();
-        bar.spells.pet_guid = PET;
-        world.insert_resource(bar);
 
         let run = |world: &mut World, lua: &str| {
             world

@@ -7,7 +7,7 @@
 //! attackers first without pinning TAB to them.
 //!
 //! Kept from 1.12: the validity filters (`0x493e40`, `CanAttack 0x606980`, critters), the
-//! [`commit`] through `SetSelection` (`0x493540`), the attack acquire (`0x612df0` at `0x6130b5`),
+//! [`commit_owing`] through `SetSelection` (`0x493540`), the attack acquire (`0x612df0` at `0x6130b5`),
 //! the ATTACKERSTATEUPDATE and spell start acquires (`0x6259c9`–`0x6259fe`, `0x6e7963`-`0x6e799c`)
 //! and the 41 yd range.
 
@@ -16,7 +16,7 @@ use benilla_protocol::{guid, EntityKind};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use crate::creature_anim::{Engaged, StartTarget, SwingMessage};
+use crate::creature_anim::StartTarget;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, Guid, GuidIndex, NetEntity, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
@@ -262,10 +262,11 @@ impl TargetScan<'_, '_> {
                 .group
                 .as_ref()
                 .is_some_and(|g| g.party_slots().any(|m| m.guid == guid)),
-            ScanSide::Raid => self.group.as_ref().is_some_and(|g| {
-                g.party_slots().any(|m| m.guid == guid)
-                    || (g.group_type == 1 && g.members.iter().any(|m| m.guid == guid))
-            }),
+            // A party slot or a stored raid row (`0x4918e0` past its own test).
+            ScanSide::Raid => self
+                .group
+                .as_ref()
+                .is_some_and(|g| g.party_or_raid_member(guid)),
         }
     }
 
@@ -365,8 +366,9 @@ impl TargetScan<'_, '_> {
                     }
                 }
             }
-            // Deviation: no scene-attach gate (the reference's `0x6704c0`), because the draw
-            // election hides every body outside the frustum, which would empty the off-screen tier.
+            // Deviation: no drawn gate (the reference's IsEntityDrawn, `0x6704c0`), because the
+            // draw election hides every body outside the frustum, which would empty the off-screen
+            // tier.
             let dist = (tf.translation - self_tf.translation).length();
             if dist > TAB_RANGE {
                 trace_unit(guid_c.0, tf, "REJECT range (41 yd)");
@@ -443,7 +445,7 @@ impl TabHistory {
     }
 }
 
-/// What one [`commit`] did; `swung` means it ran the re-swing (`0x4938c8`), so a caller must not ask
+/// What one [`commit_owing`] did; `swung` means it ran the re-swing (`0x4938c8`), so a caller must not ask
 /// again. StartAttack's own gate may have refused it ([`crate::creature_anim::StartGate`]), and the
 /// caller's would refuse alike: `swung` says it was asked, not that `CMSG_ATTACKSWING` went out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -466,14 +468,18 @@ pub(crate) enum OwedSend {
 }
 
 impl OwedSend {
-    /// The store and the light (`0x4936e2`, `0x493701`), over whatever a listener selected, and
-    /// the send.
+    /// The store and the light (`0x4936e2`, `0x493701`), over whatever a listener selected, the
+    /// lit unit's tutorial ladder (`0x493789`-`0x49383c`, [`crate::tutorial::select_tutorial`]),
+    /// and the send.
     pub(crate) fn pay(self, selection: &mut Selection, seam: &crate::creature_anim::AttackSeam) {
         let guid = match self {
             OwedSend::Select { entity, guid } => {
                 selection.target = entity;
                 selection.guid = Some(guid);
                 selection.lit = entity;
+                if let (Some(entity), Some(tutorials)) = (entity, seam.slots.tutorials()) {
+                    tutorials.selected(entity, guid);
+                }
                 guid
             }
             // The clear's send reads the selection as it stands (`0x493a49`-`0x493a4f`): a
@@ -495,7 +501,8 @@ pub(crate) struct Owed {
 }
 
 impl Owed {
-    /// Pay both now, for a writer whose signals have no listeners to run first.
+    /// Pay both now, for a test whose signals have no listeners to run first.
+    #[cfg(test)]
     pub(crate) fn pay(
         self,
         selection: &mut Selection,
@@ -520,7 +527,6 @@ pub(crate) struct OwedSwing {
     guid: u64,
     /// What `StartAttack`'s target checks find of it (`0x5ecbe6`-`0x5ecc35`).
     verdict: StartTarget,
-    engaged: bool,
     self_guid: Option<u64>,
 }
 
@@ -543,7 +549,7 @@ impl OwedSwing {
             return;
         }
         let verdict = if guid == self.guid { self.verdict } else { now };
-        seam.start(guid, self.engaged, verdict);
+        seam.start(guid, verdict);
     }
 }
 
@@ -554,40 +560,11 @@ impl OwedSwing {
 /// (`0x4938a1`, `0x5ecc48`).
 /// `entity` is the guid's object, which the select lights (`0x493701`); with none the guid is
 /// stored all the same (`0x4935c8` → `0x493605`), and neither `IsSelectable` nor the light runs.
-/// For a writer whose signal has no listeners to run first, the re-swing goes out here.
-/// `old_latches` is [`latches_on`] the selection as it stands. `engaged` is [`Engaged`], which
-/// only the server's `SMSG_ATTACKSTART` echo sets: a round trip behind the reference's lock,
-/// which StartAttack's send sets locally (`[+0xc48]`, `[+0xc50]` = 1, `0x5ecd51` → `0x47bf70`),
-/// so after a swing starts the latch reads it late. The reference clears it at the stop's echo
-/// (`0x624e40`).
-pub(super) fn commit(
-    selection: &mut Selection,
-    seam: &mut crate::creature_anim::AttackSeam,
-    entity: Option<Entity>,
-    guid: u64,
-    target_store: Option<&ObjectStore>,
-    engaged: bool,
-    self_guid: Option<u64>,
-    new_attackable: bool,
-    old_latches: bool,
-) -> CommitOutcome {
-    let (out, owed) = commit_owing(
-        selection,
-        seam,
-        entity,
-        guid,
-        target_store,
-        engaged,
-        self_guid,
-        new_attackable,
-        old_latches,
-    );
-    owed.pay(selection, seam);
-    out
-}
-
-/// [`commit`], owing what follows its signals ([`Owed`]), for a caller that runs their listeners
-/// in place before paying it. `old_latches` is [`latches_on`] the selection as it stands, which a
+/// Whether we are attacking is [`crate::creature_anim::Engaged`] as the queued unit edits leave it
+/// ([`crate::creature_anim::AttackSeam::engaged`]), which StartAttack's send sets locally
+/// (`[+0xc48]`, `[+0xc50]` = 1, `0x5ecd51` → `0x47bf70`) and the stop's echo clears (`0x624e40`).
+/// It owes what follows its signals ([`Owed`]), for a caller that runs their listeners in place
+/// before paying it. `old_latches` is [`latches_on`] the selection as it stands, which a
 /// selection made at another's signal finds to be that one's pick.
 pub(super) fn commit_owing(
     selection: &mut Selection,
@@ -595,7 +572,6 @@ pub(super) fn commit_owing(
     entity: Option<Entity>,
     guid: u64,
     target_store: Option<&ObjectStore>,
-    engaged: bool,
     self_guid: Option<u64>,
     new_attackable: bool,
     old_latches: bool,
@@ -620,10 +596,11 @@ pub(super) fn commit_owing(
         // The old target's teardown (`0x4936cc` → `0x493910`) closes its loot first.
         seam.close_loot_on(old);
     }
-    let stop_and_repoint = engaged && had_old;
+    // The latch's `0x60ecb0` leg, read before the store (`0x49367d`).
+    let stop_and_repoint = seam.engaged() && had_old;
     if stop_and_repoint {
         // `0x493a08`: the real StopAttack, which also un-queues a next-swing strike (`0x6e6f30`).
-        seam.stop(engaged);
+        seam.stop();
     }
     // `0x493a0f`-`0x493a18`: the release calls a possessed unit off after its StopAttack, with the
     // pair zeroed (`0x4939d3`); the store and the send wait for its signal's listeners.
@@ -650,7 +627,6 @@ pub(super) fn commit_owing(
             (Some(_), true) => StartTarget::Attackable,
             (Some(_), false) => StartTarget::Refused,
         },
-        engaged,
         self_guid,
     });
     (
@@ -660,6 +636,32 @@ pub(super) fn commit_owing(
         },
         Owed { send, swing },
     )
+}
+
+/// [`commit_owing`] paid at once, for a test whose signals have no listeners to run first.
+#[cfg(test)]
+pub(super) fn commit(
+    selection: &mut Selection,
+    seam: &mut crate::creature_anim::AttackSeam,
+    entity: Option<Entity>,
+    guid: u64,
+    target_store: Option<&ObjectStore>,
+    self_guid: Option<u64>,
+    new_attackable: bool,
+    old_latches: bool,
+) -> CommitOutcome {
+    let (out, owed) = commit_owing(
+        selection,
+        seam,
+        entity,
+        guid,
+        target_store,
+        self_guid,
+        new_attackable,
+        old_latches,
+    );
+    owed.pay(selection, seam);
+    out
 }
 
 /// One press on either side, as every `TargetNearest*` shim shares `0x493f60`: score the live
@@ -674,7 +676,6 @@ pub(super) fn cycle(
     selection: &mut Selection,
     seam: &mut crate::creature_anim::AttackSeam,
     front: &mut super::front::SelectFront,
-    engaged: bool,
 ) -> Owed {
     history.enter(side);
     history.prune(now);
@@ -745,7 +746,6 @@ pub(super) fn cycle(
         Some(entity),
         guid,
         scan.store_at(entity),
-        engaged,
         // `IsSelectable`'s `CREATEDBY` clause reads it.
         scan.self_guid(),
         // `Attack 0x5ecb70`'s validation, which a mode-2 pick fails (reaction >= 4 against
@@ -776,24 +776,17 @@ pub(super) fn cycle(
 
 /// The target half of the attack validator `0x612df0` (`0x61305d`–`0x613198`), shared by the
 /// player's Attack (`0x6131aa`) and the pet bar's (`0x4bd40d`): what it reads beyond the
-/// selection, the cycler it runs as `TargetNearestEnemy` (`0x6130b5`, `0x493f60(0, 1)`), and
-/// whether we are swinging, which that cycle's selection switch reads.
+/// selection and the cycler it runs as `TargetNearestEnemy` (`0x6130b5`, `0x493f60(0, 1)`).
 #[derive(SystemParam)]
 pub(crate) struct AttackPick<'w, 's> {
     scan: TargetScan<'w, 's>,
     history: ResMut<'w, TabHistory>,
     time: Res<'w, Time>,
-    engaged: Query<'w, 's, (), (With<Engaged>, With<SelfPlayer>)>,
     /// The `SelectTarget` returns ahead of the validator's two selecting calls.
     front: super::front::SelectFront<'w, 's>,
 }
 
 impl AttackPick<'_, '_> {
-    /// Whether we are attacking (`0x60ecb0`), as the server last echoed it.
-    pub(crate) fn engaged(&self) -> bool {
-        !self.engaged.is_empty()
-    }
-
     /// Our own descriptor and guid, the actor of the player's Attack.
     pub(crate) fn player(&self) -> (Option<&ObjectStore>, Option<u64>) {
         (self.scan.self_store(), self.scan.self_guid())
@@ -831,7 +824,6 @@ impl AttackPick<'_, '_> {
                 self.front.takes(entity, guid, seam.slots.targeting());
             }
         } else if may_pick {
-            let engaged = self.engaged();
             return cycle(
                 ScanSide::Enemy,
                 false,
@@ -841,7 +833,6 @@ impl AttackPick<'_, '_> {
                 selection,
                 seam,
                 &mut self.front,
-                engaged,
             );
         }
         Owed::default()
@@ -902,7 +893,7 @@ impl AttackPick<'_, '_> {
 /// The re-swing latch's legs on the outgoing selection `old` (`0x49365f`-`0x4936a3`), read before
 /// the new guid is stored: it resolves as a unit (`0x468460`, typemask 8), it has health or dynamic
 /// flag 0x20 (`0x49368d`-`0x4936a0`), and `CanAttack` (`0x606980`) allows it. The player's own legs
-/// (`0x60ecb0`, `0x605f30`, `0x49367d`) are [`commit_owing`]'s `engaged`.
+/// (`0x60ecb0`, `0x605f30`, `0x49367d`) are [`commit_owing`]'s.
 pub(super) fn latches_on(relations: &RelationWorld, old: Option<u64>) -> bool {
     old.and_then(|guid| relations.unit_and_store(guid))
         .is_some_and(|(unit, store)| {
@@ -936,8 +927,9 @@ pub(crate) struct LastEnemy(pub(crate) Option<u64>);
 
 /// Stamp [`LastEnemy`] behind the five-conjunct gate `0x49372f`–`0x493778`, on the object
 /// `SetSelection` found and lit (`0x4936f3`-`0x493701`, [`Selection::lit`]): one that streams in
-/// later under the selected guid was never selected, so it is never stamped. Runs before the death
-/// handler's deselect (`super::died`): a hostile that dies while selected stays remembered.
+/// later under the selected guid was never selected, so it is never stamped. A hostile selected
+/// alive was stamped the frame it was selected, so its death's deselect (`super::died`, in a later
+/// frame's packet) leaves it remembered.
 ///
 /// Deviation: sampled each frame, not stamped in `SetSelection`, so every selection writer is
 /// covered; a selected unit that turns hostile is remembered, where the reference's is not.
@@ -975,89 +967,261 @@ pub(super) fn remember_last_enemy(
     }
 }
 
-/// What asked [`auto_acquire`] for a unit.
+/// What asked for a unit's select inside its packet ([`OwedSelect::Acquire`]).
 #[derive(Clone, Copy, Debug)]
-enum Acquire {
+pub(crate) enum Acquire {
     /// A swing at us (`SMSG_ATTACKERSTATEUPDATE`).
     Attacker,
     /// A spell start aimed at us (`SMSG_SPELL_START`).
     Caster,
 }
 
-/// The two packet acquires, in packet order by their [`crate::creature_anim::PlaySeq`] stamps:
-/// - the ATTACKERSTATEUPDATE self-defence acquire (`0x6259c9`–`0x6259fe`): when we are the victim
-///   and hold no selection, select the attacker, with no counter-attack;
-/// - the spell start's (`0x6e7963`-`0x6e799c`): another unit casting at us, which
-///   [`crate::spell::net::CastAtPlayer`] names, is selected when the active player's object is
-///   held (`0x6e796a`), the caster cannot assist it (`CanAssist 0x6066f0` at `0x6e7973`) and
-///   nothing is selected (`[0xb4e2d8]`, `0x6e7980`). The caster is looked up as a unit
-///   (`0x468460` with mask 8, `0x6e7892`).
-///
-/// Each is `SelectTarget` (`0x6259fe`, `0x6e799c`), whose front may bind the unit to a standing
-/// cursor's cast instead; a packet handler runs in no script, whose gate context passes tag 2.
-pub(super) fn auto_acquire(
-    mut swings: MessageReader<SwingMessage>,
-    mut casts: MessageReader<crate::spell::net::CastAtPlayer>,
-    self_player: Query<(Entity, &Guid), With<SelfPlayer>>,
-    guids: Query<&Guid>,
-    // For `IsSelectable`: a `NOT_SELECTABLE` attacker is not acquired.
-    stores: Query<&ObjectStore>,
-    relations: RelationWorld,
-    mut selection: ResMut<Selection>,
-    mut seam: crate::creature_anim::AttackSeam,
-    mut front: super::front::SelectFront,
-) {
-    let Ok((me, my_guid)) = self_player.single() else {
+/// A `SetSelection` a packet's handler owes, at its place in the handler, for the packet's end to
+/// run with the VM held ([`run_owed_selects`]).
+pub(crate) enum OwedSelect {
+    /// The two packet acquires, each `SelectTarget` (`0x6259fe`, `0x6e799c`) as its handler's
+    /// last act on the unit it names:
+    /// - the ATTACKERSTATEUPDATE self-defence acquire (`0x6259c9`–`0x6259fe`): when we are the
+    ///   victim and hold no selection, select the attacker, with no counter-attack;
+    /// - the spell start's (`0x6e7963`-`0x6e799c`): another unit casting at us is selected when
+    ///   the active player's object is held (`0x6e796a`), the caster cannot assist it
+    ///   (`CanAssist 0x6066f0` at `0x6e7973`) and nothing is selected (`[0xb4e2d8]`, `0x6e7980`).
+    ///
+    /// `SelectTarget`'s front may bind the unit to a standing cursor's cast instead; a packet
+    /// handler runs in no script, whose gate context passes tag 2.
+    Acquire(Entity, Acquire),
+    /// The signals of a select its handler committed in place, as it went on: the loot
+    /// response's (`0x48f3a0`).
+    Signals(crate::script_calls::EngineSelect),
+    /// `DeselectGuid` (`0x493910(guid, 1)`), nothing unless `guid` is still the selection
+    /// (`0x493949`), which signals inside itself (`0x493a69`, `0x493a73`) and leaves the
+    /// last-target pair: a dead unit's loot close (`0x48f369`), an old pet's teardown (`0x5e26f7`),
+    /// a group list's or ending's, a release's ([`super::release`]). A handler's runs at its packet's end, a system's or a lane's on
+    /// this queue's lane at its place, a call's inside the call
+    /// ([`crate::script_calls::ScriptCallHost`]).
+    Deselect(u64),
+}
+
+/// The selects the packet's handlers owe, each at its place among what they queued.
+#[derive(Resource, Default)]
+pub(crate) struct OwedSelects(Vec<(crate::lanes::Stamp, OwedSelect)>);
+
+impl OwedSelects {
+    /// Owe `select` here, behind what the handler queued before it.
+    pub(crate) fn push(&mut self, select: OwedSelect) {
+        self.0.push((crate::lanes::stamp(), select));
+    }
+
+    /// Owe the teardown of `guid`'s selection ([`OwedSelect::Deselect`]).
+    pub(crate) fn deselect(&mut self, guid: u64) {
+        self.push(OwedSelect::Deselect(guid));
+    }
+
+    /// Where a call's owed selects begin, for [`Self::take_deselect`].
+    pub(crate) fn mark(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The first deselect owed at `from` or after, taken.
+    pub(crate) fn take_deselect(&mut self, from: usize) -> Option<u64> {
+        let at = (from..self.0.len()).find(|&i| matches!(self.0[i].1, OwedSelect::Deselect(_)))?;
+        match self.0.remove(at).1 {
+            OwedSelect::Deselect(guid) => Some(guid),
+            _ => None,
+        }
+    }
+
+    /// The units the owed acquires name, taken, for a test of a handler that owes them.
+    #[cfg(test)]
+    pub(crate) fn take_acquires(&mut self) -> Vec<Entity> {
+        std::mem::take(&mut self.0)
+            .into_iter()
+            .filter_map(|(_, s)| match s {
+                OwedSelect::Acquire(unit, _) => Some(unit),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// The guids of the deselects owed and not yet run, taken, for a test of a writer that owes them.
+#[cfg(test)]
+pub(crate) fn take_owed_deselects(world: &mut World) -> Vec<u64> {
+    let mut owed = world.get_resource_or_init::<OwedSelects>();
+    std::iter::from_fn(|| owed.take_deselect(0)).collect()
+}
+
+/// The owed selects' lane's head: what a system or a lane owed, as a packet's end runs its
+/// handlers' ([`run_owed_selects`]).
+pub(super) fn peek_owed_selects(world: &World) -> Option<crate::lanes::Stamp> {
+    world
+        .get_resource::<OwedSelects>()?
+        .0
+        .first()
+        .map(|(at, _)| *at)
+}
+
+/// Each owed select `until` admits, run as the firing of its stamp with the host lent, signalling
+/// in place; the lane stops after one whose firing stamped anything, so what it pushed fires next.
+pub(super) fn fire_owed_selects(In(until): In<crate::lanes::Until>, world: &mut World) {
+    loop {
+        let Some(owed) = world.get_resource_mut::<OwedSelects>() else {
+            return;
+        };
+        if !owed.0.first().is_some_and(|(at, _)| until.admits(*at)) {
+            return;
+        }
+        let (at, select) = owed.into_inner().0.remove(0);
+        let ((), moved) = crate::lanes::firing(at, || run_owed_select(world, select));
+        if moved {
+            return;
+        }
+    }
+}
+
+/// The owed selects' lane fired whole, for a test that drives a writer without the lanes.
+#[cfg(test)]
+pub(crate) fn fire_owed_selects_lane(world: &mut World) {
+    while peek_owed_selects(world).is_some() {
+        fire_owed_selects(In(crate::lanes::Until::all()), world);
+    }
+}
+
+/// One owed select on the world, its unit edits applied as it returns.
+fn run_owed_select(world: &mut World, select: OwedSelect) {
+    if let Err(err) = world.run_system_cached_with(owed_select, select) {
+        // A harness without the selection's seams selects nothing.
+        debug!("target: an owed select did not run: {err}");
+    }
+    crate::creature_anim::apply_unit_edits(world);
+}
+
+/// The packet's owed selects, after its handlers, each run as the firing of its stamp with the
+/// world's VM held, so its sends go out in the packet and what it signals is parked on the release
+/// lane at its place ([`super::release::park_signals`]): the reference signals inside the packet
+/// (`0x49389c`, `0x493a73`).
+pub(super) fn run_owed_selects(world: &mut World, _: crate::lanes::Stamp) {
+    let Some(mut owed) = world.get_resource_mut::<OwedSelects>() else {
         return;
     };
-    let mut asks: Vec<(u64, Entity, Acquire)> = swings
-        .read()
-        .filter(|s| s.victim == Some(me))
-        .map(|s| (s.seq, s.attacker, Acquire::Attacker))
-        .chain(casts.read().map(|c| (c.seq, c.caster, Acquire::Caster)))
-        .collect();
-    asks.sort_by_key(|&(seq, ..)| seq);
-    for (_, unit, why) in asks {
-        let Ok(guid) = guids.get(unit) else {
-            continue;
-        };
-        let guid = guid.0;
+    for (at, select) in std::mem::take(&mut owed.0) {
+        crate::lanes::firing(at, || {
+            super::release::park_signals(world, |world| {
+                if let Err(err) = world.run_system_cached_with(owed_select, select) {
+                    // A harness without the selection's seams selects nothing.
+                    debug!("target: an owed select did not run: {err}");
+                }
+            });
+        });
+    }
+}
+
+/// Owe `why`'s select of `unit`, as a handler does, for [`run_owed_selects`] to run.
+#[cfg(test)]
+pub(super) fn owe_acquire(world: &mut World, unit: Entity, why: Acquire) {
+    world
+        .get_resource_or_init::<OwedSelects>()
+        .push(OwedSelect::Acquire(unit, why));
+}
+
+/// [`run_owed_selects`] as a packet's end runs it, for a test of a handler that owes selects.
+#[cfg(test)]
+pub(super) fn run_owed_selects_now(world: &mut World) {
+    run_owed_selects(world, crate::lanes::stamp());
+}
+
+/// One owed select: an acquire's commit and its signals, or a committed select's signals, each
+/// signalling in place ([`crate::script_calls::ScriptCallHost::engine_select`]).
+pub(super) fn owed_select(
+    In(owed): In<OwedSelect>,
+    mut vm: crate::script_calls::VmWith<AcquireSelect<'static, 'static>>,
+) {
+    let select = match owed {
+        OwedSelect::Acquire(unit, why) => {
+            let mut c = vm.own();
+            let Some(my_guid) = c.self_player.single().ok().map(|(_, g)| g.0) else {
+                return;
+            };
+            c.select(unit, why, my_guid)
+        }
+        OwedSelect::Signals(select) => Some(select),
+        OwedSelect::Deselect(guid) => {
+            let mut c = vm.own();
+            if c.selection.guid != Some(guid) {
+                return;
+            }
+            let before = super::click::Standing::of(&c.selection, &c.seam);
+            let send = super::click::clear_owing(&mut c.selection, &mut c.seam);
+            Some(before.owing(Owed { send, swing: None }))
+        }
+    };
+    if let Some(select) = select {
+        vm.engine_select(select, |mut c, owed| {
+            owed.pay(&mut c.selection, &mut c.seam);
+        });
+    }
+}
+
+/// What an owed select reads and writes ([`owed_select`]).
+#[derive(SystemParam)]
+pub(super) struct AcquireSelect<'w, 's> {
+    self_player: Query<'w, 's, (Entity, &'static Guid), With<SelfPlayer>>,
+    guids: Query<'w, 's, &'static Guid>,
+    // For `IsSelectable`: a `NOT_SELECTABLE` attacker is not acquired.
+    stores: Query<'w, 's, &'static ObjectStore>,
+    relations: RelationWorld<'w, 's>,
+    selection: ResMut<'w, Selection>,
+    seam: crate::creature_anim::AttackSeam<'w, 's>,
+    front: super::front::SelectFront<'w, 's>,
+}
+
+impl AcquireSelect<'_, '_> {
+    /// One ask's select of `unit`, owing what follows its signals, or `None` when it selects
+    /// nothing.
+    fn select(
+        &mut self,
+        unit: Entity,
+        why: Acquire,
+        my_guid: u64,
+    ) -> Option<crate::script_calls::EngineSelect> {
+        let guid = self.guids.get(unit).ok()?.0;
         match why {
             Acquire::Attacker => {
                 // `0x6259e6` tests the selected guid, so a party member selected out of range
                 // keeps the selection.
-                if selection.guid.is_some() {
-                    continue;
+                if self.selection.guid.is_some() {
+                    return None;
                 }
                 debug!("auto-target: attacker {guid:#x} (victim = me, no target)");
             }
             Acquire::Caster => {
-                let rel = relations.get();
-                let assists = match (relations.unit(guid), relations.me()) {
+                let rel = self.relations.get();
+                let assists = match (self.relations.unit(guid), self.relations.me()) {
                     (Some(caster), Some(player)) => rel.can_assist(&caster, &player),
-                    _ => continue,
+                    _ => return None,
                 };
-                if assists || selection.guid.is_some() {
-                    continue;
+                if assists || self.selection.guid.is_some() {
+                    return None;
                 }
                 debug!("auto-target: caster {guid:#x} (casting at me, no target)");
             }
         }
-        if front.takes(unit, guid, seam.slots.targeting()) {
-            continue;
+        if self.front.takes(unit, guid, self.seam.slots.targeting()) {
+            return None;
         }
+        let before = super::click::Standing::of(&self.selection, &self.seam);
         // The selection was empty, so no switch law: selection only.
-        commit(
-            &mut selection,
-            &mut seam,
+        let (_, owed) = commit_owing(
+            &mut self.selection,
+            &mut self.seam,
             Some(unit),
             guid,
-            stores.get(unit).ok(),
-            false,
-            Some(my_guid.0),
+            self.stores.get(unit).ok(),
+            Some(my_guid),
             false,
             false,
         );
+        Some(before.owing(owed))
     }
 }
 
@@ -1089,6 +1253,7 @@ mod tests {
         attackable: bool,
     ) -> CommitOutcome {
         use bevy::ecs::system::RunSystemOnce;
+        engage(world, engaged);
         world
             .run_system_once(
                 move |mut selection: ResMut<Selection>,
@@ -1099,7 +1264,6 @@ mod tests {
                         Some(Entity::PLACEHOLDER),
                         guid,
                         store.as_ref(),
-                        engaged,
                         self_guid,
                         attackable,
                         true,
@@ -1107,6 +1271,24 @@ mod tests {
                 },
             )
             .expect("commit runs as a one-shot system")
+    }
+
+    /// Our attack target set (`[+0xc48]`) or clear, with whatever the last commit queued applied.
+    pub(super) fn engage(world: &mut World, engaged: bool) {
+        crate::creature_anim::apply_unit_edits(world);
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(world)
+            .expect("our own player");
+        if engaged {
+            world
+                .entity_mut(me)
+                .insert(crate::creature_anim::Engaged(0));
+        } else {
+            world
+                .entity_mut(me)
+                .remove::<crate::creature_anim::Engaged>();
+        }
     }
 
     /// A world with just what the seams need.
@@ -1180,7 +1362,7 @@ mod tests {
         world
             .run_system_once(
                 |mut selection: ResMut<Selection>, mut seam: crate::creature_anim::AttackSeam| {
-                    super::super::click::clear(&mut selection, &mut seam, false);
+                    super::super::click::clear(&mut selection, &mut seam);
                 },
             )
             .expect("clear runs as a one-shot system");
@@ -1633,12 +1815,14 @@ mod tests {
             flags,
         };
         // A raid: our subgroup 0 holds PARTY and PARTY_DEAD; RAID is in subgroup 1.
-        world.insert_resource(crate::ui_party::GroupState {
+        let mut group = crate::ui_party::GroupState {
             in_group: true,
             group_type: 1,
             members: vec![member(PARTY, 0), member(PARTY_DEAD, 0), member(RAID, 1)],
             ..Default::default()
-        });
+        };
+        group.rebuild_raid(0x5E1F);
+        world.insert_resource(group);
         let pool = |world: &mut World, side: ScanSide| {
             world
                 .run_system_once(move |scan: TargetScan| {
@@ -1651,7 +1835,8 @@ mod tests {
         // Out of a raid, mode 4's raid half has no roster: it is the party test.
         world
             .resource_mut::<crate::ui_party::GroupState>()
-            .group_type = 0;
+            .raid
+            .clear();
         assert_eq!(pool(&mut world, ScanSide::Raid), [PARTY, PARTY_DEAD]);
     }
 

@@ -559,7 +559,9 @@ fn merchant_switch_plays_close_then_open_and_queues_the_consumable_close() {
     s.set_merchant(Some(MerchantState::default()));
     s.fire_event("MERCHANT_SHOW", vec![]);
     let _ = s.take_sounds();
-    let _ = s.take_merchant_close();
+    let _ = s.take_calls_like(&benilla_ui::script::ScriptCall::Merchant(
+        benilla_ui::script::MerchantCall::Close,
+    ));
 
     s.set_merchant(Some(MerchantState::default()));
     s.fire_event("MERCHANT_CLOSED", vec![]);
@@ -574,7 +576,9 @@ fn merchant_switch_plays_close_then_open_and_queues_the_consumable_close() {
         "switching vendors plays the close then the open kit"
     );
     assert!(
-        s.take_merchant_close(),
+        s.take_calls_like(&benilla_ui::script::ScriptCall::Merchant(
+            benilla_ui::script::MerchantCall::Close
+        )) > 0,
         "the switch's MERCHANT_CLOSED queued a CloseMerchant intent — the feed must consume it so \
          the re-opened vendor is not cleared by the drain"
     );
@@ -790,6 +794,23 @@ fn shipped_merchant_hover_scopes_highlight_and_anchors_item_tooltip() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// A host answering `GetRepairAllCost` with damage to pay for, 76 copper.
+struct RepairHost;
+
+impl benilla_ui::script::CallHost for RepairHost {
+    fn apply(
+        &mut self,
+        _: &mut UiScript,
+        _: benilla_ui::script::ScriptCall,
+    ) -> Option<benilla_ui::script::CallTail> {
+        None
+    }
+
+    fn read_live(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        ask.answer(|_: &benilla_ui::script::RepairAllCostQuery| Some(Some((76, true))))
+    }
+}
+
 /// The two tabs (`MerchantFrame.lua:57-64`): the merchant page has the buyback slot and repair
 /// pair; the buyback page retitles the window and fills the rows from `GetBuybackItemInfo`.
 #[test]
@@ -838,8 +859,8 @@ fn merchant_tabs_drive_buyback_page_and_repair_pair() {
         ],
         can_repair: true,
     }));
-    s.set_repair_all_cost(76);
-    s.fire_event("MERCHANT_SHOW", vec![]);
+    // The show reads the total through the host, as every production entry lends it.
+    s.hosted(&mut RepairHost, |s| s.fire_event("MERCHANT_SHOW", vec![]));
     assert!(s.errors().is_empty(), "show errors: {:?}", s.errors());
 
     // Merchant page: the latest sale in the buyback slot (`MerchantFrame.lua:133`), repair up.

@@ -13,36 +13,33 @@ use benilla_protocol::messages::ACTION_KIND_ITEM;
 use benilla_ui::script::{ScriptValue, UiScript};
 
 use crate::items::Items;
-use crate::net::{NetCommands, ObjectStore, Objects, SelfPlayer, WorldEnterCascadeMessage};
+use crate::net::{NetCommands, ObjectStore, Objects, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::ui_items::action_count;
 
 /// The bar's 120 slots, as Lua action ids.
 const ACTION_SLOTS: std::ops::RangeInclusive<u32> = 1..=120;
 
-/// Our own player's arrival pass, if it arrived ([`arrival_counts`]).
-pub(crate) fn recount_item_actions(
+/// Our own player's arrival pass over the bar ([`arrival_counts`]), run in the arrival's place
+/// ([`crate::ui_world_enter`]) with the host lent.
+pub(crate) fn arrival_slot_pass(
     mut hosted_vm: crate::script_calls::HostedVm,
-    mut arrivals: MessageReader<WorldEnterCascadeMessage>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     objects: Objects,
     items: Res<Items>,
     commands: Res<NetCommands>,
 ) {
     hosted_vm.run(|script| {
-        let arrived = arrivals.read().count() > 0;
         let Some(script) = script else {
             return;
         };
-        if arrived {
-            let counter = Counter {
-                store: self_q.iter().next(),
-                objects: &objects,
-                items: &items,
-                commands: &commands,
-            };
-            arrival_counts(script, &counter);
-        }
+        let counter = Counter {
+            store: self_q.iter().next(),
+            objects: &objects,
+            items: &items,
+            commands: &commands,
+        };
+        arrival_counts(script, &counter);
     })
 }
 
@@ -88,22 +85,38 @@ impl Counter<'_> {
 }
 
 /// `0x4e5c70(entry)`: no active player counts 0 (`0x4e6d20`). Each slot is read as the VM holds it
-/// when its turn comes, so a handler that rewrites a later slot is seen.
-pub(crate) fn recount(script: &mut UiScript, counter: &Counter, entry: u32) {
+/// when its turn comes, so a handler that rewrites a later slot is seen. Each slot's write is
+/// `0x4e58e0`'s: the count stored (`0x4e5caa`), then the slot's usable pair (`0x4e5903`-
+/// `0x4e5914`, through the host's action states), then `ACTIONBAR_SLOT_CHANGED` (`0x4e5998`)
+/// with the host lent.
+pub(crate) fn recount<P: bevy::ecs::system::SystemParam + 'static>(
+    vm: &mut crate::script_calls::VmWith<P>,
+    counter: &Counter,
+    entry: u32,
+) {
     let count = counter.count(entry);
     for action in ACTION_SLOTS {
-        let Some(mut slot) = script
-            .action_slot(action)
-            .filter(|s| s.kind == ACTION_KIND_ITEM && s.action == entry)
-        else {
+        let written = vm.run(|script| {
+            let script = script?;
+            let mut slot = script
+                .action_slot(action)
+                .filter(|s| s.kind == ACTION_KIND_ITEM && s.action == entry)?;
+            slot.count = count;
+            script.set_action(action, Some(slot));
+            Some(())
+        });
+        if written.is_none() {
             continue;
-        };
-        slot.count = count;
-        script.set_action(action, Some(slot));
-        script.fire_event(
-            "ACTIONBAR_SLOT_CHANGED",
-            vec![ScriptValue::Int(i64::from(action))],
-        );
+        }
+        vm.engine_slot_written();
+        vm.run(|script| {
+            if let Some(script) = script {
+                script.fire_event(
+                    "ACTIONBAR_SLOT_CHANGED",
+                    vec![ScriptValue::Int(i64::from(action))],
+                );
+            }
+        });
     }
 }
 
@@ -127,11 +140,9 @@ mod tests {
     fn app() -> App {
         let mut app = App::new();
         let (tx, rx) = crossbeam_channel::unbounded();
-        app.add_message::<WorldEnterCascadeMessage>()
-            .init_resource::<crate::net::GuidIndex>()
+        app.init_resource::<crate::net::GuidIndex>()
             .init_resource::<Items>()
-            .insert_resource(NetCommands(tx))
-            .add_systems(Update, recount_item_actions);
+            .insert_resource(NetCommands(tx));
         app.insert_non_send_resource(rx); // a send must not fail
         let world = app.world_mut();
         crate::items::test_spawn_item(
@@ -355,9 +366,8 @@ mod tests {
     fn our_arrival_recounts_every_item_slot_quietly_and_signals_slot_zero() {
         let mut app = app();
         app.world_mut()
-            .resource_mut::<Messages<WorldEnterCascadeMessage>>()
-            .write(WorldEnterCascadeMessage);
-        app.update();
+            .run_system_cached(arrival_slot_pass)
+            .expect("the arrival's slot pass runs");
         assert_eq!(seen(&mut app), ["0=0"], "one signal, slot 0");
         let counts: (i64, i64, i64) = app
             .world_mut()

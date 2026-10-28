@@ -114,9 +114,9 @@ impl Plugin for InillaPlugin {
         .configure_sets(PreUpdate, InputProducers.before(bevy::input::InputSystems))
         .add_systems(
             Update,
-            synth::run_vm_ops
-                .after(benilla_world::schedule::WorldStage::Net)
-                .before(crate::ui_script::UiInput),
+            // In the packets' feed phase (after `WorldStage::Net`), as the window input records
+            // now run ahead of the net drain (`ui_script::UiInput`).
+            synth::run_vm_ops.in_set(crate::ui_script::UiFeed),
         )
         .add_systems(
             Update,

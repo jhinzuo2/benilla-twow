@@ -18,7 +18,7 @@ use crate::creature_anim::{CastEvent, CastEventKind, Casting, SpellGoTargets};
 use crate::ui_action::{PlayerActions, Spells, UiError, UiErrorKeys};
 use crate::ui_aura::AuraDurations;
 use crate::ui_cast::{CastBarEdge, CastReports};
-use crate::ui_spellbook::LearnedInTab;
+use crate::ui_spellbook::{BookSignals, Learned};
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::ecs::system::SystemParam;
@@ -26,19 +26,9 @@ use bevy::ecs::system::SystemParam;
 use crate::net::{GuidIndex, NetCommands, NetHandlerApp, ObjectStore, SelfGuid, SelfPlayer};
 use crate::query_cache::Ask;
 
-/// Another unit's `SMSG_SPELL_START` aimed at the player (`0x6e790d`-`0x6e7947`), for the target
-/// chain's select of its caster (`0x6e799c`), which holds the selection
-/// ([`crate::target`]). `seq` is the packet's [`crate::creature_anim::PlaySeq`] stamp.
-#[derive(Message, Clone, Copy, Debug)]
-pub(crate) struct CastAtPlayer {
-    pub(crate) caster: Entity,
-    pub(crate) seq: u64,
-}
-
 /// Register the spell's handlers; called from [`super::SpellPlugin`].
 pub(super) fn register(app: &mut App) {
     use SessionEventKind as K;
-    app.add_message::<CastAtPlayer>();
     app.net_handler(K::Connected, on_world_enter)
         .net_handler(K::SpellBook, on_spell_book)
         .net_handler(K::ActionButtons, on_action_buttons)
@@ -75,8 +65,8 @@ pub(crate) struct Lifecycle<'w> {
     spells: Option<Res<'w, Spells>>,
     net: Res<'w, NetCommands>,
     actions: ResMut<'w, PlayerActions>,
-    learned_in_tab: ResMut<'w, LearnedInTab>,
     reports: ResMut<'w, CastReports>,
+    tutorials: Option<Res<'w, crate::tutorial::Tutorials>>,
     pending: ResMut<'w, PendingCast>,
     /// With `pending`, `reports` and `net`, the in-flight slot the GO-deferred attack start's
     /// cancel reads (`0x5ecc85`).
@@ -99,7 +89,8 @@ pub(crate) struct Lifecycle<'w> {
 pub(crate) struct Scene<'w, 's> {
     commands: Commands<'w, 's>,
     casting: Query<'w, 's, &'static Casting>,
-    engaged_self: Query<'w, 's, (), (With<crate::creature_anim::Engaged>, With<SelfPlayer>)>,
+    /// Our own entity, whose attack target the queued edits answer.
+    self_player: Query<'w, 's, Entity, With<SelfPlayer>>,
     stores: Query<'w, 's, &'static mut ObjectStore>,
     items: ResMut<'w, crate::items::Items>,
     loot_latch: ResMut<'w, crate::ui_loot::LootLatch>,
@@ -142,43 +133,84 @@ fn active_player<'a>(
         .and_then(|&e| stores.get(e).ok())
 }
 
-fn on_action_buttons(In(ev): In<SessionEvent>, mut l: Lifecycle) {
+fn on_action_buttons(In(ev): In<SessionEvent>, mut slots: ResMut<crate::ui_action::ActionSlots>) {
     if let SessionEvent::ActionButtons { buttons } = ev {
-        action_buttons(buttons, &mut l.actions);
+        action_buttons(buttons, &mut slots);
     }
 }
 
-fn on_spell_learned(In(ev): In<SessionEvent>, mut l: Lifecycle, errors: Res<UiErrorKeys>) {
+/// The learn, then the registrar's tail at the packet: the form list's edge (`0x4b2904`), then the
+/// book's (`0x4b2b5a`-`0x4b2ba1`).
+fn on_spell_learned(
+    In(ev): In<SessionEvent>,
+    mut l: Lifecycle,
+    errors: Res<UiErrorKeys>,
+    mut book: BookSignals,
+) {
     if let SessionEvent::SpellLearned { spell_id } = ev {
-        learned_spell(
+        learned_spell(spell_id, &mut l.actions, l.spells.as_deref(), &errors);
+        book.entered(
             spell_id,
+            Learned::Fresh,
             &mut l.actions,
             l.spells.as_deref(),
-            &errors,
-            &mut l.learned_in_tab,
         );
     }
 }
 
-fn on_spell_removed(In(ev): In<SessionEvent>, mut l: Lifecycle, errors: Res<UiErrorKeys>) {
+/// The unlearn, whose removal signals at the packet (`0x5ea24c` → `0x4b2e4e`, `0x4b2f3f`).
+fn on_spell_removed(
+    In(ev): In<SessionEvent>,
+    mut l: Lifecycle,
+    errors: Res<UiErrorKeys>,
+    mut book: BookSignals,
+) {
     if let SessionEvent::SpellRemoved { spell_id } = ev {
+        let was_known = l.actions.spells.contains(&spell_id);
         removed_spell(spell_id, &mut l.actions, l.spells.as_deref(), &errors);
+        book.left(
+            spell_id,
+            was_known,
+            true,
+            &mut l.actions,
+            l.spells.as_deref(),
+        );
     }
 }
 
-fn on_spell_superceded(In(ev): In<SessionEvent>, mut l: Lifecycle, errors: Res<UiErrorKeys>) {
+/// The rank-up, whose book pair signals at the packet: the old rank's removal (`0x4b2f5b` →
+/// `0x4b2f3f`), then the new one's live add (`0x4b2f68` → `0x4b2b5a`).
+fn on_spell_superceded(
+    In(ev): In<SessionEvent>,
+    mut l: Lifecycle,
+    errors: Res<UiErrorKeys>,
+    mut book: BookSignals,
+) {
     if let SessionEvent::SpellSuperceded {
         old_spell_id,
         new_spell_id,
     } = ev
     {
+        let was_known = l.actions.spells.contains(&old_spell_id);
         superceded_spell(
             old_spell_id,
             new_spell_id,
             &mut l.actions,
             l.spells.as_deref(),
             &errors,
-            &mut l.learned_in_tab,
+        );
+        book.left(
+            old_spell_id,
+            was_known,
+            false,
+            &mut l.actions,
+            l.spells.as_deref(),
+        );
+        book.entered(
+            new_spell_id,
+            Learned::Rank { old: old_spell_id },
+            &mut l.actions,
+            l.spells.as_deref(),
         );
     }
 }
@@ -220,6 +252,7 @@ fn on_cast_result(
             ground: &mut ladder.ground,
             reports: &mut ladder.reports,
             net: &ladder.commands,
+            tutorials: ladder.tutorials.as_deref(),
         };
         let chained = cast_result(
             spell_id,
@@ -251,7 +284,8 @@ fn on_spell_start(
     mut l: Lifecycle,
     mut sc: Scene,
     precast: crate::creature_anim::PrecastTables,
-    mut cast_at_player: MessageWriter<CastAtPlayer>,
+    // The caster's select a start at us owes, absent in a harness without the target plugin.
+    acquires: Option<ResMut<crate::target::OwedSelects>>,
 ) {
     if let SessionEvent::SpellStart {
         caster,
@@ -272,7 +306,7 @@ fn on_spell_start(
             &mut sc.commands,
             &l.index,
             &mut sc.cast_events,
-            &mut cast_at_player,
+            acquires.map(|a| a.into_inner()),
             &l.self_guid,
             &mut l.reports,
             &mut l.pending,
@@ -294,11 +328,22 @@ fn on_spell_start(
 }
 
 /// The GO, then its deferred auto-attack start (`0x6e8402` → `0x6131a0` → `0x5ecb70`): StartAttack
-/// with its own select (`0x5eccaa`), which selects the hit unit whatever is selected.
+/// with its own select (`0x5eccaa`), which selects the hit unit whatever is selected and signals
+/// in place, behind the GO's reports, before the swing
+/// ([`crate::script_calls::ScriptCallHost::engine_start_attack`]).
+#[allow(clippy::type_complexity)] // a Bevy system's full input set
 fn on_spell_go(
     In(ev): In<SessionEvent>,
-    mut set: ParamSet<((Lifecycle, Scene), crate::target::SelectCommit)>,
+    mut set: crate::script_calls::disjoint::Pair<
+        (Lifecycle<'static>, Scene<'static, 'static>),
+        crate::script_calls::VmWith<
+            'static,
+            'static,
+            crate::target::SelectCommit<'static, 'static>,
+        >,
+    >,
 ) {
+    let mark = crate::lanes::mark();
     if let SessionEvent::SpellGo {
         caster,
         spell_id,
@@ -307,15 +352,25 @@ fn on_spell_go(
         misses,
         target,
         go_target,
+        target_mask,
+        source,
         dest,
         ammo_display_id,
         item_caster,
         unit_caster,
     } = ev
     {
+        let points = GoPoints {
+            mask: target_mask,
+            source,
+            dest,
+        };
         let deferred = {
             let (mut l, mut sc) = set.p0();
-            let engaged = !sc.engaged_self.is_empty();
+            let engaged = sc
+                .self_player
+                .single()
+                .is_ok_and(|me| sc.edits.attacking(me));
             spell_go(
                 caster,
                 spell_id,
@@ -324,7 +379,7 @@ fn on_spell_go(
                 misses,
                 target,
                 go_target,
-                dest,
+                points,
                 ammo_display_id,
                 item_caster,
                 unit_caster,
@@ -353,13 +408,15 @@ fn on_spell_go(
                         ground: &mut l.ground,
                         reports: &mut l.reports,
                         net: &l.net,
+                        tutorials: l.tutorials.as_deref(),
                     },
                 ),
                 l.play_seq.next(),
             )
         };
         if let Some(guid) = deferred {
-            set.p1().start_attack(guid);
+            set.p1()
+                .engine_start_attack(guid, mark, |mut commit| commit.start_attack(guid));
         }
     }
 }
@@ -410,6 +467,7 @@ fn on_cancel_auto_repeat(In(ev): In<SessionEvent>, mut l: Lifecycle, sc: Scene) 
                 ground: &mut l.ground,
                 reports: &mut l.reports,
                 net: &l.net,
+                tutorials: l.tutorials.as_deref(),
             },
         );
     }
@@ -623,13 +681,27 @@ fn spell_book(
         initial_cooldowns.len()
     );
     let (spells, items, mods, pad) = seed;
-    // `ResetSpellBook 0x4b23a0` empties the opener list (`0x4b2464`-`0x4b2470`) before the
-    // arrival's replay learns the list in wire order (`0x5dea8b`-`0x5deab9`).
+    // `ResetSpellBook 0x4b23a0` empties the opener and dispel lists (`0x4b2464`-`0x4b2470`,
+    // `0x4b2486`-`0x4b24c2`) before the arrival's replay learns the list in wire order
+    // (`0x5dea8b`-`0x5deab9`).
     actions.openers.clear();
+    actions.dispels.clear();
+    // It zeroes the effect-spell globals too (`0x4b2433`), `Stuck()`'s among them.
+    actions.stuck_spell = None;
     for &spell_id in &spell_ids {
-        list_opener(spell_id, spells, actions);
+        register_in_book(spell_id, spells, actions);
     }
-    actions.spells = spell_ids.into_iter().collect();
+    actions.spells.clear();
+    actions.profession_order.clear();
+    actions.craft_order.clear();
+    actions.effect_slots = Default::default();
+    // The list itself (`0xc4d2a8`), which our player's arrival learns again one spell at a time,
+    // the form list's growth with it (`0x5dea86`-`0x5deab9`, [`crate::ui_world_enter`]).
+    actions.initial.clone_from(&spell_ids);
+    for spell_id in spell_ids {
+        actions.spells.insert(spell_id);
+        list_learn(spell_id, actions, spells);
+    }
     actions.dirty = true;
     let now = Instant::now();
     for cd in &initial_cooldowns {
@@ -645,29 +717,84 @@ fn spell_book(
 }
 
 /// `SMSG_ACTION_BUTTONS`, at login and on server-side edits, into the action store.
-fn action_buttons(buttons: Vec<ActionButton>, actions: &mut PlayerActions) {
+fn action_buttons(buttons: Vec<ActionButton>, slots: &mut crate::ui_action::ActionSlots) {
     debug!("net: action bar — {} occupied slots", buttons.len());
-    actions.buttons = buttons.into_iter().map(|b| (b.slot, b)).collect();
-    actions.dirty = true;
+    slots.buttons = buttons.into_iter().map(|b| (b.slot, b)).collect();
+    slots.dirty = true;
 }
 
-/// `SMSG_LEARNED_SPELL`: the spell joins the book (the spellbook feed diffs it; learning never
-/// bars a spell) and is announced in chat, the reference's own tail: `0x5e61c0` →
+/// `SMSG_LEARNED_SPELL`: the spell joins the known spells, which the book reads (learning never
+/// bars a spell), and is announced in chat, the reference's own tail: `0x5e61c0` →
 /// `AddSpell(id, slot, 1, 1)` → the registrar `0x4b25b0` with its announce flag set.
 fn learned_spell(
     spell_id: u32,
     actions: &mut PlayerActions,
     spells: Option<&Spells>,
     errors: &UiErrorKeys,
-    tab_flash: &mut LearnedInTab,
 ) {
     debug!("net: learned spell {spell_id}");
     if actions.spells.insert(spell_id) {
         actions.dirty = true;
     }
-    list_opener(spell_id, spells, actions);
+    list_learn(spell_id, actions, spells);
+    register_in_book(spell_id, spells, actions);
     announce_learn(spell_id, spells, errors);
-    tab_flash.0.push(spell_id);
+}
+
+/// `LearnSpell 0x5e9c20`'s list legs: the profession lists append with no duplicate check
+/// (`0x5e9d72`), the craft lists only a spell they lack (`0x5e9db3`, `0x5e9e0f`); and a spell with
+/// no `Attributes & 0x20`, no cast UI and `SPELL_EFFECT_TRADE_SKILL` first takes the player's
+/// effect slot its misc value names (`0x5e9c8e`, `0x5e9d88`, `0x5e9e1c`-`0x5e9e36`), the one write
+/// of `CGPlayer_C+0x1d10`; its reader indexes below 4 (`0x5ea360`).
+fn list_learn(spell_id: u32, actions: &mut PlayerActions, spells: Option<&Spells>) {
+    actions.profession_order.push(spell_id);
+    if !actions.craft_order.contains(&spell_id) {
+        actions.craft_order.push(spell_id);
+    }
+    let slot = spells.and_then(|s| s.catalog.get(spell_id)).and_then(|d| {
+        let opens_window = d.attributes & benilla_formats::SPELL_ATTR_IS_TRADESKILL == 0
+            && (d.cast_ui as i32) <= 0
+            && d.effects[0] == benilla_formats::SPELL_EFFECT_TRADE_SKILL;
+        usize::try_from(d.effect_misc_value[0])
+            .ok()
+            .filter(|&misc| opens_window && misc < 4)
+    });
+    if let Some(slot) = slot {
+        actions.effect_slots[slot] = Some(spell_id);
+    }
+}
+
+/// `UnlearnSpell 0x5e9fe0`'s list legs: the profession lists' backward scan takes out the last
+/// copy (`0x5ea0fe`, `0x5ea123`), the craft lists' forward scan the first (`0x5ea1b8`).
+fn list_unlearn(spell_id: u32, actions: &mut PlayerActions) {
+    if let Some(at) = actions
+        .profession_order
+        .iter()
+        .rposition(|&id| id == spell_id)
+    {
+        actions.profession_order.remove(at);
+    }
+    if let Some(at) = actions.craft_order.iter().position(|&id| id == spell_id) {
+        actions.craft_order.remove(at);
+    }
+}
+
+/// `SPELL_EFFECT_STUCK` in `Effect[0]`, the registrar's test for `Stuck()`'s spell (`0x4b2614`).
+const SPELL_EFFECT_STUCK: u32 = 0x54;
+
+/// The registrar `0x4b25b0`'s effect legs this client keeps: the opener list, the dispel list, and
+/// `Stuck()`'s spell `[0xb70098]`, which each registered spell whose `Effect[0]` is
+/// `SPELL_EFFECT_STUCK` overwrites (`0x4b2614`-`0x4b261d`), so the last such learn holds it. No
+/// unlearn clears it; the book's reset does.
+fn register_in_book(spell_id: u32, spells: Option<&Spells>, actions: &mut PlayerActions) {
+    list_opener(spell_id, spells, actions);
+    list_dispels(spell_id, spells, actions);
+    if spells
+        .and_then(|s| s.catalog.get(spell_id))
+        .is_some_and(|d| d.effects[0] == SPELL_EFFECT_STUCK)
+    {
+        actions.stuck_spell = Some(spell_id);
+    }
 }
 
 /// `SPELL_EFFECT_OPEN_LOCK` in `Effect[0]`, the registrar's test for the opener list (`0x4b265e`).
@@ -682,6 +809,30 @@ fn list_opener(spell_id: u32, spells: Option<&Spells>, actions: &mut PlayerActio
         .is_some_and(|d| d.effects[0] == SPELL_EFFECT_OPEN_LOCK)
     {
         actions.openers.push(spell_id);
+    }
+}
+
+/// `SPELL_EFFECT_DISPEL` (38), the registrar's test for the dispel list (`0x4b26a2`).
+const SPELL_EFFECT_DISPEL: u32 = 0x26;
+/// `TARGET_UNIT_ENEMY` (vmangos `SpellDefines.h:31`): a dispel aimed there is an offensive one,
+/// left off the dispel list (`0x4b26ab`).
+const TARGET_UNIT_ENEMY: u32 = 6;
+
+/// The registrar's dispel leg (`0x4b26a2`-`0x4b26ee`): each of the three effects that is
+/// `SPELL_EFFECT_DISPEL` with `EffectImplicitTargetA` not 6 appends its `EffectMiscValue` to
+/// [`PlayerActions::dispels`] when the list lacks it.
+fn list_dispels(spell_id: u32, spells: Option<&Spells>, actions: &mut PlayerActions) {
+    let Some(d) = spells.and_then(|s| s.catalog.get(spell_id)) else {
+        return;
+    };
+    for i in 0..3 {
+        let kind = d.effect_misc_value[i] as u32;
+        if d.effects[i] == SPELL_EFFECT_DISPEL
+            && d.effect_implicit_target_a[i] != TARGET_UNIT_ENEMY
+            && !actions.dispels.contains(&kind)
+        {
+            actions.dispels.push(kind);
+        }
     }
 }
 
@@ -734,6 +885,7 @@ fn removed_spell(
     if actions.spells.remove(&spell_id) {
         actions.dirty = true;
     }
+    list_unlearn(spell_id, actions);
     // `UnlearnSpell 0x5e9fe0` does nothing for a spell with no record (`0x5ea02a`); otherwise it
     // clears the bar slots that stand for the spell (`0x5ea253`), which the bar's queue makes.
     if spells.is_some_and(|s| s.catalog.get(spell_id).is_some()) {
@@ -766,25 +918,26 @@ fn superceded_spell(
     actions: &mut PlayerActions,
     spells: Option<&Spells>,
     errors: &UiErrorKeys,
-    tab_flash: &mut LearnedInTab,
 ) {
     debug!("net: superceded spell {old_spell_id} -> {new_spell_id}");
+    // The player's unlearn of the old rank, then its learn of the new one at the tail
+    // (`0x5e6392`, `0x5e63a4`).
     actions.spells.remove(&old_spell_id);
+    list_unlearn(old_spell_id, actions);
     actions.spells.insert(new_spell_id);
+    list_learn(new_spell_id, actions, spells);
     actions.superseded.push((old_spell_id, new_spell_id));
     actions.dirty = true;
     // `0x4b2f50` unlists the old rank and registers the new one at the tail; the player's own
     // unlearn of the old rank (`0x5e6392` → `0x5ea24c`) then runs the removal once more, and its
     // learn of the new one (`0x5e63a4`) skips the registrar (`0x5e9c5a`).
     unlist_opener(old_spell_id, actions);
-    list_opener(new_spell_id, spells, actions);
+    register_in_book(new_spell_id, spells, actions);
     unlist_opener(old_spell_id, actions);
     // A rank-up announces once, like a first learn: the supersede pair `0x4b2f50` calls the
     // unlearn `0x4b2c50`, which prints nothing, then the registrar `0x4b25b0` with `edx = 1`
     // (`0x4b2f61`).
     announce_learn(new_spell_id, spells, errors);
-    // The same flag flashes the tab of the new rank.
-    tab_flash.0.push(new_spell_id);
     // That unlearn (`UnlearnSpell(old, 1)`, `0x5e6392` into `0x5e9fe0`) then clears every bar slot
     // still standing for the old rank (`0x5ea253`), an item's on-use spell included; a spell with
     // no record unlearns nothing (`0x5ea02a`).
@@ -971,8 +1124,8 @@ fn spell_start(
     commands: &mut Commands,
     index: &GuidIndex,
     cast_events: &mut MessageWriter<CastEvent>,
-    // The select of a caster aiming at the player, the target chain's.
-    cast_at_player: &mut MessageWriter<CastAtPlayer>,
+    // The select of a caster aiming at the player, owed at the packet's end.
+    acquires: Option<&mut crate::target::OwedSelects>,
     self_guid: &SelfGuid,
     reports: &mut CastReports,
     pending: &mut PendingCast,
@@ -1060,9 +1213,14 @@ fn spell_start(
     }
     // Another unit's cast whose unit target is the player (`0x6e790d` mask bit `0x2`,
     // `0x6e7926` a guid, `0x6e7939`/`0x6e7947` the player's) selects its caster when the
-    // target chain's gates pass ([`crate::target`]).
+    // target chain's gates pass (`0x6e796a`-`0x6e799c`), the handler's last act on that leg.
     if self_guid.0 != Some(caster) && target.is_some() && target == self_guid.0 {
-        cast_at_player.write(CastAtPlayer { caster: e, seq });
+        if let Some(acquires) = acquires {
+            acquires.push(crate::target::OwedSelect::Acquire(
+                e,
+                crate::target::Acquire::Caster,
+            ));
+        }
     }
     // The precast edge, instants included: their GO follows at once and reaps the hold.
     cast_events.write(CastEvent {
@@ -1091,7 +1249,7 @@ fn spell_go(
     misses: Vec<benilla_protocol::messages::SpellGoMiss>,
     target: Option<u64>,
     go_target: Option<u64>,
-    dest: Option<[f32; 3]>,
+    points: GoPoints,
     ammo_display_id: Option<u32>,
     item_caster: Option<u64>,
     // The packet's second guid as written, the caster slot `0x6e7f8b` looks up as a unit.
@@ -1120,10 +1278,11 @@ fn spell_go(
     attack_ctx: (&crate::creature_anim::UnitEdits, bool, &mut super::CastCore),
     seq: u64,
 ) -> Option<u64> {
+    let GoPoints { mask, source, dest } = points;
     debug!(
         "net: spell go {spell_id} by {caster:#x} ({} hit(s), {} miss(es), flags \
-         {cast_flags:#x}, target {target:?}, go_target {go_target:?}, dest {dest:?}, \
-         ammo {ammo_display_id:?})",
+         {cast_flags:#x}, target {target:?}, go_target {go_target:?}, mask {mask:#x}, \
+         source {source:?}, dest {dest:?}, ammo {ammo_display_id:?})",
         hits.len(),
         misses.len()
     );
@@ -1272,10 +1431,16 @@ fn spell_go(
         .iter()
         .filter_map(|&g| index.0.get(&g).map(|&e| (g, e)))
         .collect();
-    let misses: Vec<(Entity, u8)> = misses
+    let misses: Vec<(Entity, u8, u8)> = misses
         .iter()
-        .filter_map(|m| index.0.get(&m.target).map(|&e| (e, m.info)))
+        .filter_map(|m| {
+            index
+                .0
+                .get(&m.target)
+                .map(|&e| (e, m.info, m.reflect_result))
+        })
         .collect();
+
     // The caster slot is the second guid looked up as a unit (`0x6e7f8b`, mask 8): a game object's
     // cast writes it 0, so it finds none and skips every leg that needs one.
     let unit = index
@@ -1293,7 +1458,9 @@ fn spell_go(
                 spell_id,
                 hits: hits.into_iter().map(|(_, e)| e).collect(),
                 misses,
+                source: None,
                 dest: None,
+                target_mask: mask,
                 ammo_display_id,
                 seq,
             });
@@ -1326,20 +1493,32 @@ fn spell_go(
         item_cast: item_caster.is_some(),
         seq,
     });
-    // A pure dest cast (ground AoE, empty lists) rides the same message: the point is a target.
+    // A pure point cast (ground AoE, empty lists) rides the same message: the point is a target.
+    let source = source.map(benilla_assets::coords::wow_to_bevy);
     let dest = dest.map(benilla_assets::coords::wow_to_bevy);
-    if !hits.is_empty() || !misses.is_empty() || dest.is_some() {
+    if !hits.is_empty() || !misses.is_empty() || source.is_some() || dest.is_some() {
         go_targets.write(SpellGoTargets {
             caster: Some(e),
             spell_id,
             hits: hits.into_iter().map(|(_, e)| e).collect(),
             misses,
+            source,
             dest,
+            target_mask: mask,
             ammo_display_id,
             seq,
         });
     }
     deferred
+}
+
+/// The GO target block's mask and its two points, raw WoW (`0x7e4ed0`): SOURCE_LOCATION (0x20)
+/// and DEST_LOCATION (0x40).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct GoPoints {
+    pub(super) mask: u16,
+    pub(super) source: Option<[f32; 3]>,
+    pub(super) dest: Option<[f32; 3]>,
 }
 
 /// `SMSG_SPELL_FAILED_OTHER`: a cast was interrupted; ends the caster's `Casting` as [`spell_go`]
@@ -1643,10 +1822,11 @@ fn spell_chain_targets(
 mod tests {
     use super::*;
     use crate::spell::QueuedMeleeSpell;
-    use benilla_protocol::messages::{ObjectType, ACTION_KIND_SPELL};
+    use benilla_protocol::messages::ObjectType;
 
     mod cooldown_sites;
     mod dispatch;
+    mod learned;
     mod openers;
 
     /// `SMSG_COOLDOWN_EVENT` (`0x6e9670`): the event moves the held record's one start, which the
@@ -1730,14 +1910,11 @@ mod tests {
         );
         let mut actions = PlayerActions::default();
         let errors = UiErrorKeys::default();
-        let mut flash = LearnedInTab::default();
-        learned_spell(78, &mut actions, Some(&spells), &errors, &mut flash);
+        learned_spell(78, &mut actions, Some(&spells), &errors);
 
         assert_eq!(errors.len(), 1, "one line, once");
         assert_eq!(errors.snapshot()[0].key, "ERR_LEARN_ABILITY_S");
         assert_eq!(errors.snapshot()[0].arg_s(), Some("Heroic Strike (Rank 1)"));
-        // The same live-learn flag gates the tab flash.
-        assert_eq!(flash.0, vec![78], "queued for LEARNED_SPELL_IN_TAB");
     }
 
     /// A plain row is a spell; a tradeskill row is a recipe whose argText drops the rank (it
@@ -1754,13 +1931,7 @@ mod tests {
             },
         );
         let errors = UiErrorKeys::default();
-        learned_spell(
-            133,
-            &mut PlayerActions::default(),
-            Some(&spells),
-            &errors,
-            &mut LearnedInTab::default(),
-        );
+        learned_spell(133, &mut PlayerActions::default(), Some(&spells), &errors);
         assert_eq!(errors.snapshot()[0].key, "ERR_LEARN_SPELL_S");
         assert_eq!(errors.snapshot()[0].arg_s(), Some("Fireball (Rank 1)"));
 
@@ -1774,13 +1945,7 @@ mod tests {
             },
         );
         let errors = UiErrorKeys::default();
-        learned_spell(
-            2550,
-            &mut PlayerActions::default(),
-            Some(&spells),
-            &errors,
-            &mut LearnedInTab::default(),
-        );
+        learned_spell(2550, &mut PlayerActions::default(), Some(&spells), &errors);
         assert_eq!(errors.snapshot()[0].key, "ERR_LEARN_RECIPE_S");
         assert_eq!(
             errors.snapshot()[0].arg_s(),
@@ -1821,8 +1986,7 @@ mod tests {
         let mut actions = PlayerActions::default();
         actions.spells.insert(78);
         let errors = UiErrorKeys::default();
-        let mut flash = LearnedInTab::default();
-        superceded_spell(78, 284, &mut actions, Some(&spells), &errors, &mut flash);
+        superceded_spell(78, 284, &mut actions, Some(&spells), &errors);
 
         assert_eq!(
             actions.unlearned,
@@ -1831,11 +1995,6 @@ mod tests {
              (`0x5e6392` into `0x5e9fe0`, `0x5ea253`)"
         );
         assert_eq!(errors.len(), 1, "one line for a rank-up, not two");
-        assert_eq!(
-            flash.0,
-            vec![284],
-            "the NEW rank's tab flashes, not the old one's"
-        );
         assert_eq!(errors.snapshot()[0].key, "ERR_LEARN_ABILITY_S");
         assert_eq!(errors.snapshot()[0].arg_s(), Some("Heroic Strike (Rank 2)"));
     }
@@ -1852,20 +2011,8 @@ mod tests {
             },
         );
         let errors = UiErrorKeys::default();
-        learned_spell(
-            668,
-            &mut PlayerActions::default(),
-            Some(&spells),
-            &errors,
-            &mut LearnedInTab::default(),
-        );
-        learned_spell(
-            99999,
-            &mut PlayerActions::default(),
-            Some(&spells),
-            &errors,
-            &mut LearnedInTab::default(),
-        );
+        learned_spell(668, &mut PlayerActions::default(), Some(&spells), &errors);
+        learned_spell(99999, &mut PlayerActions::default(), Some(&spells), &errors);
         assert!(
             errors.is_empty(),
             "PASSIVE|DO_NOT_DISPLAY is silent, and so is an id with no record"
@@ -1876,24 +2023,12 @@ mod tests {
     fn learned_spell_adds_to_the_book_once() {
         let mut actions = PlayerActions::default();
         let errors = UiErrorKeys::default();
-        learned_spell(
-            6603,
-            &mut actions,
-            None,
-            &errors,
-            &mut LearnedInTab::default(),
-        );
+        learned_spell(6603, &mut actions, None, &errors);
         assert!(actions.spells.contains(&6603));
         assert!(actions.dirty, "a new spell dirties the feed");
 
         actions.dirty = false;
-        learned_spell(
-            6603,
-            &mut actions,
-            None,
-            &errors,
-            &mut LearnedInTab::default(),
-        );
+        learned_spell(6603, &mut actions, None, &errors);
         assert!(
             !actions.dirty,
             "re-learning a known spell is a no-op (insert returns false)"
@@ -1905,23 +2040,8 @@ mod tests {
     fn superceded_spell_swaps_the_book_and_leaves_the_bar_to_the_rank_pass() {
         let mut actions = PlayerActions::default();
         actions.spells.insert(78); // Heroic Strike rank 1, known
-        actions.buttons.insert(
-            0,
-            ActionButton {
-                slot: 0,
-                action: 78,
-                kind: ACTION_KIND_SPELL,
-            },
-        );
 
-        superceded_spell(
-            78,
-            284,
-            &mut actions,
-            None,
-            &UiErrorKeys::default(),
-            &mut LearnedInTab::default(),
-        );
+        superceded_spell(78, 284, &mut actions, None, &UiErrorKeys::default());
 
         assert!(
             !actions.spells.contains(&78),
@@ -1931,11 +2051,10 @@ mod tests {
             actions.spells.contains(&284),
             "the new rank enters the book"
         );
-        assert_eq!(
-            actions.buttons[&0].action, 78,
-            "the bar follows from the book, not from here"
+        assert!(
+            actions.dirty,
+            "the bar follows from the book, and `dirty` is what makes it follow"
         );
-        assert!(actions.dirty, "…and `dirty` is what makes it follow");
     }
 
     /// The self player's own packets, run through the real handlers in the order a server sends
@@ -1958,7 +2077,7 @@ mod tests {
             let mut app = App::new();
             app.add_message::<CastEvent>()
                 .add_message::<SpellGoTargets>()
-                .add_message::<CastAtPlayer>()
+                .init_resource::<crate::target::OwedSelects>()
                 .add_message::<CombatTextSpawn>()
                 .add_message::<GoLidOpen>()
                 .add_message::<crate::creature_anim::SheathRequest>()
@@ -2083,7 +2202,7 @@ mod tests {
                     move |mut commands: Commands,
                           index: Res<GuidIndex>,
                           mut cast_events: MessageWriter<CastEvent>,
-                          mut cast_at_player: MessageWriter<CastAtPlayer>,
+                          mut acquires: ResMut<crate::target::OwedSelects>,
                           self_guid: Res<SelfGuid>,
                           mut reports: ResMut<CastReports>,
                           mut pending: ResMut<PendingCast>,
@@ -2101,7 +2220,7 @@ mod tests {
                             &mut commands,
                             &index,
                             &mut cast_events,
-                            &mut cast_at_player,
+                            Some(&mut acquires),
                             &self_guid,
                             &mut reports,
                             &mut pending,
@@ -2268,7 +2387,7 @@ mod tests {
                             vec![],
                             None,
                             None,
-                            None,
+                            GoPoints::default(),
                             None,
                             None,
                             Self::SELF,
@@ -2297,6 +2416,7 @@ mod tests {
                                     ground: &mut Default::default(),
                                     reports: &mut Default::default(),
                                     net: &net_commands,
+                                    tutorials: None,
                                 },
                             ),
                             1,
@@ -2563,10 +2683,8 @@ mod tests {
         let asks = |s: &mut CastSeq| -> Vec<Entity> {
             s.app
                 .world_mut()
-                .resource_mut::<Messages<CastAtPlayer>>()
-                .drain()
-                .map(|m| m.caster)
-                .collect()
+                .resource_mut::<crate::target::OwedSelects>()
+                .take_acquires()
         };
         s.start_at(OTHER, FROSTBOLT, 3_000, 0, Some(CastSeq::SELF));
         assert_eq!(asks(&mut s), vec![other], "at us");
@@ -3103,14 +3221,14 @@ mod tests {
 
     /// One SPELL_GO of `display` (as spell 2649) by `caster` in a world holding us (guid 10) and,
     /// when given, the casting item; `mods` is the player's table. Returns the player bank's and
-    /// the pet bank's armed durations, the pet bar's repaint count and the pet list's generation.
+    /// the pet bank's armed durations and the pet list's generation.
     fn go_cooldowns(
         caster: u64,
         store: ObjectStore,
         item: Option<(u64, ObjectStore)>,
         display: fn() -> benilla_formats::SpellDisplay,
         mods: crate::spell::SpellModifiers,
-    ) -> (u32, u32, u32, u64) {
+    ) -> (u32, u32, u64) {
         use crate::combat_text::CombatTextSpawn;
         use crate::creature_anim::Casting;
         use crate::go_anim::GoLidOpen;
@@ -3195,7 +3313,7 @@ mod tests {
                         vec![],
                         None,
                         None,
-                        None,
+                        GoPoints::default(),
                         None,
                         item_caster,
                         caster,
@@ -3224,6 +3342,7 @@ mod tests {
                                 ground: &mut Default::default(),
                                 reports: &mut Default::default(),
                                 net: &net_commands,
+                                tutorials: None,
                             },
                         ),
                         1,
@@ -3238,7 +3357,6 @@ mod tests {
         (
             armed(world.resource::<Cooldowns>()),
             armed(&world.resource::<crate::ui_pet::PetBar>().cooldowns),
-            world.resource::<crate::ui_pet::PetBar>().bar_signals,
             world
                 .resource::<crate::ui_pet::PetBar>()
                 .cooldowns
@@ -3260,35 +3378,34 @@ mod tests {
     #[test]
     fn a_pets_own_go_arms_the_pet_bank_and_only_the_pet_bank() {
         let fire = |caster: u64, store: ObjectStore| {
-            let (player, pet, signals, generation) = go_cooldowns(
+            let (player, pet, generation) = go_cooldowns(
                 caster,
                 store,
                 None,
                 growl,
                 crate::spell::SpellModifiers::default(),
             );
-            (player > 0, pet > 0, signals, generation)
+            (player > 0, pet > 0, generation)
         };
 
         // Our pet: the PET bank only. The insert moves the list's generation, which is the flush's
-        // edge (`0x6e85fc`, `0x6e8601`: the cooldown events), and signals no `PET_BAR_UPDATE`.
-        let (player, pet, signals, generation) = fire(20, owned(SUMMONEDBY, 10));
+        // edge (`0x6e85fc`, `0x6e8601`: the cooldown events).
+        let (player, pet, generation) = fire(20, owned(SUMMONEDBY, 10));
         assert!(pet, "our pet's GO arms the pet bank");
         assert!(!player, "…and never the player's");
         assert_eq!(generation, 1, "the pet list's flush edge");
-        assert_eq!(signals, 0, "the bar's own signal is not the GO's");
 
         // A charm reads CHARMEDBY first: the same leg, the other field.
-        let (_, charmed, _, _) = fire(20, owned(CHARMEDBY, 10));
+        let (_, charmed, _) = fire(20, owned(CHARMEDBY, 10));
         assert!(charmed, "a charmed unit's GO arms it too");
 
         // A totem carries CREATEDBY and no SUMMONEDBY: `0x5ee5a0` would accept it, `0x6e859a` does
         // not.
-        let (_, totem, _, _) = fire(30, owned(CREATEDBY, 10));
+        let (_, totem, _) = fire(30, owned(CREATEDBY, 10));
         assert!(!totem, "CREATEDBY alone is not this leg's owner test");
 
         // Somebody else's pet: neither bank, no flush.
-        let (p2, pet2, _, generation) = fire(40, owned(SUMMONEDBY, 99));
+        let (p2, pet2, generation) = fire(40, owned(SUMMONEDBY, 99));
         assert!(!p2 && !pet2, "a stranger's pet arms nothing");
         assert_eq!(generation, 0, "and moves no edge");
     }
@@ -3393,7 +3510,7 @@ mod tests {
                         vec![],
                         None,
                         None,
-                        None,
+                        GoPoints::default(),
                         None,
                         None,
                         10,
@@ -3422,6 +3539,7 @@ mod tests {
                                 ground: &mut Default::default(),
                                 reports: &mut Default::default(),
                                 net: &net_commands,
+                                tutorials: None,
                             },
                         ),
                         1,
@@ -3657,13 +3775,7 @@ mod tests {
         );
 
         let errors = UiErrorKeys::default();
-        learned_spell(
-            1234,
-            &mut PlayerActions::default(),
-            Some(&spells),
-            &errors,
-            &mut LearnedInTab::default(),
-        );
+        learned_spell(1234, &mut PlayerActions::default(), Some(&spells), &errors);
         assert_eq!(errors.len(), 1, "the learn block never reads castUI");
         assert_eq!(errors.snapshot()[0].key, "ERR_LEARN_SPELL_S");
 
@@ -3773,7 +3885,7 @@ mod tests {
                             // A different guid from `hits[0]`, which the arm must take.
                             Some(99),
                             None,
-                            None,
+                            GoPoints::default(),
                             None,
                             None,
                             caster,
@@ -3802,6 +3914,7 @@ mod tests {
                                     ground: &mut Default::default(),
                                     reports: &mut Default::default(),
                                     net: &net_commands,
+                                    tutorials: None,
                                 },
                             ),
                             1,

@@ -68,6 +68,37 @@ impl ChatLanguages {
     }
 }
 
+impl ChatLanguages {
+    /// A readable's page text as this character reads it (`0x4e3856` → `0x49b560`, `keepAngle`
+    /// and `keepPunct` set, 0x1f40 bytes): the character's skill in `language`, or 0 when the show
+    /// is not `translate`d (a reason-1 read reply, `0x4e37b3`/`0x4e3808`). Unchanged for language
+    /// 0, full skill, and no local player (`0x49b597`).
+    pub(crate) fn garble_item_text(&self, language: u32, translate: bool, text: &str) -> String {
+        let Some(words) = self.words.as_ref().filter(|_| self.have_player) else {
+            return text.to_string();
+        };
+        let skill = if translate { self.skill(language) } else { 0 };
+        benilla_formats::garble(
+            words,
+            language,
+            skill,
+            text,
+            benilla_formats::Garble::ITEM_TEXT,
+        )
+    }
+
+    /// A character with `words` and its `skill` per language, for a test.
+    #[cfg(test)]
+    pub(crate) fn for_test(words: LanguageWords, skill: &[(u32, u32)]) -> Self {
+        Self {
+            words: Some(words),
+            skill: skill.iter().copied().collect(),
+            gm: false,
+            have_player: true,
+        }
+    }
+}
+
 /// Load `LanguageWords.dbc` once at startup.
 pub(super) fn load_language_words(
     mut langs: ResMut<ChatLanguages>,
@@ -125,7 +156,8 @@ pub(super) fn feed_language_skills(
             let Some(language) = spells.catalog.declared_language(known) else {
                 continue;
             };
-            let Some(line) = lines.catalog.spell_to_line(known) else {
+            let (race, class) = store.race_class();
+            let Some(line) = lines.catalog.spell_to_line(known, race, class) else {
                 // Spell 25674 declares Draconic but has no `SkillLineAbility` row (`0x6de040`),
                 // so Draconic is never understood.
                 continue;

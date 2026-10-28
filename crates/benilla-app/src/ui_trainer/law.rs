@@ -4,12 +4,14 @@
 //! not unify them.
 
 use benilla_formats::{
-    substitute, SkillLineCatalog, SpellCatalog, TokenContext, SPELL_ATTR_IS_TRADESKILL,
-    SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_LEARN_PET_SPELL, SPELL_EFFECT_LEARN_SPELL,
-    SPELL_EFFECT_SKILL_STEP,
+    substitute_parts, ExpandAt, SkillLineCatalog, SpellCatalog, TokenContext,
+    SPELL_ATTR_IS_TRADESKILL, SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_LEARN_PET_SPELL,
+    SPELL_EFFECT_LEARN_SPELL, SPELL_EFFECT_SKILL_STEP,
 };
 use benilla_protocol::messages::{trainer_spell_state, TrainerSpell};
-use benilla_ui::script::{TrainerServiceCategory, TrainerTooltip, TRAINER_GROUP_KNOWN};
+use benilla_ui::script::{
+    ProductWait, TooltipText, TrainerServiceCategory, TrainerTooltip, TRAINER_GROUP_KNOWN,
+};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
@@ -42,7 +44,8 @@ pub(super) fn service_icon(
     )
 }
 
-/// [`service_icon`], with `wait` set to the product whose record the lookup (`0x4d9096`) missed:
+/// [`service_icon`], with `wait` set to the product whose record the lookup (`0x4d9096`) missed,
+/// beside the taught spell its owner is built from:
 /// the callback `0x4d9140` each getter call keeps on it (`0x4d907e`) runs `0x4d7d40` when it lands.
 pub(super) fn service_icon_waiting(
     wire_spell: u32,
@@ -51,7 +54,7 @@ pub(super) fn service_icon_waiting(
     icons: Option<&ItemDisplays>,
     items: &Items,
     ask: Ask<'_>,
-    wait: &mut Option<u32>,
+    wait: &mut Option<ProductWait>,
 ) -> Option<String> {
     let wire = spells.get(wire_spell)?;
     if trainer_type == TRAINER_TYPE_TRADESKILL {
@@ -63,13 +66,15 @@ pub(super) fn service_icon_waiting(
             .map(|i| wire.effect_trigger_spell[i])
             .filter(|&t| t != 0);
         // The taught spell's product item, slot 0 only.
-        if let Some(product) = taught
-            .and_then(|t| spells.get(t))
-            .map(|d| d.effect_item_type[0])
-            .filter(|&e| e != 0)
+        if let Some((taught, product)) = taught
+            .and_then(|t| spells.get(t).map(|d| (t, d.effect_item_type[0])))
+            .filter(|&(_, e)| e != 0)
         {
             let Some(template) = items.template(product, 0, ask) else {
-                *wait = Some(product);
+                *wait = Some(ProductWait {
+                    item: product,
+                    taught,
+                });
                 return None;
             };
             return item_icon(icons, template.display_info_id);
@@ -147,10 +152,11 @@ pub(super) fn service_description(
     text: &ServiceText,
 ) -> Option<String> {
     service_description_waiting(wire, trainer_type, spells, items, ask, text, &mut None)
+        .map(|t| t.text(benilla_ui::strings::Strings::Host(text.player.global)))
 }
 
 /// [`service_description`], with `wait` set to the recipe's product whose record the lookup
-/// (`0x4d9d07`) missed: the callback `0x4d9db0` each getter call keeps on it (`0x4d9cef`) runs
+/// (`0x4d9d07`) missed, beside the taught spell its owner is built from: the callback `0x4d9db0` each getter call keeps on it (`0x4d9cef`) runs
 /// `0x4d7d40` when it lands. A product id of 0 is never looked up, so it keeps none.
 pub(super) fn service_description_waiting(
     wire: &TrainerSpell,
@@ -159,8 +165,16 @@ pub(super) fn service_description_waiting(
     items: &Items,
     ask: Ask<'_>,
     text: &ServiceText,
-    wait: &mut Option<u32>,
-) -> Option<String> {
+    wait: &mut Option<ProductWait>,
+) -> Option<TooltipText> {
+    // The expander's text, each template it names left to the getter's read of the VM's strings.
+    fn substitute(
+        text: &str,
+        d: &benilla_formats::SpellDisplay,
+        ctx: &TokenContext,
+    ) -> TooltipText {
+        crate::ui_tooltip::tooltip_text(substitute_parts(text, d, ctx, ExpandAt::default()))
+    }
     let d = spells.get(wire.spell)?;
     let learn = (0..3).find(|&i| {
         matches!(
@@ -182,7 +196,8 @@ pub(super) fn service_description_waiting(
         }
     }
     if let Some(slot) = learn {
-        if let Some(taught) = spells.get(d.effect_trigger_spell[slot]) {
+        let taught_id = d.effect_trigger_spell[slot];
+        if let Some(taught) = spells.get(taught_id) {
             if let Some(t) = taught.description.as_deref().filter(|t| !t.is_empty()) {
                 return Some(substitute(t, taught, caster(slot)));
             }
@@ -193,10 +208,15 @@ pub(super) fn service_description_waiting(
                 let product = taught.effect_item_type[0];
                 match items.template(product, 0, ask) {
                     Some(item) if !item.description.is_empty() => {
-                        return Some(item.description.clone());
+                        return Some(TooltipText::from(item.description.clone()));
                     }
                     Some(_) => {}
-                    None if product != 0 => *wait = Some(product),
+                    None if product != 0 => {
+                        *wait = Some(ProductWait {
+                            item: product,
+                            taught: taught_id,
+                        })
+                    }
                     None => {}
                 }
             }
@@ -215,7 +235,8 @@ pub(super) fn service_group(
     trainer_type: u32,
     category: TrainerServiceCategory,
     spells: &SpellCatalog,
-    skill_lines: Option<&SkillLineCatalog>,
+    // With the player's race and class, which index the line.
+    skill_lines: Option<(&SkillLineCatalog, (u8, u8))>,
     // The VM's own `GlobalStrings.lua`, for the header labels.
     get: &dyn Fn(&str) -> Option<String>,
 ) -> (u32, String) {
@@ -236,13 +257,13 @@ pub(super) fn service_group(
         );
     }
     let line = skill_lines
-        .and_then(|c| c.spell_to_line(taught))
+        .and_then(|(c, (race, class))| c.spell_to_line(taught, race, class))
         .unwrap_or(0);
     if line == 0 {
         return (0, String::new());
     }
     let name = skill_lines
-        .and_then(|c| c.line(line))
+        .and_then(|(c, _)| c.line(line))
         .map(|l| l.name.clone())
         .unwrap_or_else(|| format!("Skill {line}"));
     (line, name)
@@ -277,9 +298,9 @@ pub(super) fn service_kind(wire_spell: u32, spells: &SpellCatalog) -> (bool, Opt
 /// re-evaluator's 3 (`0x4d7e3e`, `0x4d83a4`) among them; vmangos sends 0 to 2
 /// (`NPCHandler.cpp:113`).
 ///
-/// Deviation: benilla hides every state from 3 up. The reference shows bytes 32 and up, because
-/// x86 `shl` wraps its count (bits 32-34 alias 0-2) and its group counter `[hdr+4+state*4]`
-/// (`0x4d7854`) runs past the header.
+/// Deviation: benilla hides every state from 3 up. The reference shows states 32-34, 64-66 …
+/// 224-226 and hides the gaps, because x86 `shl` uses its count's low 5 bits and only filter bits
+/// 0-2 are set (`0x4da390`); its group counter `[hdr+4+state*4]` (`0x4d7854`) runs past the header.
 pub(super) fn category(state: u8) -> TrainerServiceCategory {
     match state {
         trainer_spell_state::GREEN => TrainerServiceCategory::Available,

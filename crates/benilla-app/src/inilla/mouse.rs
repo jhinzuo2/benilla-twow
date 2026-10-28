@@ -17,7 +17,7 @@ use bevy::input::mouse::{MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWh
 use bevy::input::ButtonState;
 use bevy::math::DVec2;
 use bevy::prelude::*;
-use bevy::window::{CursorLeft, CursorMoved, PrimaryWindow};
+use bevy::window::{CursorLeft, CursorMoved, PrimaryWindow, WindowEvent};
 
 use inilla_core::touch::{MouseButton as KButton, MouseOp};
 
@@ -68,6 +68,9 @@ pub(crate) fn apply(
     mut wheel: MessageWriter<MouseWheel>,
     mut moved: MessageWriter<CursorMoved>,
     mut left_window: MessageWriter<CursorLeft>,
+    // The window's interleaved stream, which the interface's input records read
+    // (`ui_script::records`): winit writes each mouse message there too, so this does.
+    mut stream: MessageWriter<WindowEvent>,
 ) {
     let Ok((window_entity, mut window)) = windows.single_mut() else {
         return;
@@ -88,11 +91,13 @@ pub(crate) fn apply(
                         f64::from(p.x) * scale,
                         f64::from(p.y) * scale,
                     )));
-                    moved.write(CursorMoved {
+                    let ev = CursorMoved {
                         window: window_entity,
                         position: p,
                         delta,
-                    });
+                    };
+                    stream.write(WindowEvent::CursorMoved(ev.clone()));
+                    moved.write(ev);
                     vm.pos = Some(p);
                     moved_this_frame = true;
                 }
@@ -108,7 +113,7 @@ pub(crate) fn apply(
                 };
                 if *held != down {
                     *held = down;
-                    buttons.write(MouseButtonInput {
+                    let ev = MouseButtonInput {
                         button: button(b),
                         state: if down {
                             ButtonState::Pressed
@@ -116,7 +121,9 @@ pub(crate) fn apply(
                             ButtonState::Released
                         },
                         window: window_entity,
-                    });
+                    };
+                    stream.write(WindowEvent::MouseButtonInput(ev));
+                    buttons.write(ev);
                     clicked_this_frame = true;
                 }
             }
@@ -129,12 +136,14 @@ pub(crate) fn apply(
                 });
             }
             MouseOp::Wheel(n) => {
-                wheel.write(MouseWheel {
+                let ev = || MouseWheel {
                     unit: MouseScrollUnit::Line,
                     x: 0.0,
                     y: n,
                     window: window_entity,
-                });
+                };
+                stream.write(WindowEvent::MouseWheel(ev()));
+                wheel.write(ev());
             }
             MouseOp::Leave => {
                 if vm.left || vm.right || clicked_this_frame {
@@ -153,6 +162,9 @@ pub(crate) fn apply(
                 }
                 if vm.pos.is_some() {
                     window.set_physical_cursor_position(None);
+                    stream.write(WindowEvent::CursorLeft(CursorLeft {
+                        window: window_entity,
+                    }));
                     left_window.write(CursorLeft {
                         window: window_entity,
                     });

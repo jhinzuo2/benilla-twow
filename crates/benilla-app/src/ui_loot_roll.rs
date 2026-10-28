@@ -223,6 +223,12 @@ impl LootRolls {
         }
     }
 
+    /// Whether roll `roll_id` is still listed.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, roll_id: u32) -> bool {
+        self.active.iter().any(|r| r.roll_id == roll_id)
+    }
+
     /// Our own vote: drop the roll and return its wire identity; `None` for a stale click. The
     /// vote's `CANCEL_LOOT_ROLL` fired in the verb, so none is queued here.
     fn vote(&mut self, roll_id: u32) -> Option<(u64, u32)> {
@@ -269,13 +275,30 @@ mod net {
             .net_handler(K::Disconnected, on_session_end);
     }
 
-    fn on_packet(In(ev): In<SessionEvent>, mut rolls: ResMut<LootRolls>) {
+    fn on_packet(
+        In(ev): In<SessionEvent>,
+        mut rolls: ResMut<LootRolls>,
+        loot: Option<ResMut<crate::ui_loot::LootState>>,
+    ) {
         match ev {
             SessionEvent::LootStartRoll(p) => loot_start_roll(p, &mut rolls),
             SessionEvent::LootRoll(p) => loot_roll(p, &mut rolls),
-            SessionEvent::LootRollWon(p) => loot_roll_won(p, &mut rolls),
-            SessionEvent::LootAllPassed(p) => loot_all_passed(p, &mut rolls),
+            SessionEvent::LootRollWon(p) => {
+                resolved(loot, p.looted_target, p.item_slot);
+                loot_roll_won(p, &mut rolls);
+            }
+            SessionEvent::LootAllPassed(p) => {
+                resolved(loot, p.looted_target, p.item_slot);
+                loot_all_passed(p, &mut rolls);
+            }
             _ => {}
+        }
+    }
+
+    /// The window's row stops waiting on the roll (`ClearLootRollState 0x5ebcf0`).
+    fn resolved(loot: Option<ResMut<crate::ui_loot::LootState>>, guid: u64, slot: u32) {
+        if let (Some(mut loot), Ok(slot)) = (loot, u8::try_from(slot)) {
+            loot.roll_resolved(guid, slot);
         }
     }
 
@@ -320,12 +343,8 @@ impl Plugin for UiLootRollPlugin {
         net::register(app);
         app.init_resource::<LootRolls>().add_systems(
             Update,
-            (
-                // The feed before the input pass shows a new roll the same frame; the drain after
-                // it sends a vote the same frame.
-                feed_loot_rolls.in_set(UiFeed),
-                drain_loot_rolls.in_set(crate::ui_script::UiDrain),
-            ),
+            // The feed after the packets shows a new roll the same frame, before the tick.
+            feed_loot_rolls.in_set(UiFeed),
         );
     }
 }
@@ -588,8 +607,9 @@ fn snapshot(
 
 /// Tick the open rolls, push them into the VM, fire their events and post their chat lines.
 fn feed_loot_rolls(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    mut rolls: ResMut<LootRolls>,
+    // The rolls, which a vote's call closes: the events their handlers vote from go out once the
+    // pushes are in.
+    mut vm: crate::script_calls::VmWith<ResMut<'static, LootRolls>>,
     items: Res<Items>,
     names: Res<NameCache>,
     icons: Option<Res<ItemDisplays>>,
@@ -604,7 +624,7 @@ fn feed_loot_rolls(
     // (`0x61ba3a`, `0x61bafe`, `0x61c0b9`).
     loot: Res<crate::ui_loot::LootConfig>,
 ) {
-    hosted_vm.run(|script| {
+    vm.feed(|script, mut rolls, fires| {
         rolls.tick(time.delta().as_millis() as u32);
 
         let Some(script) = script else {
@@ -665,7 +685,7 @@ fn feed_loot_rolls(
         // four-frame `GroupLootFrame_OpenNewFrame` drops it.
         for roll_id in std::mem::take(&mut rolls.cancelled) {
             debug!("ui_loot_roll: roll {roll_id} cancelled");
-            script.fire_event("CANCEL_LOOT_ROLL", vec![ScriptValue::Int(roll_id as i64)]);
+            fires.post("CANCEL_LOOT_ROLL", vec![ScriptValue::Int(roll_id as i64)]);
         }
         for r in &mut rolls.active {
             if r.phase != Phase::Starting {
@@ -676,7 +696,7 @@ fn feed_loot_rolls(
                 "ui_loot_roll: roll {} opened ({} ms, held {} ms)",
                 r.roll_id, r.countdown_ms, r.held_ms
             );
-            script.fire_event(
+            fires.post(
                 "START_LOOT_ROLL",
                 vec![
                     ScriptValue::Int(r.roll_id as i64),
@@ -687,32 +707,31 @@ fn feed_loot_rolls(
     })
 }
 
-/// Drain the Lua votes: each `RollOnLoot` is one `CMSG_LOOT_ROLL` and closes our frame.
-fn drain_loot_rolls(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    mut rolls: ResMut<LootRolls>,
-    commands: Res<NetCommands>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        // The VM signalled each vote's `CANCEL_LOOT_ROLL`, and a bind-on-pickup Need or Greed's
-        // `CONFIRM_LOOT_ROLL`, inside the verb (`0x61bf2a`, `0x61be8b`).
-        for (roll_id, roll_type) in script.take_loot_roll_votes() {
-            match rolls.vote(roll_id) {
-                Some((looted_target, item_slot)) => {
-                    debug!("ui_loot_roll: vote {roll_type} on roll {roll_id}");
-                    let _ = commands.0.send(ClientCommand::LootRoll {
-                        looted_target,
-                        item_slot,
-                        roll_type,
-                    });
-                }
-                None => debug!("ui_loot_roll: RollOnLoot({roll_id}) — no such roll, ignored"),
+/// The vote inside its call ([`benilla_ui::script::LootRollCall`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct LootRollSteps<'w> {
+    /// Absent in a world with no group loot, which drops the votes.
+    rolls: Option<ResMut<'w, LootRolls>>,
+    net: Res<'w, NetCommands>,
+}
+
+impl LootRollSteps<'_> {
+    /// `0x61bdf0` past its gate: `CMSG_LOOT_ROLL` with the roll's wire identity (`0x61bf18`), and
+    /// the roll closed with the next one promoted (`0x61bf32`-`0x61bf46`); the VM signals the
+    /// vote's `CANCEL_LOOT_ROLL` after this returns (`0x61bf2a`). A stale id is dropped.
+    pub(crate) fn vote(&mut self, roll_id: u32, roll_type: u8) {
+        match self.rolls.as_deref_mut().and_then(|r| r.vote(roll_id)) {
+            Some((looted_target, item_slot)) => {
+                debug!("ui_loot_roll: vote {roll_type} on roll {roll_id}");
+                let _ = self.net.0.send(ClientCommand::LootRoll {
+                    looted_target,
+                    item_slot,
+                    roll_type,
+                });
             }
+            None => debug!("ui_loot_roll: RollOnLoot({roll_id}) — no such roll, ignored"),
         }
-    })
+    }
 }
 
 #[cfg(test)]

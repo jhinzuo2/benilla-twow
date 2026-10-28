@@ -5,7 +5,7 @@
 //! health on the `<name>StatusBar` child. The world mouseover drives it through
 //! [`super::UiScript::world_tooltip_unit`]; unit-frame hovers call `SetUnit` from Lua.
 
-use mlua::{Lua, Table};
+use mlua::{Lua, Table, Value};
 
 use super::object::frame_handle_of;
 use super::tooltip::{append_line, clear, set_owner_core, show_or_hide_empty};
@@ -90,15 +90,17 @@ struct Viewer {
 
 /// The active player toward `u`, through the host's relation functions as `UnitCanAttack` and
 /// `UnitCanAssist` ask them.
-fn viewer(model: &Model, u: &UnitState) -> Option<Viewer> {
+fn viewer(lua: &Lua, model: &Model, u: &UnitState) -> Option<Viewer> {
     let me = model.unit_guids.player;
     if me == 0 {
         return None;
     }
-    let player = model.unit("player");
-    let rel = model.unit_relations.as_deref();
+    let player = model.snapshot_unit("player");
     let ask = |f: &dyn Fn(&dyn super::UnitRelations) -> Option<bool>| {
-        u.has_object && rel.and_then(f).unwrap_or(false)
+        u.has_object
+            && super::unit::with_relations(lua, model, f)
+                .flatten()
+                .unwrap_or(false)
     };
     Some(Viewer {
         drunk: player.map_or(0, |p| p.drunk),
@@ -133,6 +135,9 @@ pub enum TooltipTint {
     /// The skill-difficulty ramp `0x529fa0` of a known opener's value against the requirement:
     /// a skill-opened "Locked" line (`0x52ab31`) and `LOCKED_WITH_SPELL_KNOWN` (`0x52abd8`).
     Skill { required: i32, value: i32 },
+    /// `0xc0d3e8` = `0xffffd200`, the name line's gold: a type handler's lines, which
+    /// `0x530380` adds with that colour on both cells (`0x53038d`, `0x530392`).
+    Gold,
 }
 
 /// `CreatureType.dbc` id 10, "Not specified".
@@ -222,11 +227,10 @@ fn level_line(
 fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
     let h = frame_handle_of(lua, this)?;
     // A unit is its object, found by guid (`0x52a021`); guid 0 finds none.
-    let (unit, viewer, player_level, skinning, me) = {
+    let (unit, viewer, req, me) = {
         let model = lua.app_data_mut::<Model>().expect("model app_data");
-        let unit = model
-            .unit(token)
-            .cloned()
+        let unit = crate::script::unit::view(lua, &model, token)
+            .map(std::borrow::Cow::into_owned)
             .filter(|u| u.exists && u.guid != 0);
         // The group record by guid, for every unit shown (`0x52a02b`): its member row's.
         let unit = unit.map(|mut u| {
@@ -237,16 +241,11 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
                 .and_then(|row| row.tooltip.party.clone());
             u
         });
-        let viewer = unit.as_ref().and_then(|u| viewer(&model, u));
-        let req = &model.player_req;
-        (
-            unit,
-            viewer,
-            req.level,
-            req.skinning,
-            model.unit_guids.player,
-        )
+        let viewer = unit.as_ref().and_then(|u| viewer(lua, &model, u));
+        let req = crate::script::requirements::player_req(lua, &model);
+        (unit, viewer, req, model.unit_guids.player)
     };
+    let player_level = crate::script::ReqRead::head(&req).level;
     clear(lua, h);
     let Some(u) = unit else {
         super::visibility::set_shown(lua, h, false);
@@ -325,7 +324,8 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
         // `UNIT_SKINNABLE` (`0x529ed0`): unit flags bit 26 off a creature (`0x52a914`,
         // `0x52a924`), red but for a player with the skinning spell (`0x529eed`-`0x529f86`).
         if u.skinnable && !u.is_player {
-            let color = skinning.map_or(RED, |value| {
+            // The latched spell's points, read only for a skinnable unit (`0x529f06`).
+            let color = crate::script::ReqRead::skinning(&req).map_or(RED, |value| {
                 super::tooltip_item::names::skill_color(skinning_required(u.level), value)
             });
             keyed_line(lua, this, "UNIT_SKINNABLE", color)?;
@@ -489,7 +489,7 @@ impl super::UiScript {
     }
 
     /// Show the world-mouseover GameObject tooltip (builder `0x52aa20`): the backdrop tinted, the
-    /// name in gold, then the caller's lock lines. The anchor forks on the object's
+    /// name in gold, then the caller's handler and lock lines. The anchor forks on the object's
     /// `[vtbl+0x5c]`: true (`0x492a01`) owns it by `UIParent` in mode 6, `ANCHOR_CURSOR`
     /// (`0x52ffe0(UIParent, 6, 0, 0)` at `0x492a1e`), which the tooltip's own update then keeps on
     /// the cursor; false (`0x492a42`) fires `OnTooltipSetDefaultAnchor` for the default corner, as
@@ -517,6 +517,7 @@ impl super::UiScript {
                     TooltipTint::Skill { required, value } => {
                         super::tooltip_item::names::skill_color(required, value)
                     }
+                    TooltipTint::Gold => GOLD,
                 };
                 append_line(lua, this, (text.clone(), colour), None, false)?;
             }
@@ -547,7 +548,7 @@ impl super::UiScript {
             let Some(root) = model.arena.lookup("UIParent") else {
                 return false;
             };
-            (h, model.frame_id(h), root)
+            (h, model.frame_id(h), model.frame_id(root))
         };
         if cursor {
             set_owner_core(&self.lua, h, Some(root), TooltipAnchor::Cursor, 0.0, 0.0);
@@ -572,13 +573,13 @@ impl super::UiScript {
         true
     }
 
-    /// Show the minimap blip tooltip (an `AreaPOI` or quest-dot name), from `Minimap`'s own hover
-    /// probe `0x4eb0c0`: owned by `Minimap` itself (`0x4eb19c` keeps `this + 0x24`, pushed at
-    /// `0x4eb57d`) in mode 6, `ANCHOR_CURSOR` (`0x4eb587`), so the tooltip's own update keeps it on
-    /// the cursor; one gold line, faint gold for a cross-interior dot; then the show
-    /// (`0x4eb85f`/`0x4eb869`). The blip is held until the probe finds none
+    /// Show the minimap blip tooltip, from `Minimap`'s own hover probe `0x4eb0c0`: owned by
+    /// `Minimap` itself (`0x4eb19c` keeps `this + 0x24`, pushed at `0x4eb57d`) in mode 6,
+    /// `ANCHOR_CURSOR` (`0x4eb587`), so the tooltip's own update keeps it on the cursor; `text`, the
+    /// names of everything under the cursor joined by `\n`, as one gold line (`0x530380`); then the
+    /// show (`0x4eb85f`/`0x4eb869`). The text is held until the probe finds nothing
     /// ([`Self::minimap_blip_lost`]) or misses the Minimap.
-    pub fn minimap_tooltip(&mut self, text: &str, grey: bool) -> bool {
+    pub fn minimap_tooltip(&mut self, text: &str) -> bool {
         let (h, id, root) = {
             let mut model = self.model_mut();
             let Some(h) = model.arena.lookup("GameTooltip") else {
@@ -587,7 +588,7 @@ impl super::UiScript {
             let Some(root) = model.arena.lookup("Minimap") else {
                 return false;
             };
-            (h, model.frame_id(h), root)
+            (h, model.frame_id(h), model.frame_id(root))
         };
         let wrapper = match super::object::frame_wrapper(&self.lua, id) {
             Ok(w) => w,
@@ -597,14 +598,7 @@ impl super::UiScript {
             }
         };
         set_owner_core(&self.lua, h, Some(root), TooltipAnchor::Cursor, 0.0, 0.0);
-        // A cross-interior entry's `|cffb0b0b0` wrap modulates the gold: faint gold, not grey.
-        let dim = 0xb0 as f32 / 255.0;
-        let color = if grey {
-            [GOLD[0] * dim, GOLD[1] * dim, GOLD[2] * dim, 1.0]
-        } else {
-            GOLD
-        };
-        if let Err(e) = append_line(&self.lua, &wrapper, (text.to_string(), color), None, false) {
+        if let Err(e) = append_line(&self.lua, &wrapper, (text.to_string(), GOLD), None, false) {
             self.push_error(e);
             return false;
         }
@@ -619,9 +613,12 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // GameTooltip:SetUnit(token) → 1 or nil, which `UnitFrame_OnEnter` reads to arm its re-poll.
     m.set(
         "SetUnit",
-        lua.create_function(|lua, (this, token): (Table, String)| {
-            // The token gate every `Unit*` verb uses: an unknown token raises. Not in
-            // `render_unit`, which the app calls with canonical tokens.
+        lua.create_function(|lua, (this, token): (Table, Value)| {
+            frame_handle_of(lua, &this)?;
+            // `is-number-or-string` else `Usage: SetUnit("unit")` (`0x534a42`, `0x84f284`).
+            let token = super::binding_abi::string_arg(lua, token, r#"Usage: SetUnit("unit")"#)?;
+            // The token gate every `Unit*` verb uses (`0x515970`): an unknown token raises. Not
+            // in `render_unit`, which the app calls with canonical tokens.
             crate::script::unit::check_unit_token(&Some(token.clone()))?;
             let ok = render_unit(lua, &this, &token)?;
             Ok(if ok {

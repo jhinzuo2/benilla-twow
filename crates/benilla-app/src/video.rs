@@ -4,9 +4,9 @@
 //!
 //! Deviation: `gxWindow "0"` is borderless fullscreen, not 1.12's exclusive mode-set at
 //! `gxResolution`, because Wayland has no client mode-setting (winit ignores
-//! `Fullscreen::Exclusive` there), X11's XRandR changes the desktop's mode and a crash leaves it
-//! changed, and macOS has no exclusive mode. Bevy's `WindowMode::Fullscreen` also panics on a live
-//! change that cannot resolve a monitor (`bevy_winit::winit_windows:91`, `system.rs:333`).
+//! `Fullscreen::Exclusive` there), and X11's XRandR changes the desktop's mode and a crash leaves
+//! it changed. Bevy's `WindowMode::Fullscreen` also panics on a live change that cannot resolve a
+//! monitor (`bevy_winit::winit_windows:91`, `system.rs:333`).
 //!
 //! The `gx*` rows are latched until `RestartGx()`, as in 1.12; a restart re-asserts them against
 //! the window rather than re-creating the device, since wgpu reconfigures the surface live.
@@ -373,7 +373,8 @@ pub(crate) fn on_cvar(
         }
         // Not applied until the next launch (the filter policy is published once at the end of
         // `CvarLoad`); the reference registers both with `flags = 1` and applies them live.
-        // `anisotropic` takes the reference's clamp to `[1, 16]` (`0x689110`).
+        // `anisotropic` is refused outside `[1, 16]` before it reaches here (`0x689110`,
+        // `check_anisotropic`); the clamp covers a saved value, which the file read does not check.
         "trilinear" => tex_filter.trilinear = ev.flag(),
         "anisotropic" => {
             tex_filter.aniso = (v as u32).clamp(
@@ -407,8 +408,8 @@ pub(crate) fn on_cvar(
             );
         }
         // Weather Intensity 0..3: the reference's callback `0x67b870` jumps (`0x67b8e8`) to the
-        // quality cells {0.1, 0.33, 0.66, 1.0} at `[0x8680ec]`. Its off-grid handling is
-        // untraced; this clamps.
+        // quality cells {0.1, 0.33, 0.66, 1.0} at `[0x8680ec]`, and refuses a value outside 0..=3
+        // before it applies (`check_weather_density`); the clamp covers a saved value.
         "weatherdensity" => weather.weather_density = v.trunc().clamp(0.0, 3.0) as u8,
         // Spell Detail (`0x689510`): `SStrToInt`, clamped to [0, 2] in the handler's own copy,
         // echoed, then the emission scalar 0.33, 0.66 or 1.0 through `0x7adfb0`, shared with
@@ -603,13 +604,7 @@ fn publish_display_modes(
         let Ok(window) = windows.single() else {
             return;
         };
-        let res = &window.resolution;
-        let current = Some(ScreenResolution {
-            width: res.width() as u32,
-            height: res.height() as u32,
-        })
-        .filter(|r| r.width > 0 && r.height > 0);
-        let offered = offered_modes(monitors.iter(), widescreen);
+        let (offered, current) = display_modes(window, monitors.iter(), widescreen);
         // Keyed by VM: a `ReloadUI` VM has been pushed nothing, so a plain `Local` would skip it.
         let memo = last.get(script);
         if memo.as_ref() == Some(&(offered.clone(), current)) {
@@ -618,6 +613,50 @@ fn publish_display_modes(
         *memo = Some((offered.clone(), current));
         script.set_screen_resolutions(offered, current);
     })
+}
+
+/// The list [`publish_display_modes`] pushes and the live window size as its current entry.
+fn display_modes<'a>(
+    window: &Window,
+    monitors: impl IntoIterator<Item = &'a Monitor>,
+    widescreen: bool,
+) -> (Vec<ScreenResolution>, Option<ScreenResolution>) {
+    let res = &window.resolution;
+    let current = Some(ScreenResolution {
+        width: res.width() as u32,
+        height: res.height() as u32,
+    })
+    .filter(|r| r.width > 0 && r.height > 0);
+    (offered_modes(monitors, widescreen), current)
+}
+
+/// The resolution list read at the call, the call host's half of
+/// [`benilla_ui::script::ScreenModesQuery`]: the reference builds it on the first use of any
+/// resolution verb (`0x48bc90`), so a file-scope `GetScreenResolutions()` during the UI load
+/// answers the full list, from the same source as [`publish_display_modes`]; the multisample list
+/// likewise ([`benilla_ui::script::MultisampleFormatsQuery`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct DisplayLive<'w, 's> {
+    windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    monitors: Query<'w, 's, &'static Monitor>,
+    widescreen: Option<Res<'w, Widescreen>>,
+    /// The device's multisample formats, which the multisample verbs read (`0x48c3e0`).
+    msaa: Option<Res<'w, benilla_world::view::MsaaFormats>>,
+}
+
+impl crate::script_calls::live::LiveFamily for DisplayLive<'_, '_> {
+    fn answer(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        ask.answer(|_: &benilla_ui::script::ScreenModesQuery| {
+            let window = self.windows.single().ok()?;
+            let widescreen = self.widescreen.as_deref().is_none_or(|w| w.0);
+            let (offered, current) = display_modes(window, self.monitors.iter(), widescreen);
+            Some(benilla_ui::script::ScreenModes { offered, current })
+        }) || ask.answer(|_: &benilla_ui::script::MultisampleFormatsQuery| {
+            self.msaa
+                .as_deref()
+                .map(|f| crate::cvars::multisample_formats(Some(f)))
+        })
+    }
 }
 
 /// Check the window got the size `$WOW_WIN` asked for: the window manager may clamp it to the
@@ -848,6 +887,64 @@ const GX_RESOLUTION: &str = "gxResolution";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Vulkan presentation stall past wgpu-core's 1 s frame timeout is waited out, not turned
+    /// into a lost device, only while the lock resolves wgpu-hal to `third_party/wgpu-hal`, the
+    /// copy with the stall budget (`third_party/wgpu-hal/BENILLA.md`). A registry entry in the
+    /// lock, a bumped version or a dropped hunk fails here, not on a Windows or Linux player.
+    #[test]
+    fn wgpu_hal_resolves_to_the_vendored_stall_patch() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+
+        let lock = read("Cargo.lock");
+        let entry = lock
+            .split("[[package]]")
+            .find(|p| p.trim_start().starts_with("name = \"wgpu-hal\""))
+            .expect("Cargo.lock has no wgpu-hal");
+        assert!(
+            !entry.lines().any(|l| l.starts_with("source = ")),
+            "wgpu-hal resolves to a registry copy, not the path patch:{entry}"
+        );
+        assert!(
+            read("Cargo.toml").contains("wgpu-hal = { path = \"third_party/wgpu-hal\" }"),
+            "the root Cargo.toml lost its [patch.crates-io] wgpu-hal path"
+        );
+
+        let version = |manifest: &str| {
+            manifest
+                .lines()
+                .find_map(|l| l.strip_prefix("version = "))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            version(entry),
+            version(&read("third_party/wgpu-hal/Cargo.toml")),
+            "the vendored wgpu-hal is not the version the lock resolves"
+        );
+
+        let instance = read("third_party/wgpu-hal/src/vulkan/instance.rs");
+        for hunk in [
+            "const STALL_BUDGET",
+            "Err(vk::Result::TIMEOUT) if retry_stall(stall_start, timeout_ns)",
+            "vkWaitForFences on the acquired image returned",
+            "waiting for the previous submission timed out",
+        ] {
+            assert!(
+                instance.contains(hunk),
+                "the vendored acquire_texture lost `{hunk}`"
+            );
+        }
+        assert!(
+            instance
+                .matches("retry_stall(stall_start, timeout_ns)")
+                .count()
+                == 3,
+            "acquire_texture retries the previous-submission wait, the acquire and the post-acquire fence wait"
+        );
+    }
 
     /// Synced is `Fifo`, not `AutoVsync` (`FifoRelaxed`, which tears on a late frame).
     #[test]

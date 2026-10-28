@@ -1,12 +1,14 @@
-//! The guild-charter globals of the guild registrar and the petition window. The snapshot keeps
-//! the signer list (`[0xbdce20]`) and the cached `CGPetition` record (`[0xbdce28]`) apart, as the
-//! reference does, since the bindings read them independently. Predicates are `1` or nil (no
-//! `lua_pushboolean`: `0x6f3810`, `0x6f37f0`) and an unresolved name is nil. `PETITION_SHOW` waits
-//! for every signer name and the record (`0x4f419b`), a deferral `crate::ui_petition` owns.
+//! The guild-charter globals of the guild registrar and the petition window, read through the lent
+//! host at the call ([`PetitionQuery`]). The state keeps the signer list (`[0xbdce20]`) and the
+//! cached `CGPetition` record (`[0xbdce28]`) apart, as the reference does, since the bindings read
+//! them independently. Predicates are `1` or nil (no `lua_pushboolean`: `0x6f3810`, `0x6f37f0`)
+//! and an unresolved name is nil. `PETITION_SHOW` waits for every signer name and the record
+//! (`0x4f419b`), a deferral `crate::ui_petition` owns.
 
 use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi;
+use super::live::{ask, LiveQuery};
 use super::Model;
 
 /// `GetPetitionInfo`'s first return when the record's charter bit is set (`0x84cf8c`, selected at
@@ -36,7 +38,8 @@ pub struct PetitionRecordView {
     pub is_originator: bool,
 }
 
-/// What the two charter windows read, mirroring the reference module's `.data` state.
+/// What the two charter windows read, mirroring the reference module's `.data` state; the
+/// answer to [`PetitionQuery`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PetitionState {
     /// `GetGuildCharterCost()`: showlist entry 0's cost (`[0xbdce50]`) in copper, which `0x4f50ed`
@@ -51,6 +54,20 @@ pub struct PetitionState {
     /// `CanSignPetition()`, computed app-side as three of its four refusals need state the engine
     /// lacks; it is `1` with nothing open, as in the reference.
     pub can_sign: bool,
+}
+
+/// The question: [`PetitionState`] now, the module's cells (`0xbdce20`, `0xbdce28`, `0xbdce50`)
+/// as the handlers and the calls left them, each name read off the name cache at the call.
+pub struct PetitionQuery;
+
+impl LiveQuery for PetitionQuery {
+    type Answer = PetitionState;
+}
+
+/// The state now: the host's, else the VM's copy, which only a test sets (every production entry
+/// that runs Lua lends the host).
+fn state(lua: &Lua, model: &Model) -> PetitionState {
+    ask(lua, &PetitionQuery).unwrap_or_else(|| model.petition.clone())
 }
 
 /// A charter verb past its binding's checks, which the host applies inside the call
@@ -70,8 +87,11 @@ pub enum PetitionCall {
     /// `GetTabardInfo()` (`0x4f5300`), not a getter: with a player, `MSG_TABARDVENDOR_ACTIVATE`
     /// for the registrar's guid unless the designer is already open on that guid, or the
     /// `ERR_EMBLEMERROR_NOTABARDGEOSET` refusal while the player's display id is not its native
-    /// one (`0x5e00e0`); then the registrar closes (`0x4f5355` → `0x4f5010`).
+    /// one (`0x5e00e0`); then the registrar's close core (`0x4f5355` → `0x4f5010`).
     TabardInfo,
+    /// `CloseGuildRegistrar()` (`0x4f5220`): the registrar's close core `0x4f5010`, its latch
+    /// release, its cell and its `GUILD_REGISTRAR_CLOSED` (`0x4f503a`).
+    CloseRegistrar,
     /// `SignPetition([n])`: a wire byte defaulting to 1, not 0 (`0x4f46d9`); vmangos skips it.
     Sign(i8),
     /// `OfferPetition()`: the host resolves the current target (`CGGameUI`'s selection pair, not
@@ -89,29 +109,9 @@ pub enum PetitionCall {
 }
 
 impl super::UiScript {
-    /// Replace the charter snapshot; the app fires the four events and defers `PETITION_SHOW`.
+    /// Set the VM's copy of the charter state, which the getters read with no host to ask.
     pub fn set_petition(&mut self, state: PetitionState) {
         self.model_mut().petition = state;
-    }
-
-    /// `0x4f3ef0` inside a close: the signers freed, the record still cached for the
-    /// `PETITION_CLOSED` handlers (`0x4f4016`, then `0x4f4078` after the signal).
-    pub fn free_petition_signers(&mut self) {
-        let mut model = self.model_mut();
-        model.petition.signers.clear();
-        model.petition.can_sign = true;
-    }
-
-    /// The close's last step (`0x4f4078`): the record goes.
-    pub fn drop_petition_record(&mut self) {
-        self.model_mut().petition.record = None;
-    }
-
-    /// Take the `CloseGuildRegistrar()` calls made since the last take: the close core needs the
-    /// interaction latch, which a core answers when its own `GUILD_REGISTRAR_CLOSED` raised the
-    /// call through `OnHide`.
-    pub fn take_registrar_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().registrar_close)
     }
 
     /// The charter calls a harness VM kept ([`Self::keep_calls`]), in call order.
@@ -154,7 +154,7 @@ pub fn validate_guild_name(
 
 /// [`validate_guild_name`] against the lists and the charsets this VM's client holds.
 fn check(model: &Model, name: &str) -> Result<(), &'static str> {
-    validate_guild_name(name, &*model.glue.name_lists(), model.name_charsets())
+    validate_guild_name(name, &*model.name_lists(), model.name_charsets())
 }
 
 /// A cached name as a string, an uncached one as nil.
@@ -177,7 +177,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetPetitionInfo",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let Some(r) = model.petition.record.as_ref() else {
+            let Some(r) = state(lua, &model).record else {
                 return Ok(MultiValue::from_vec(vec![
                     Value::Nil,
                     Value::Nil,
@@ -203,7 +203,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetNumPetitionNames",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(model.petition.signers.len() as i64)
+            Ok(state(lua, &model).signers.len() as i64)
         })?,
     )?;
 
@@ -220,10 +220,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 "Usage: GetPetitionNameInfo(index)",
             )?);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let signers = state(lua, &model).signers;
             let Some(name) = usize::try_from(index)
                 .ok()
                 .and_then(|i| i.checked_sub(1))
-                .and_then(|i| model.petition.signers.get(i))
+                .and_then(|i| signers.get(i))
             else {
                 return Ok(Value::Nil);
             };
@@ -238,7 +239,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "CanSignPetition",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(binding_abi::flag(model.petition.can_sign))
+            Ok(binding_abi::flag(state(lua, &model).can_sign))
         })?,
     )?;
 
@@ -248,41 +249,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetGuildCharterCost",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(i64::from(model.petition.charter_cost))
+            Ok(i64::from(state(lua, &model).charter_cost))
         })?,
     )?;
 
     // ── The verbs ────────────────────────────────────────────────────────────────────────────
-    // The five that carry nothing, registered in the reference's table order; none touches the
+    // The six that carry nothing, registered in the reference's table order; none touches the
     // snapshot, which the server owns. `GetTabardInfo`'s stock caller is commented out
     // (`GuildRegistrarFrame.xml:190`).
     let call = |call: PetitionCall| lua.create_function(move |lua, ()| submit(lua, call.clone()));
     g.set("TurnInGuildCharter", call(PetitionCall::TurnIn)?)?;
-    // CloseGuildRegistrar() (`0x4f5010`) is the close core, which needs the interaction latch, so
-    // it stays latch-driven ([`UiScript::take_registrar_close`]) and its `GUILD_REGISTRAR_CLOSED`
-    // signals after the verb, where the reference's signals inside it (`0x4f503a`).
-    g.set(
-        "CloseGuildRegistrar",
-        lua.create_function(|lua, ()| {
-            lua.app_data_mut::<Model>()
-                .expect("model app_data")
-                .registrar_close = true;
-            Ok(())
-        })?,
-    )?;
-    // GetTabardInfo() (`0x4f5300`): the activate inside the call, then the registrar's close core
-    // (`0x4f5355` → `0x4f5010`), latch-driven as `CloseGuildRegistrar` is, so its signal comes
-    // after the verb, not inside it (`0x4f503a`).
-    g.set(
-        "GetTabardInfo",
-        lua.create_function(|lua, ()| {
-            submit(lua, PetitionCall::TabardInfo)?;
-            lua.app_data_mut::<Model>()
-                .expect("model app_data")
-                .registrar_close = true;
-            Ok(())
-        })?,
-    )?;
+    g.set("CloseGuildRegistrar", call(PetitionCall::CloseRegistrar)?)?;
+    g.set("GetTabardInfo", call(PetitionCall::TabardInfo)?)?;
     g.set("OfferPetition", call(PetitionCall::Offer)?)?;
     g.set("ClosePetition", call(PetitionCall::Close)?)?;
 
@@ -617,7 +595,7 @@ mod tests {
     fn the_guild_name_check_is_the_clients() {
         let mut s = UiScript::new().unwrap();
         s.keep_calls();
-        s.set_glue_name_lists(std::rc::Rc::new(ThreeWords));
+        s.set_name_lists(std::rc::Rc::new(ThreeWords));
         let refused = |key: &'static str| PetitionCall::NameRefused(key);
         for (name, want) in [
             ("", refused("ERR_GUILD_ENTER_NAME")),
@@ -692,8 +670,8 @@ mod tests {
         assert_eq!(bought(&mut s, &long), PetitionCall::Buy(long.clone()));
     }
 
-    /// `GetTabardInfo()` pushes nothing (`0x4f535f`), hands the host the designer's opener and
-    /// leaves the registrar's close to the latch (`0x4f5355`).
+    /// `GetTabardInfo()` pushes nothing (`0x4f535f`) and hands the host one call: the designer's
+    /// opener, then the registrar's close core (`0x4f5355`).
     #[test]
     fn get_tabard_info_is_a_call_with_no_returns() {
         let mut s = UiScript::new().unwrap();
@@ -704,7 +682,7 @@ mod tests {
             0
         );
         assert_eq!(s.take_petition_calls(), vec![PetitionCall::TabardInfo]);
-        assert!(s.take_registrar_close());
-        assert!(!s.take_registrar_close(), "taken");
+        s.run("CloseGuildRegistrar()").unwrap();
+        assert_eq!(s.take_petition_calls(), vec![PetitionCall::CloseRegistrar]);
     }
 }

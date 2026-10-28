@@ -1,5 +1,6 @@
-//! The questgiver packet handlers: each fills the [`QuestGiver`] the feed reads, and each panel
-//! packet replaces the open view.
+//! The questgiver packet handlers: each fills the [`QuestGiver`] the getters read through the
+//! host, each panel packet replaces the open view, and each line a handler raises goes on the
+//! questgiver lane where it runs ([`QuestGiverLane`]).
 
 use benilla_protocol::messages::{
     QuestComplete, QuestDetails, QuestGiverList, QuestOfferReward, QuestRequestItems, QuestShareMsg,
@@ -7,7 +8,7 @@ use benilla_protocol::messages::{
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::prelude::*;
 
-use super::{QuestGiver, QuestLine, QuestLines};
+use super::{QuestGiver, QuestGiverLane, QuestLine, QuestLines};
 use crate::net::{ClientCommand, NetCommands, NetHandlerApp};
 use crate::query_cache::Ask;
 use crate::ui_action::UiError;
@@ -30,33 +31,20 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::QuestGiverInvalid, on_giver_invalid)
         .net_handler(K::QuestGiverFailed, on_giver_failed)
         .net_handler(K::QuestTemplate, on_template_giver_failures)
-        .net_handler(K::Disconnected, on_session_end)
-        .net_handler(K::Connected, on_login)
-        .net_handler(K::Worldport, on_worldport);
+        .net_handler(K::Disconnected, on_session_end);
 }
 
-/// The reference's world-enter reset `0x500af0`, run by the enter-world cascade `0x4908c0` on a
-/// login and on every worldport, is the `0xbe0824` latch's only clear.
-fn on_login(In(ev): In<SessionEvent>, mut quest: ResMut<QuestGiver>) {
-    if let SessionEvent::Connected { .. } = ev {
-        world_enter_reset(&mut quest);
-    }
-}
-
-/// The same reset on a worldport.
-fn on_worldport(In(ev): In<SessionEvent>, mut quest: ResMut<QuestGiver>) {
-    if let SessionEvent::Worldport { .. } = ev {
-        world_enter_reset(&mut quest);
-    }
-}
-
+/// The reference's world-enter reset `0x500af0`, run by the enter-world cascade `0x4908c0`
+/// (`0x49099c`) at a login, every worldport and a `/reload` ([`super::world_enter_cascade`]), is
+/// the `0xbe0824` latch's only clear.
 pub(super) fn world_enter_reset(quest: &mut QuestGiver) {
     quest.close_on_cancel = 0;
     // The same reset zeroes the chosen reward (`0x500b15`) and both pools (`0x500b21`-`0x500b5c`).
     quest.chosen_reward = 0;
     quest.pools = super::QuestPools::default();
-    // And the panel kind (`0x500afc`).
+    // And the panel kind (`0x500afc`), and the cells the getters read.
     quest.view = None;
+    quest.world_enter();
 }
 
 fn on_giver_status(In(ev): In<SessionEvent>, mut quest: ResMut<QuestGiver>) {
@@ -95,6 +83,7 @@ fn on_offer(In(ev): In<SessionEvent>, mut commands: Commands) {
 fn on_complete(
     In(ev): In<SessionEvent>,
     mut quest: ResMut<QuestGiver>,
+    mut lane: ResMut<QuestGiverLane>,
     mut lines: ResMut<QuestLines>,
     quest_log: Res<QuestLog>,
     net_commands: Res<NetCommands>,
@@ -106,6 +95,7 @@ fn on_complete(
             .template(c.quest_id, Ask::Event(&net_commands))
             .is_some_and(|t| t.next_quest_in_chain != 0);
         quest_complete(c, &mut quest, &mut lines);
+        lane.push_lines(&mut quest);
         if !chained {
             crate::ui_session::queue(&mut commands, close_without_report);
         }
@@ -139,6 +129,7 @@ fn on_objectives_complete(In(ev): In<SessionEvent>, mut quest: ResMut<QuestGiver
 fn on_failed(
     In(ev): In<SessionEvent>,
     mut quest: ResMut<QuestGiver>,
+    mut lane: ResMut<QuestGiverLane>,
     quest_log: Res<QuestLog>,
     self_q: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
     script: Option<NonSendMut<benilla_ui::script::UiScript>>,
@@ -146,22 +137,30 @@ fn on_failed(
     if let SessionEvent::QuestFailed { quest_id, timed } = ev {
         let store = self_q.iter().next().map(|s| &s.0);
         quest_failed(quest_id, timed, store, script, &quest_log, &mut quest);
+        lane.push_lines(&mut quest);
     }
 }
 
-fn on_log_full(In(ev): In<SessionEvent>, mut quest: ResMut<QuestGiver>) {
+fn on_log_full(
+    In(ev): In<SessionEvent>,
+    mut quest: ResMut<QuestGiver>,
+    mut lane: ResMut<QuestGiverLane>,
+) {
     if let SessionEvent::QuestLogFull = ev {
         quest_log_full(&mut quest);
+        lane.push_lines(&mut quest);
     }
 }
 
 fn on_giver_invalid(
     In(ev): In<SessionEvent>,
     mut quest: ResMut<QuestGiver>,
+    mut lane: ResMut<QuestGiverLane>,
     mut commands: Commands,
 ) {
     if let SessionEvent::QuestGiverInvalid { reason } = ev {
         quest_giver_invalid(reason, &mut quest);
+        lane.push_lines(&mut quest);
         crate::ui_session::queue(&mut commands, close_without_report);
     }
 }
@@ -169,6 +168,7 @@ fn on_giver_invalid(
 fn on_giver_failed(
     In(ev): In<SessionEvent>,
     mut quest: ResMut<QuestGiver>,
+    mut lane: ResMut<QuestGiverLane>,
     mut quest_log: ResMut<QuestLog>,
     script: Option<NonSend<benilla_ui::script::UiScript>>,
     net_commands: Res<NetCommands>,
@@ -184,6 +184,7 @@ fn on_giver_failed(
             &mut quest_log,
             &net_commands,
         );
+        lane.push_lines(&mut quest);
         crate::ui_session::queue(&mut commands, close_without_report);
     }
 }
@@ -194,6 +195,7 @@ fn on_giver_failed(
 fn on_template_giver_failures(
     In(ev): In<SessionEvent>,
     mut quest: ResMut<QuestGiver>,
+    mut lane: ResMut<QuestGiverLane>,
     mut quest_log: ResMut<QuestLog>,
     script: Option<NonSend<benilla_ui::script::UiScript>>,
 ) {
@@ -216,6 +218,7 @@ fn on_template_giver_failures(
     for _ in 0..waiting {
         giver_failed_lines(&t.title, quest_log.giver_failed_reason, latched, &mut quest);
     }
+    lane.push_lines(&mut quest);
 }
 
 /// The handlers' close, `0x501130(0, 0)`: the turn-in of a quest with no next step (`0x5dc6e5`)
@@ -274,7 +277,9 @@ pub(crate) fn quest_detail(world: &mut World, d: QuestDetails) {
         return;
     }
     // The trailing flag is the latch, not part of the view.
-    world.resource_mut::<QuestGiver>().close_on_cancel = d.auto_finish;
+    if super::giver_held(world, d.npc) {
+        world.resource_mut::<QuestGiver>().close_on_cancel = d.auto_finish;
+    }
     super::open_panel(world, d.npc, crate::ui_quest::QuestView::Detail(d));
 }
 
@@ -285,7 +290,9 @@ fn quest_progress(world: &mut World, p: QuestRequestItems) {
         p.quest_id, p.npc, p.is_complete
     );
     // The progress publisher `0x501070` writes `closeOnCancel` into the same latch (`0x50111a`).
-    world.resource_mut::<QuestGiver>().close_on_cancel = p.close_on_cancel;
+    if super::giver_held(world, p.npc) {
+        world.resource_mut::<QuestGiver>().close_on_cancel = p.close_on_cancel;
+    }
     super::open_panel(world, p.npc, crate::ui_quest::QuestView::Progress(p));
 }
 
@@ -297,7 +304,9 @@ fn quest_offer(world: &mut World, o: QuestOfferReward) {
     );
     // The `u32` after the reward text lands in the latch through DETAILS' publisher `0x500ef0`
     // (`0x50101a`).
-    world.resource_mut::<QuestGiver>().close_on_cancel = o.auto_finish;
+    if super::giver_held(world, o.npc) {
+        world.resource_mut::<QuestGiver>().close_on_cancel = o.auto_finish;
+    }
     super::open_panel(world, o.npc, crate::ui_quest::QuestView::Reward(o));
 }
 
@@ -460,6 +469,7 @@ mod tests {
         use bevy::ecs::system::RunSystemOnce;
         let mut world = World::new();
         world.init_resource::<QuestGiver>();
+        world.init_resource::<QuestGiverLane>();
         let mut log = QuestLog::default();
         log.insert_template(crate::ui_quest::test_template(7, "Deliver the Message", 0));
         world.insert_resource(log);
@@ -473,9 +483,8 @@ mod tests {
             world
                 .run_system_once_with(on_failed, SessionEvent::QuestFailed { quest_id: 7, timed })
                 .unwrap();
-            let mut quest = world.resource_mut::<QuestGiver>();
-            let lines = quest.take_messages().len();
-            let reasked = quest.reask_epoch();
+            let lines = world.resource_mut::<QuestGiverLane>().take_lines().len();
+            let reasked = world.resource::<QuestGiver>().reask_epoch();
             let mut script = world.non_send_resource_mut::<benilla_ui::script::UiScript>();
             let refreshes = script.take_quest_giver_refreshes();
             (lines, script.quest_log_latched(7), reasked, refreshes)
@@ -503,7 +512,17 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut world = World::new();
         world.init_resource::<QuestGiver>();
+        world.init_resource::<QuestGiverLane>();
         world.insert_resource(NetCommands(tx));
+        world.init_resource::<crate::net::GuidIndex>();
+        // The givers the tests name, held as units (`0x500bf1`-`0x500c35`).
+        for guid in [0xF130_0000_0000_0007, 0x4000_0000_0000_0BAD, 0x2A] {
+            crate::items::test_spawn_object(
+                &mut world,
+                guid,
+                benilla_protocol::ObjectFields::from_pairs(&[(2, 0x9)]),
+            );
+        }
         (world, rx)
     }
 
@@ -804,12 +823,12 @@ mod tests {
                     SessionEvent::QuestTemplate(Box::new(t)),
                 )
                 .unwrap();
-            world.resource_mut::<QuestGiver>().take_messages()
+            world.resource_mut::<QuestGiverLane>().take_lines()
         };
         failed(&mut world, 373, 0);
         assert!(world
-            .resource_mut::<QuestGiver>()
-            .take_messages()
+            .resource_mut::<QuestGiverLane>()
+            .take_lines()
             .is_empty());
         assert!(!world.resource::<QuestGiver>().is_open());
         assert!(rx

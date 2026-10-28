@@ -1,5 +1,6 @@
-//! The cast and auto-repeat state a press, a script call or a cast result changes on a unit: the
-//! cast's [`Casting`], its [`Precast`] and the auto-repeat markers. They are components, which a system adds or
+//! The cast, attack and auto-repeat state a press, a script call or a cast result changes on a
+//! unit: the cast's [`Casting`], its [`Precast`], the attack target [`Engaged`] and the
+//! auto-repeat markers. They are components, which a system adds or
 //! removes only through a sync point, so the seams that change them (`SelfCancel`, `CastLadder`,
 //! `AttackSeam`) queue the change here and hold no `Commands`: the call host they sit in carries
 //! no deferred buffer, and the VM pass's hosts need no sync point between them.
@@ -8,9 +9,13 @@
 //! one-shots as they return ([`crate::script_calls::with_hosted_vm`],
 //! [`crate::script_calls::run_cached`]). The pass's end set, and a flush in each other schedule
 //! that can queue one, hand it to the sync point ahead of the readers ([`flush_unit_edits`]).
+//! The same queue carries the console commands a call runs against the world, which no host
+//! lends ([`UnitEdits::push_world`]).
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use bevy::ecs::lifecycle::HookContext;
+use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::*;
 
 use bevy::ecs::entity::EntityHashMap;
@@ -18,8 +23,8 @@ use bevy::ecs::entity::EntityHashMap;
 use bevy::ecs::message::Messages;
 
 use super::{
-    precast, AutoRepeatArmed, CastEvent, CastEventKind, Casting, NockLatch, NockedAmmo, PlaySeq,
-    Precast,
+    precast, AutoRepeatArmed, CastEvent, CastEventKind, Casting, Engaged, NockLatch, NockedAmmo,
+    PlaySeq, Precast,
 };
 
 /// One queued change.
@@ -32,6 +37,10 @@ pub(crate) enum UnitEdit {
     /// gates it ([`crate::spell::CastCore::cancel_reaping`]), and the failed cast event the
     /// server's echo would bring, stamped as it applies.
     AbortCasting { entity: Entity, spell_id: u32 },
+    /// `0x614150(spell, 0)` with no cast edge of its own, as the aura cancel stops the cancelled
+    /// spell's kits (`0x6e707e`): its [`Casting`] while that is still this spell's, and a
+    /// [`CastEventKind::Reap`].
+    StopSpellKits { entity: Entity, spell_id: u32 },
     /// The sticky auto-repeat arm (`0x6e593b`, `|= 0x200`).
     ArmAutoRepeat(Entity),
     /// The local auto-repeat stop's unit leg (`0x6ea080`): the arm (`0x6ea113`), the precast of
@@ -53,6 +62,11 @@ pub(crate) enum UnitEdit {
     },
     /// `0x60fc50`: the precast's busy bit alone.
     EndPrecastBusy(Entity),
+    /// StartAttack's send stores the victim as the attack target (`0x5ecd51` → `0x47bf70`:
+    /// `[+0xc48]` the guid, `[+0xc50]` 1), ahead of the server's echo.
+    StartAttack { entity: Entity, target: u64 },
+    /// A unit's death zeroes its attack target (`0x605896`-`0x6058a2`).
+    EndAttack(Entity),
 }
 
 impl UnitEdit {
@@ -60,7 +74,7 @@ impl UnitEdit {
     #[cfg(test)]
     pub(crate) fn writes(&self) -> Vec<std::any::TypeId> {
         match self {
-            Self::ReapCasting { .. } | Self::AbortCasting { .. } => {
+            Self::ReapCasting { .. } | Self::AbortCasting { .. } | Self::StopSpellKits { .. } => {
                 vec![std::any::TypeId::of::<Casting>()]
             }
             Self::ArmAutoRepeat(_) => vec![std::any::TypeId::of::<AutoRepeatArmed>()],
@@ -75,6 +89,9 @@ impl UnitEdit {
             | Self::SendPrecast { .. }
             | Self::EndPrecast { .. }
             | Self::EndPrecastBusy(_) => vec![std::any::TypeId::of::<Precast>()],
+            Self::StartAttack { .. } | Self::EndAttack(_) => {
+                vec![std::any::TypeId::of::<Engaged>()]
+            }
         }
     }
 
@@ -87,6 +104,10 @@ impl UnitEdit {
                 spell_id: 0,
             },
             Self::AbortCasting {
+                entity,
+                spell_id: 0,
+            },
+            Self::StopSpellKits {
                 entity,
                 spell_id: 0,
             },
@@ -109,18 +130,23 @@ impl UnitEdit {
                 tail: true,
             },
             Self::EndPrecastBusy(entity),
+            Self::StartAttack { entity, target: 0 },
+            Self::EndAttack(entity),
         ];
         // A new kind stops this match compiling until it is listed above as well.
         for edit in &every {
             match edit {
                 Self::ReapCasting { .. }
                 | Self::AbortCasting { .. }
+                | Self::StopSpellKits { .. }
                 | Self::ArmAutoRepeat(_)
                 | Self::ClearAutoRepeat { .. }
                 | Self::StartPrecast { .. }
                 | Self::SendPrecast { .. }
                 | Self::EndPrecast { .. }
-                | Self::EndPrecastBusy(_) => {}
+                | Self::EndPrecastBusy(_)
+                | Self::StartAttack { .. }
+                | Self::EndAttack(_) => {}
             }
         }
         every
@@ -141,7 +167,12 @@ impl UnitEdit {
                 Some((entity, Change::End(Some(spell_id))))
             }
             Self::EndPrecastBusy(entity) => Some((entity, Change::Busy)),
-            Self::ReapCasting { .. } | Self::AbortCasting { .. } | Self::ArmAutoRepeat(_) => None,
+            Self::ReapCasting { .. }
+            | Self::AbortCasting { .. }
+            | Self::StopSpellKits { .. }
+            | Self::ArmAutoRepeat(_)
+            | Self::StartAttack { .. }
+            | Self::EndAttack(_) => None,
         }
     }
 }
@@ -153,7 +184,14 @@ pub(crate) struct UnitEdits {
     queue: Mutex<Vec<UnitEdit>>,
     /// Every unit's [`Precast`] as applied, kept by the component's hooks.
     precasts: Mutex<EntityHashMap<Precast>>,
+    /// Every unit's [`Engaged`] target as applied, kept by the component's hooks.
+    attacks: Mutex<EntityHashMap<u64>>,
+    /// What a call runs against the world, after the unit edits, in the order queued.
+    world_runs: Mutex<Vec<WorldRun>>,
 }
+
+/// A call's run against the world ([`UnitEdits::push_world`]).
+pub(crate) type WorldRun = Box<dyn FnOnce(&mut World) + Send>;
 
 impl UnitEdits {
     fn queue(&self) -> MutexGuard<'_, Vec<UnitEdit>> {
@@ -163,6 +201,18 @@ impl UnitEdits {
     /// Queue `edit` behind the ones already queued.
     pub(crate) fn push(&self, edit: UnitEdit) {
         self.queue().push(edit);
+    }
+
+    /// Queue `run` against the world, after the unit edits: a console command that writes engine
+    /// state no host lends ([`crate::console::ConsoleHandler`]).
+    pub(crate) fn push_world(&self, run: WorldRun) {
+        self.runs().push(run);
+    }
+
+    fn runs(&self) -> MutexGuard<'_, Vec<WorldRun>> {
+        self.world_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The precast `entity` holds once the queue applies: the applied one with the queued changes
@@ -184,6 +234,41 @@ impl UnitEdits {
         held
     }
 
+    /// The attack target `entity` holds once the queue applies, `[+0xc48]` (`HasAttackTarget`
+    /// `0x60ecb0` tests it): the applied [`Engaged`] with the queued changes replayed. A link of
+    /// the VM pass reads it here, never off the component, so a swing started earlier in the pass
+    /// reads as started at once, as the reference's local store makes it (`0x5ecd51`).
+    pub(crate) fn attack_target(&self, entity: Entity) -> Option<u64> {
+        let mut held = self
+            .attacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&entity)
+            .copied();
+        for edit in self.queue().iter() {
+            match *edit {
+                UnitEdit::StartAttack { entity: e, target } if e == entity => held = Some(target),
+                UnitEdit::EndAttack(e) if e == entity => held = None,
+                _ => {}
+            }
+        }
+        held
+    }
+
+    /// Whether `entity` is attacking once the queue applies ([`Self::attack_target`]).
+    pub(crate) fn attacking(&self, entity: Entity) -> bool {
+        self.attack_target(entity).is_some()
+    }
+
+    /// [`Engaged`]'s hooks: `entity` now holds `target`.
+    pub(super) fn mirror_attack(&self, entity: Entity, target: Option<u64>) {
+        let mut attacks = self.attacks.lock().unwrap_or_else(PoisonError::into_inner);
+        match target {
+            Some(t) => attacks.insert(entity, t),
+            None => attacks.remove(&entity),
+        };
+    }
+
     /// The component's hooks: `entity` now holds `precast`.
     pub(super) fn mirror(&self, entity: Entity, precast: Option<Precast>) {
         let mut precasts = self.precasts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -194,21 +279,50 @@ impl UnitEdits {
     }
 }
 
+/// [`Engaged`]'s insert hook: the queue's mirror holds the target.
+pub(super) fn engaged_inserted(world: DeferredWorld, ctx: HookContext) {
+    if let (Some(&Engaged(target)), Some(edits)) = (
+        world.get::<Engaged>(ctx.entity),
+        world.get_resource::<UnitEdits>(),
+    ) {
+        edits.mirror_attack(ctx.entity, Some(target));
+    }
+}
+
+/// [`Engaged`]'s replace hook, ahead of a re-insert or a removal: the mirror drops it.
+pub(super) fn engaged_replaced(world: DeferredWorld, ctx: HookContext) {
+    if let Some(edits) = world.get_resource::<UnitEdits>() {
+        edits.mirror_attack(ctx.entity, None);
+    }
+}
+
 /// Applies the queue in order, from an exclusive system. A despawned unit's changes are dropped.
 pub(crate) fn apply_unit_edits(world: &mut World) {
-    let Some(edits) = world.get_resource::<UnitEdits>() else {
+    let Some(queued) = world.get_resource::<UnitEdits>() else {
         return;
     };
-    let edits = std::mem::take(&mut *edits.queue());
+    let edits = std::mem::take(&mut *queued.queue());
+    let runs = std::mem::take(&mut *queued.runs());
     apply(world, edits);
+    run_all(world, runs);
 }
 
 /// The pass's end: the queue as one command, so it applies at the sync point ahead of the systems
 /// ordered after the pass, the readers of what it changes.
-pub(crate) fn flush_unit_edits(edits: Res<UnitEdits>, mut commands: Commands) {
-    let edits = std::mem::take(&mut *edits.queue());
-    if !edits.is_empty() {
-        commands.queue(move |world: &mut World| apply(world, edits));
+pub(crate) fn flush_unit_edits(queued: Res<UnitEdits>, mut commands: Commands) {
+    let edits = std::mem::take(&mut *queued.queue());
+    let runs = std::mem::take(&mut *queued.runs());
+    if !edits.is_empty() || !runs.is_empty() {
+        commands.queue(move |world: &mut World| {
+            apply(world, edits);
+            run_all(world, runs);
+        });
+    }
+}
+
+fn run_all(world: &mut World, runs: Vec<WorldRun>) {
+    for run in runs {
+        run(world);
     }
 }
 
@@ -232,6 +346,10 @@ fn apply(world: &mut World, edits: Vec<UnitEdit>) {
                 reap(world, entity, spell_id);
                 cast_event(world, entity, spell_id, CastEventKind::Fail);
             }
+            UnitEdit::StopSpellKits { entity, spell_id } => {
+                reap(world, entity, spell_id);
+                cast_event(world, entity, spell_id, CastEventKind::Reap);
+            }
             UnitEdit::ArmAutoRepeat(entity) => {
                 if let Ok(mut unit) = world.get_entity_mut(entity) {
                     unit.insert(AutoRepeatArmed);
@@ -240,6 +358,16 @@ fn apply(world: &mut World, edits: Vec<UnitEdit>) {
             UnitEdit::ClearAutoRepeat { entity, .. } => {
                 if let Ok(mut unit) = world.get_entity_mut(entity) {
                     unit.remove::<AutoRepeatArmed>();
+                }
+            }
+            UnitEdit::StartAttack { entity, target } => {
+                if let Ok(mut unit) = world.get_entity_mut(entity) {
+                    unit.insert(Engaged(target));
+                }
+            }
+            UnitEdit::EndAttack(entity) => {
+                if let Ok(mut unit) = world.get_entity_mut(entity) {
+                    unit.remove::<Engaged>();
                 }
             }
             UnitEdit::StartPrecast { .. }

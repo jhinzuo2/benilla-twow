@@ -418,7 +418,7 @@ fn a_monster_line_with_no_macro_fires_at_its_packet() {
 /// player line's sender.
 #[test]
 fn each_answer_handler_queues_a_release_behind_a_line_that_reads_it() {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let world = app.world_mut();
     let log = || crate::ui_chat::ChatLog::default();
     for (line, answer) in [
@@ -451,6 +451,7 @@ fn own_watches(delta: &[(u16, u32)]) -> Vec<FieldNotice> {
     me.merge_diff(delta, |i, o, n| moved.push((i, o, n)));
     let around = crate::field_watch::Around {
         me: Some(ME),
+        target: None,
         creature_lookup: &|_| false,
         others: &Vec::new,
         pet_bar: 0,
@@ -616,6 +617,11 @@ fn the_roster_events_fire_at_their_packet() {
     app.world_mut().resource_mut::<crate::net::SelfGuid>().0 = Some(ME);
     app.world_mut()
         .init_resource::<crate::ui_quest::QuestGiver>();
+    // What the views lane reads, which the members' records start.
+    app.world_mut().init_resource::<crate::net::Reputations>();
+    app.world_mut().init_resource::<crate::target::Selection>();
+    app.world_mut()
+        .init_resource::<crate::ui_guild::GuildState>();
     app.world_mut()
         .non_send_resource_mut::<benilla_ui::script::UiScript>()
         .run(

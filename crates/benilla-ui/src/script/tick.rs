@@ -12,23 +12,26 @@ impl UiScript {
     /// that tick's `OnUpdate` pass: the host's lane ([`Model::pending_events`]), for a producer
     /// outside any Lua verb. A drain runs a step behind its input, so firing at once would
     /// overtake events the host already queued. A Lua verb's own events never wait here: they
-    /// fire inside it ([`verb`]), so the soulbind confirm for an item placed into a worn slot
-    /// follows that placement's `CURSOR_UPDATE`, whose handler hides it (`UIParent.lua:357-361`).
+    /// fire inside it ([`verb`]).
     pub fn queue_event(&mut self, event: &str, args: Vec<ScriptValue>) {
         self.model_mut()
             .pending_events
             .push((event.to_string(), args));
     }
 
-    /// Fire an event to every frame registered for it, shown or not, setting both the
-    /// `this`/`event`/`arg1..argN` globals and the `(self, event, ...)` arguments (`0x704d50`,
-    /// `0x704f10`); handler errors go to [`UiScript::errors`]. Frames fire in registration order,
+    /// Fire an event to every frame registered for it, shown or not, setting the
+    /// `this`/`event`/`arg1..argN` globals and calling each handler with no arguments, as
+    /// `lua_pcall(0, 0)` (`0x704e79`, `0x705199`) calls it; a handler's error reaches the Lua error
+    /// handler at the raise, then [`UiScript::errors`]. Frames fire in registration order,
     /// as `SignalEvent` (`0x703e50`) walks its tail-appended list (`0x7052d0`), and consumers rely
     /// on it: both ZoneText frames write `PVPInfoTextString` on one event, and the last one wins.
     ///
     /// The walk steps by the next listener saved before each handler runs (`0x703ee8`), so a
-    /// handler that unregisters itself does not skip its successor. Deviation: a handler that
-    /// unregisters the saved next ends the dispatch, because the reference then reads a freed node.
+    /// handler that unregisters itself does not skip its successor, and one that unregisters a
+    /// listener further on unlinks it before the walk gets there. A handler that unregisters the
+    /// saved next leaves the walk on a node whose links the unlink zeroed (`0x70559d`, `0x7055a3`)
+    /// and whose free keeps its object (`0x645eb0`): that listener runs once more, then the walk
+    /// ends, and the listeners after it miss the event.
     pub fn fire_event(&mut self, event: &str, args: Vec<ScriptValue>) {
         fire_event_into(&self.lua, event, args);
     }
@@ -73,6 +76,17 @@ impl Model {
         }
     }
 
+    /// Inside a [`verb`] segment, hand `call` to the host in its place among the segment's
+    /// signals, as engine code a verb shares makes it there: `0x4e58e0`'s send ahead of the
+    /// `ACTIONBAR_SLOT_CHANGED` it signals (`0x4e5998`). Engine code reaches this only inside a
+    /// verb.
+    pub(crate) fn call_in_verb(&mut self, call: super::ScriptCall) {
+        match &mut self.verb_events {
+            Some(segment) => segment.push(Raised::Call(Box::new(call))),
+            None => debug_assert!(false, "a call outside a verb segment: {call:?}"),
+        }
+    }
+
     /// End the view [`Model::view_cursor`] opened.
     pub(crate) fn end_cursor_view(&mut self) {
         if let Some(segment) = &mut self.verb_events {
@@ -94,6 +108,9 @@ pub(crate) enum Raised {
     EndCursorView,
     /// A cursor write, its own records inside it ([`super::cursor::write`]).
     CursorWrite(Box<super::cursor::CursorWrite>),
+    /// A call the engine code made in its place among the segment's signals
+    /// ([`Model::call_in_verb`]), handed to the host there.
+    Call(Box<super::ScriptCall>),
 }
 
 /// Undo `raised`'s writes, last first: each lock bit as it was, and each cursor write
@@ -105,7 +122,8 @@ pub(crate) fn rewind(model: &mut Model, raised: &[Raised]) {
                 set_lock_bit(model, *guid, *was);
             }
             Raised::CursorWrite(write) => write.rewind(model),
-            Raised::Event(..) | Raised::CursorView(_) | Raised::EndCursorView => {}
+            Raised::Event(..) | Raised::CursorView(_) | Raised::EndCursorView | Raised::Call(_) => {
+            }
         }
     }
 }
@@ -119,7 +137,8 @@ fn roll_back_locks(model: &mut Model, raised: &[Raised]) {
                 set_lock_bit(model, *guid, *was);
             }
             Raised::CursorWrite(write) => roll_back_locks(model, &write.raised),
-            Raised::Event(..) | Raised::CursorView(_) | Raised::EndCursorView => {}
+            Raised::Event(..) | Raised::CursorView(_) | Raised::EndCursorView | Raised::Call(_) => {
+            }
         }
     }
 }
@@ -161,7 +180,7 @@ pub(crate) fn verb<R>(lua: &Lua, body: impl FnOnce(&mut Model) -> R) -> R {
         if raised.iter().any(|r| {
             matches!(
                 r,
-                Raised::Event(..) | Raised::Lock { .. } | Raised::CursorWrite(_)
+                Raised::Event(..) | Raised::Lock { .. } | Raised::CursorWrite(_) | Raised::Call(_)
             )
         }) {
             super::calls::hold(lua, super::calls::Held::Segment(raised));
@@ -217,6 +236,13 @@ pub(crate) fn fan_out(lua: &Lua, raised: Vec<Raised>, how: Fan) {
                 );
             }
             Raised::Event(event, args) => fire_event_into(lua, &event, args),
+            Raised::Call(call) => {
+                if let Err(e) = super::calls::submit(lua, *call) {
+                    lua.app_data_mut::<Model>()
+                        .expect("model app_data set")
+                        .record_lua_error(&e);
+                }
+            }
             Raised::CursorView(payload) => {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data set");
                 hidden.push(std::mem::replace(&mut model.cursor, payload));
@@ -305,18 +331,12 @@ pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
     }
     while let Some(h) = at {
         let mut model = model_mut();
-        // A saved next that the previous handler unregistered ends the walk.
-        let Some(pos) = model
-            .event_to_frames
-            .get(event)
-            .and_then(|l| l.iter().position(|&x| x == h))
-        else {
-            break;
-        };
-        let next = model
-            .event_to_frames
-            .get(event)
-            .and_then(|l| l.get(pos + 1).copied());
+        // The successor is read before the handler runs (`0x703ee8`). A saved next the previous
+        // handler unregistered still runs, and its zeroed link ends the walk.
+        let next = model.event_to_frames.get(event).and_then(|l| {
+            let pos = l.iter().position(|&x| x == h)?;
+            l.get(pos + 1).copied()
+        });
         let id = model.frame_id(h);
         drop(model);
         if let Err(e) = event::fire_event_handler(lua, id, &args) {
@@ -345,17 +365,7 @@ impl super::UiScript {
     /// range); drains the layout again (`0x765799`); then re-picks the hover against those rects
     /// (`0x7657be`). The draw pass fires `OnUpdateModel`.
     pub fn tick(&mut self, elapsed: f32) {
-        self.model_mut().nameplates.begin_update();
-        self.model_mut().now += f64::from(elapsed);
-        // Events queued since the last tick fire before this tick's OnUpdate.
-        let pending = std::mem::take(&mut self.model_mut().pending_events);
-        for (event, args) in pending {
-            self.fire_event(&event, args);
-        }
-        // The item tooltips the caches answered since the last tick rebuild (`0x52e530`).
-        for e in super::tooltip_item::build::answer_item_caches(&self.lua) {
-            self.push_error(e);
-        }
+        self.advance_clock_and_events(elapsed);
         self.resolve();
         self.update_walk(elapsed);
         self.resolve();
@@ -371,9 +381,39 @@ impl super::UiScript {
         if let Some((x, y)) = repick {
             self.mouse_move(x, y);
         }
+        // The draw pass opens with the overlap bits of the strata whose levels went dirty.
+        super::object::toplevel::refresh_overlap_bits(&mut self.model_mut());
         self.paint_model_panes();
+        self.paint_movies();
         // `WOW_UI_HANDLERS=<secs>`: last, so its report covers everything this tick fired.
         self.report_handler_profile(elapsed);
+    }
+
+    /// A frame whose pass skips the interface's layer, as under the loading screen: its layer
+    /// takes the unit square out of what the layers below see (`0x442431`-`0x442437`), and the
+    /// pass calls no layer left empty (`0x4424b9`/`0x4424ca`). So neither the pump nor the draw
+    /// pass of [`Self::tick`] runs (`0x764330`), and the frame's elapsed time is cleared unread
+    /// (`0x4426c3`): the next walk gets its own frame's. The clock and the queued events still
+    /// advance, being no part of the layer.
+    pub fn tick_covered(&mut self, elapsed: f32) {
+        self.advance_clock_and_events(elapsed);
+    }
+
+    /// The `GetTime()` clock, then the events queued since the last tick and the item and spell
+    /// tooltips the caches answered (`0x52e530`, `0x52f820`), all ahead of the tick's `OnUpdate`.
+    fn advance_clock_and_events(&mut self, elapsed: f32) {
+        self.model_mut().nameplates.begin_update();
+        self.model_mut().now += f64::from(elapsed);
+        let pending = std::mem::take(&mut self.model_mut().pending_events);
+        for (event, args) in pending {
+            self.fire_event(&event, args);
+        }
+        for e in super::tooltip_item::build::answer_item_caches(&self.lua) {
+            self.push_error(e);
+        }
+        for e in super::tooltip_spell::answer_spell_items(&self.lua) {
+            self.push_error(e);
+        }
     }
 }
 

@@ -115,6 +115,65 @@ pub(crate) fn stamp() -> Stamp {
     }
 }
 
+/// The item firing on this thread, if any: a verb its listeners call runs at that item's moment.
+pub(crate) fn firing_now() -> Option<Stamp> {
+    FIRING.get()
+}
+
+thread_local! {
+    /// A close core is running held behind a lane: what a core it re-enters signals is its.
+    static BEHIND: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Where [`behind`] ran its core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Behind {
+    /// At once, its signals fired in place.
+    Ran,
+    /// Held, its signals parked on the lane.
+    Parked,
+    /// Inside another core's hold, which parks its signals with its own.
+    Nested,
+}
+
+/// Run a close `core` behind a lane whose head is `head`: at once unless the lane holds an item
+/// stamped before the item firing now (any item, with none firing), else with the world's VM held,
+/// what it signalled parked under a key `park` queues on the lane, so a close never fires ahead of
+/// the open it closes. A core it re-enters, as a release re-enters its close (`0x493310`), runs
+/// inside the hold.
+pub(crate) fn behind(
+    world: &mut World,
+    head: Option<Stamp>,
+    core: impl FnOnce(&mut World),
+    park: impl FnOnce(&mut World, u64, u64),
+) -> Behind {
+    if BEHIND.get() {
+        core(world);
+        return Behind::Nested;
+    }
+    let Some((_held, mark)) = waits_behind(head)
+        .then(|| crate::script_calls::defer_vm(world))
+        .flatten()
+    else {
+        core(world);
+        return Behind::Ran;
+    };
+    BEHIND.set(true);
+    core(world);
+    BEHIND.set(false);
+    if let Some((session, key)) = crate::script_calls::park_since(world, mark) {
+        park(world, session, key);
+    }
+    Behind::Parked
+}
+
+/// Whether a close run now must wait behind a lane whose head is `head`: the lane holds an item
+/// stamped before the item firing now (any item, with none firing), and no other core's hold
+/// already takes what it signals ([`behind`]).
+pub(crate) fn waits_behind(head: Option<Stamp>) -> bool {
+    !BEHIND.get() && head.is_some_and(|head| firing_now().is_none_or(|now| head < now))
+}
+
 /// Run `f` as the firing of the item stamped `at`, so what it pushes nests under the item; with
 /// whether anything was stamped meanwhile, after which the drain takes the lowest stamp again.
 pub(crate) fn firing<R>(at: Stamp, f: impl FnOnce() -> R) -> (R, bool) {
@@ -125,11 +184,14 @@ pub(crate) fn firing<R>(at: Stamp, f: impl FnOnce() -> R) -> (R, bool) {
     (r, CLOCK.load(Ordering::Relaxed) != before)
 }
 
-/// What a lane's firing may fire: the stamps below `bound`, the lowest of the other lanes' heads,
-/// among those whose outermost push came before the drain began.
+/// What a lane's firing may fire, among the stamps whose outermost push came before the drain
+/// began: those below `before`, the lowest head of the lanes registered ahead of it, and up to
+/// `through`, the lowest head of the lanes after it. Equal heads fire in lane order, so a tie
+/// never stalls the drain.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Until {
-    bound: Option<Stamp>,
+    before: Option<Stamp>,
+    through: Option<Stamp>,
     fence: u64,
 }
 
@@ -138,32 +200,52 @@ impl Until {
     #[cfg(test)]
     pub(crate) fn all() -> Self {
         Self {
-            bound: None,
+            before: None,
+            through: None,
             fence: CLOCK.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn admits(&self, stamp: Stamp) -> bool {
-        stamp.first() < self.fence && self.bound.is_none_or(|b| stamp < b)
+        stamp.first() < self.fence
+            && self.before.is_none_or(|b| stamp < b)
+            && self.through.is_none_or(|b| stamp <= b)
     }
 }
 
+/// What an exclusive firing touches beside the call host and its own lane, as the access a system
+/// declares: Bevy reports an exclusive system's as empty, so the lanes' measure takes this one
+/// instead. Built from the systems the firing runs ([`system_access`]) and what its world-held
+/// steps read.
+pub(crate) type LaneReads = fn(&mut World) -> bevy::ecs::query::FilteredAccessSet;
+
+/// The access `system` declares, measured on `world` by initializing a copy of it.
+pub(crate) fn system_access<I: bevy::ecs::system::SystemInput + 'static, O: 'static, M>(
+    world: &mut World,
+    system: impl IntoSystem<I, O, M>,
+) -> bevy::ecs::query::FilteredAccessSet {
+    use bevy::ecs::system::System;
+    IntoSystem::into_system(system).initialize(world)
+}
+
 /// One lane: its name, its head, its firing (a one-shot taking [`Until`], the `NetHandlers`
-/// shape), and what it does once ahead of each drain.
+/// shape), what it does once ahead of each drain, and an exclusive firing's declared reads.
 struct Lane {
     name: &'static str,
     peek: fn(&World) -> Option<Stamp>,
     fire: SystemId<In<Until>>,
     begin: Option<fn(&World)>,
+    reads: Option<LaneReads>,
 }
 
 /// Every lane, in registration order.
 #[derive(Resource, Default)]
 pub(crate) struct Lanes(
     Vec<Lane>,
-    /// Each lane's firing's declared access, for the tests that ask what the drain touches.
+    /// Each lane's firing's declared access, an exclusive one's from its [`LaneReads`], and whether
+    /// it is exclusive, once [`measure`] ran.
     #[cfg(test)]
-    pub(crate) Vec<bevy::ecs::query::FilteredAccessSet>,
+    Option<Vec<(bevy::ecs::query::FilteredAccessSet, bool)>>,
 );
 
 impl Lanes {
@@ -172,6 +254,61 @@ impl Lanes {
     pub(crate) fn names(&self) -> Vec<&'static str> {
         self.0.iter().map(|l| l.name).collect()
     }
+
+    /// Each lane's firing's declared access, in registration order, for the tests that ask what
+    /// the drain touches. Panics before [`measure`].
+    #[cfg(test)]
+    pub(crate) fn accesses(&self) -> Vec<&bevy::ecs::query::FilteredAccessSet> {
+        self.1
+            .as_deref()
+            .expect("the lanes' accesses are read after `lanes::measure`")
+            .iter()
+            .map(|(a, _)| a)
+            .collect()
+    }
+
+    /// Each lane's firing, in registration order: whether it is exclusive, and whether it
+    /// declares its reads. Panics before [`measure`].
+    #[cfg(test)]
+    pub(crate) fn exclusive_reads(&self) -> Vec<(bool, bool)> {
+        let measured = self
+            .1
+            .as_deref()
+            .expect("the lanes' firings are read after `lanes::measure`");
+        measured
+            .iter()
+            .zip(&self.0)
+            .map(|((_, exclusive), lane)| (*exclusive, lane.reads.is_some()))
+            .collect()
+    }
+}
+
+/// Reads every lane firing's declared access, for [`Lanes::accesses`]: each is initialized, its
+/// access kept (an exclusive one's from its [`LaneReads`]), and registered again, where its first run initializes it again on the same state.
+/// Done on a test's asking, not at registration: a firing that lends the call host is most of a
+/// plugin's build to initialize, and most tests fire few lanes or none.
+#[cfg(test)]
+pub(crate) fn measure(world: &mut World) {
+    world.resource_scope(|world, mut lanes: Mut<Lanes>| {
+        if lanes.1.is_some() {
+            return;
+        }
+        let mut accesses = Vec::new();
+        for lane in &mut lanes.0 {
+            let mut system = world
+                .unregister_system(lane.fire)
+                .expect("a registered lane firing")
+                .system();
+            let exclusive = system.is_exclusive();
+            let mut access = system.initialize(world);
+            if let (true, Some(reads)) = (exclusive, lane.reads) {
+                access = reads(world);
+            }
+            accesses.push((access, exclusive));
+            lane.fire = world.register_boxed_system(system);
+        }
+        lanes.1 = Some(accesses);
+    });
 }
 
 /// What runs once after each drain, however it ended: a lane's firing that stopped early leaves
@@ -180,7 +317,7 @@ impl Lanes {
 struct DrainEnds(Vec<fn(&mut World)>);
 
 /// The drain's place: after every feed in [`crate::ui_script::UiFeed`] has pushed, and before
-/// the tick ([`crate::ui_script::UiInput`]).
+/// the tick ([`crate::ui_script::UiTick`]).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiLanes;
 
@@ -194,6 +331,16 @@ pub(crate) trait LaneApp {
         peek: fn(&World) -> Option<Stamp>,
         fire: impl IntoSystem<In<Until>, (), M> + 'static,
         begin: Option<fn(&World)>,
+    ) -> &mut Self;
+
+    /// Register a lane whose firing holds the world, with what it reads beside the call host and
+    /// its own lane ([`LaneReads`]).
+    fn add_exclusive_lane(
+        &mut self,
+        name: &'static str,
+        peek: fn(&World) -> Option<Stamp>,
+        fire: fn(In<Until>, &mut World),
+        reads: LaneReads,
     ) -> &mut Self;
 
     /// Run `end` once after each drain, whether it fired every item or stopped.
@@ -214,7 +361,7 @@ impl LaneApp for App {
                     Update,
                     UiLanes
                         .after(crate::ui_script::UiFeed)
-                        .before(crate::ui_script::UiInput),
+                        .before(crate::ui_script::UiTick),
                 )
                 .add_systems(
                     Update,
@@ -232,22 +379,34 @@ impl LaneApp for App {
         {
             return self;
         }
-        // Initialized here, its access kept: the run initializes it again, on the same state.
-        #[cfg(test)]
-        let (fire, access) = {
-            let mut system = IntoSystem::into_system(fire);
-            let access = bevy::ecs::system::System::initialize(&mut system, self.world_mut());
-            (system, access)
-        };
         let fire = self.world_mut().register_system(fire);
-        #[cfg(test)]
-        self.world_mut().resource_mut::<Lanes>().1.push(access);
         self.world_mut().resource_mut::<Lanes>().0.push(Lane {
             name,
             peek,
             fire,
             begin,
+            reads: None,
         });
+        self
+    }
+
+    fn add_exclusive_lane(
+        &mut self,
+        name: &'static str,
+        peek: fn(&World) -> Option<Stamp>,
+        fire: fn(In<Until>, &mut World),
+        reads: LaneReads,
+    ) -> &mut Self {
+        self.add_lane(name, peek, fire, None);
+        if let Some(lane) = self
+            .world_mut()
+            .resource_mut::<Lanes>()
+            .0
+            .iter_mut()
+            .find(|l| l.name == name)
+        {
+            lane.reads = Some(reads);
+        }
         self
     }
 
@@ -285,16 +444,22 @@ pub(crate) fn fire_in_order(world: &mut World) {
             break;
         };
         // A head at the origin is a view's frame-start push, which raises nothing and commutes
-        // with another view's: it bounds no other lane.
-        let bound = heads
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .filter_map(|(_, h)| *h)
-            .filter(|h| *h != Stamp::origin())
-            .min();
+        // with another view's: it bounds no other lane. The pick is the first lane holding the
+        // lowest head, so a later lane's equal head bounds it inclusively.
+        let lowest = |lanes: &[Option<Stamp>]| {
+            lanes
+                .iter()
+                .filter_map(|h| *h)
+                .filter(|h| *h != Stamp::origin())
+                .min()
+        };
+        let until = Until {
+            before: lowest(&heads[..i]),
+            through: lowest(&heads[i + 1..]),
+            fence,
+        };
         let lane = &lanes.0[i];
-        if let Err(e) = world.run_system_with(lane.fire, Until { bound, fence }) {
+        if let Err(e) = world.run_system_with(lane.fire, until) {
             error!("lanes: `{}` did not fire: {e}", lane.name);
             break;
         }
@@ -314,13 +479,99 @@ pub(crate) fn fire_in_order(world: &mut World) {
 }
 
 #[cfg(test)]
+mod action_live_tests;
+#[cfg(test)]
+mod arrival_live_tests;
+#[cfg(test)]
+mod auction_live_tests;
+#[cfg(test)]
+mod aura_live_tests;
+#[cfg(test)]
+mod aura_view_tests;
+#[cfg(test)]
 mod bag_tests;
+#[cfg(test)]
+mod bank_live_tests;
+#[cfg(test)]
+mod battlefield_live_tests;
+#[cfg(test)]
+mod book_live_tests;
+#[cfg(test)]
+mod cast_live_tests;
+#[cfg(test)]
+mod cooldown_live_tests;
+#[cfg(test)]
+mod dialog_live_tests;
+#[cfg(test)]
+mod duration_live_tests;
+#[cfg(test)]
+mod gossip_live_tests;
+#[cfg(test)]
+mod group_view_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod guild_live_tests;
+#[cfg(test)]
+mod host_read_tests;
+#[cfg(test)]
+mod inspect_live_tests;
+#[cfg(test)]
+mod item_live_tests;
+#[cfg(test)]
 mod item_tests;
 #[cfg(test)]
+mod loot_live_tests;
+#[cfg(test)]
+mod mail_live_tests;
+#[cfg(test)]
+mod merchant_live_tests;
+#[cfg(test)]
+mod name_live_tests;
+#[cfg(test)]
+mod packet_signal_tests;
+#[cfg(test)]
+mod pet_live_tests;
+#[cfg(test)]
+mod petition_live_tests;
+#[cfg(test)]
+mod quest_log_live_tests;
+#[cfg(test)]
+mod quiet_tests;
+#[cfg(test)]
+mod reputation_live_tests;
+#[cfg(test)]
+mod requirement_live_tests;
+#[cfg(test)]
+mod selection_live_tests;
+#[cfg(test)]
+mod social_live_tests;
+#[cfg(test)]
+mod stable_live_tests;
+#[cfg(test)]
+mod stance_live_tests;
+#[cfg(test)]
+mod stat_live_tests;
+#[cfg(test)]
+mod storm_tests;
+#[cfg(test)]
+mod tabard_live_tests;
+#[cfg(test)]
+mod taxi_live_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod token_live_tests;
+#[cfg(test)]
+mod tooltip_live_tests;
+#[cfg(test)]
+mod trade_live_tests;
+#[cfg(test)]
+mod trainer_live_tests;
+#[cfg(test)]
+mod unit_feed_live_tests;
+#[cfg(test)]
+mod unit_live_tests;
 #[cfg(test)]
 mod unit_view_tests;
 
@@ -409,6 +660,21 @@ mod unit_tests {
         push::<0>(w, "d");
         push::<1>(w, "e");
         assert_eq!(drain(&mut app), ["a", "b", "c", "d", "e"]);
+    }
+
+    /// Two lanes holding one stamp fire in lane order, the first lane's item then the second's,
+    /// and the drain goes on to the next stamp: a tie never stalls it.
+    #[test]
+    fn equal_heads_fire_in_lane_order_and_the_drain_goes_on() {
+        let mut app = app(&[]);
+        let w = app.world_mut();
+        let tie = stamp();
+        w.resource_mut::<Toy<0>>().0.push((tie, "a"));
+        w.resource_mut::<Toy<1>>().0.push((tie, "b"));
+        push::<1>(w, "c");
+        push::<0>(w, "d");
+        assert_eq!(drain(&mut app), ["a", "b", "c", "d"]);
+        assert_eq!(drain(&mut app), Vec::<&str>::new(), "nothing left behind");
     }
 
     /// A signal raised inside a listener runs to its end before the outer signal returns

@@ -26,7 +26,32 @@ pub(crate) struct MailVerbs<'w> {
 }
 
 impl MailVerbs<'_> {
-    /// Apply one mail call.
+    /// The mailbox's cell `[0xb6ef88]`.
+    pub(crate) fn mailbox(&self) -> Option<u64> {
+        self.mail.as_deref().and_then(|m| m.mailbox)
+    }
+
+    /// The close core's clear of the cell (`0x4acd8f`), the VM's verbs finding none from here.
+    pub(crate) fn clear_mailbox(&mut self, script: &mut UiScript) {
+        if let Some(mail) = self.mail.as_deref_mut() {
+            mail.clear();
+        }
+        script.mail_closed();
+    }
+
+    /// The close core's tail (`0x4acda8`, `0x4acdb1`): after a read, or an arrival while open,
+    /// `MSG_QUERY_NEXT_MAIL_TIME`, stamping "no mail".
+    pub(crate) fn refresh_after_close(&mut self) {
+        let Some(pending) = self.pending.as_deref_mut() else {
+            return;
+        };
+        if pending.take_refresh() {
+            pending.on_query_sent();
+            let _ = self.commands.0.send(ClientCommand::QueryNextMailTime);
+        }
+    }
+
+    /// Apply one mail call; the close is the host's ([`MailCall::Close`]).
     pub(crate) fn apply(&mut self, script: &mut UiScript, call: MailCall) {
         let Self {
             mail,
@@ -61,26 +86,30 @@ impl MailVerbs<'_> {
                 return;
             }
             MailCall::ReadBody {
-                index,
                 mail_id,
                 text_id,
+                body,
             } => {
-                mail.bodies.lookup(text_id, || {
+                // A miss asks and keeps the callback `0x4af340`, one per call (`0x4af1bf`).
+                let held = mail.bodies.lookup(text_id, || {
                     let _ = commands
                         .0
                         .send(ClientCommand::ItemTextQuery { text_id, mail_id });
                 });
+                if held.is_none() {
+                    mail.wait(super::MailWait::Body(text_id));
+                }
                 // The cached text, expanded, is masked on every read (`0x4af1f6`, `0x4af203` with
                 // `dl` 0), so each read moves the mask's phase; a template's body is not.
-                if let (Some(mut body), Some(filter)) =
-                    (script.inbox_body(index), filter.as_deref())
-                {
+                if let (Some(mut body), Some(filter)) = (body, filter.as_deref()) {
                     let enabled = switches.as_deref().is_some_and(|s| s.profanity);
                     filter.mask(enabled, &mut body);
                     script.answer_inbox_body(body);
                 }
                 return;
             }
+            // The close core needs the latch, which the host lends beside this.
+            MailCall::Close => return,
             _ => {}
         }
         // The VM's guards found a mailbox the session has since forgotten: no packet goes, so the
@@ -93,7 +122,7 @@ impl MailVerbs<'_> {
             return;
         };
         let command = match call {
-            MailCall::Open { .. } | MailCall::ReadBody { .. } => return,
+            MailCall::Open { .. } | MailCall::ReadBody { .. } | MailCall::Close => return,
             MailCall::CheckInbox => ClientCommand::GetMailList { mailbox },
             MailCall::Row {
                 verb,

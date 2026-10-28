@@ -660,37 +660,6 @@ fn a_channel_notice_fires_its_token_and_the_reference_reads_arg7_and_arg10_bare(
     assert_eq!(lines_in_window(&s), 1);
 }
 
-/// The notice switch's MODE_CHANGE arm (`0x49c24d`) calls `0x49e910` and returns before the fire.
-#[test]
-fn a_mode_change_notice_never_becomes_an_event() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
-
-    let log = super::feed::ChatLog::default();
-    log.push_channel_notice(
-        channel_notice::MODE_CHANGE,
-        "World".into(),
-        &ChannelNoticeTail::ModeChange {
-            guid: 42,
-            old_flags: 0,
-            new_flags: 1,
-        },
-    );
-    assert_eq!(
-        log.pending_len(),
-        0,
-        "MODE_CHANGE is dropped at the feed — the reference's 0x0C arm fires nothing"
-    );
-
-    // The control: a notice that fires is queued.
-    log.push_channel_notice(
-        channel_notice::YOU_JOINED,
-        "World".into(),
-        &ChannelNoticeTail::YouJoined { flags: 0 },
-    );
-    assert_eq!(log.pending_len(), 1);
-}
-
 /// arg4, arg7, arg8 and arg9 are one channel record in the reference, defaulted together
 /// (`0x49b12f`).
 #[test]
@@ -1125,7 +1094,7 @@ fn a_session_end_empties_the_window_and_the_boxs_memory() {
 }
 
 /// Each token names a `CHAT_<X>_NOTICE` string (`ChatFrame.lua:1416`, `:1424`); the tokenless bytes
-/// are MODE_CHANGE (`0x0C`), which fires nothing, and the member lines JOINED and LEFT.
+/// are MODE_CHANGE (`0x0C`), whose lines `0x49e8a0` names itself, and the member lines JOINED and LEFT.
 #[test]
 fn every_notice_token_resolves_and_the_tokenless_bytes_stay_silent() {
     let _data = benilla_formats::wow_data_or_skip!();
@@ -1882,6 +1851,14 @@ fn an_addon_message_survives_its_own_send_and_receive() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = benilla_ui::script::UiScript::new().unwrap();
     s.keep_calls();
+    // The send needs the player object (`0x49f94b`).
+    s.set_unit(
+        "player",
+        Some(benilla_ui::script::UnitState {
+            exists: true,
+            ..Default::default()
+        }),
+    );
     s.run(r#"SendAddonMessage("oRA", "SYNC\t1\t2", "PARTY")"#)
         .unwrap();
     assert!(s.errors().is_empty(), "send raised: {:?}", s.errors());
@@ -2001,7 +1978,7 @@ fn a_speaker_that_cannot_animate_queues_no_talk_gesture() {
     let laugh_words = |n: u32| (n == 1).then(|| "lol".to_string());
     let speak = |tries: u16, flags: Option<u32>| {
         select_gesture(CHAT_MSG_SAY, "lol", laugh_words)
-            .filter(|_| !gesture_prevented(tries, flags))
+            .filter(|_| !gesture_prevented(tries == 0, flags))
             .into_iter()
             .count()
     };
@@ -2334,32 +2311,6 @@ fn the_posture_emotes_carry_no_swim_suppression_flag() {
             "posture emote {id} passes the emote gate while swimming"
         );
     }
-}
-
-/// `SMSG_LEVELUP_INFO`'s gains park on `ChatLog` until the level edge that matches them.
-#[test]
-fn level_up_gains_are_matched_by_level_and_a_miss_is_not_an_absence() {
-    use benilla_protocol::messages::LevelUpInfo;
-
-    let log = super::feed::ChatLog::default();
-    let ding = LevelUpInfo {
-        level: 10,
-        health: 22,
-        powers: [15, 0, 0, 0, 0],
-        stats: [0, 1, 2, 3, 0],
-    };
-    log.push_level_up_gains(&ding, 1);
-
-    // A level edge that is not this ding's leaves the entry parked...
-    assert!(log.take_level_up_gains(11).is_none(), "wrong level matched");
-    // ...and the right one takes it, exactly once.
-    let (got, talent_points) = log.take_level_up_gains(10).expect("parked for level 10");
-    assert_eq!(got, ding);
-    assert_eq!(talent_points, 1);
-    assert!(
-        log.take_level_up_gains(10).is_none(),
-        "the entry was taken, not copied"
-    );
 }
 
 /// Fires `PLAYER_LEVEL_UP` with the nine reference args and returns every line the stock handler
@@ -3528,7 +3479,7 @@ fn the_away_lines_fire_inside_the_call() {
 fn the_call_host_applies_the_chat_calls_inside_the_verb() {
     use crate::net::{ChatKind, ClientCommand, NetCommands};
 
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     app.world_mut().insert_non_send_resource(in_world_vm());
@@ -3979,10 +3930,11 @@ fn unit_combat_fires_for_every_token_naming_the_unit() {
     assert_eq!(order, ["pet WOUND", "target WOUND"]);
 }
 
-/// The honor line's rank title genders off the active player's own descriptor, `PLAYER_BYTES_3`
-/// byte 0 (`0x612bf0` on the active player calls `0x5ed5b0`), not the name cache.
+/// The honor line's rank title genders off the active player's own descriptor, its real gender
+/// (`UNIT_FIELD_BYTES_0` byte 2), not the name cache, and not `PLAYER_BYTES_3` byte 0, which a
+/// drunk female's drunk bits fill (the Deviation on `unit_gender`).
 #[test]
-fn the_honor_title_genders_off_the_active_players_bytes() {
+fn the_honor_title_genders_off_the_active_players_real_gender() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut feed = super::notice_tests::Feed::new();
     feed.script()
@@ -4002,7 +3954,8 @@ fn the_honor_title_genders_off_the_active_players_bytes() {
     let me = feed
         .world
         .spawn(crate::net::ObjectStore(
-            benilla_protocol::ObjectFields::from_pairs(&[(2, 0x19), (195, 1)]),
+            // Female in `UNIT_FIELD_BYTES_0` byte 2; byte 0 of `PLAYER_BYTES_3` full of drunk bits.
+            benilla_protocol::ObjectFields::from_pairs(&[(2, 0x19), (36, 1 << 16), (195, 0xFFFF)]),
         ))
         .id();
     let victim = feed
@@ -4274,4 +4227,16 @@ fn a_notices_chat_line_shows_where_the_notice_fires() {
             .unwrap();
         assert_eq!(order, heard);
     }
+}
+
+/// The chat event helper triggers Replying to Tells for a received whisper, type 6, before the
+/// event (`0x49b0fb`-`0x49b107`); a whisper we sent (type 7) triggers nothing.
+#[test]
+fn a_received_whisper_triggers_replying_to_tells() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    let mut windows = super::frames::ChatWindows::default();
+    super::frames::route(&mut s, &mut windows, &ev(K::WhisperInform, "hi", "Bob"));
+    assert!(s.take_tutorial_triggers().is_empty(), "our own tell");
+    super::frames::route(&mut s, &mut windows, &ev(K::Whisper, "hi", "Bob"));
+    assert_eq!(s.take_tutorial_triggers(), [0x10]);
 }

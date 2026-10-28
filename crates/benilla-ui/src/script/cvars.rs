@@ -81,7 +81,8 @@ pub struct MultisampleFormat {
 /// One screen resolution the Video options dropdown offers, in physical pixels. Deviation: the
 /// list is the window sizes this client can present, not the device's display modes, because
 /// benilla makes no exclusive mode-set. `"WxH"` is a contract: `OptionsFrame.lua:281-284` splits
-/// on the `x` and `CT_Viewport.lua:107` matches `"(%d+)x(%d+)"`, both failing silently.
+/// on the `x`, raising on a string without one, and `CT_Viewport.lua:107` matches
+/// `"(%d+)x(%d+)"`, failing silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScreenResolution {
     pub width: u32,
@@ -105,6 +106,73 @@ impl std::fmt::Display for ScreenResolution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}x{}", self.width, self.height)
     }
+}
+
+/// The Video menus' resolution list and the client's current entry, as the host reads them where
+/// a verb runs: the reference builds the list on the first use of any resolution verb
+/// (`0x48bc90`), so a call during the UI load answers it. Declined with no display to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenModesQuery;
+
+/// The host's answer to [`ScreenModesQuery`], as [`UiScript::set_screen_resolutions`] takes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenModes {
+    pub offered: Vec<ScreenResolution>,
+    pub current: Option<ScreenResolution>,
+}
+
+impl super::live::LiveQuery for ScreenModesQuery {
+    type Answer = ScreenModes;
+}
+
+/// The device's multisample formats, read where a multisample verb runs: the reference builds the
+/// list on the first use of any of them (`0x48c3e0`). Declined before the device is enumerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MultisampleFormatsQuery;
+
+impl super::live::LiveQuery for MultisampleFormatsQuery {
+    type Answer = Vec<MultisampleFormat>;
+}
+
+/// Seat the live resolution list in the model before a resolution verb reads it (`0x48bc90`); the
+/// model's own list stands with no host to ask.
+fn read_screen_modes(lua: &Lua) {
+    if let Some(modes) = super::live::ask(lua, &ScreenModesQuery) {
+        seat_resolutions(
+            &mut lua.app_data_mut::<Model>().expect("model app_data"),
+            modes.offered,
+            modes.current,
+        );
+    }
+}
+
+/// Seat the live multisample list in the model before a multisample verb reads it (`0x48c3e0`).
+fn read_multisample_formats(lua: &Lua) {
+    if let Some(formats) = super::live::ask(lua, &MultisampleFormatsQuery) {
+        lua.app_data_mut::<Model>()
+            .expect("model app_data")
+            .multisample_formats = formats;
+    }
+}
+
+/// Sort and dedupe `offered` by [`ScreenResolution::sort_key`], insert `current` when the list
+/// lacks it and seat both.
+fn seat_resolutions(
+    model: &mut Model,
+    mut offered: Vec<ScreenResolution>,
+    current: Option<ScreenResolution>,
+) {
+    offered.sort_by_key(ScreenResolution::sort_key);
+    offered.dedup();
+    let current = current.map(|c| {
+        offered.iter().position(|r| *r == c).unwrap_or_else(|| {
+            let at = offered.partition_point(|r| r.sort_key() < c.sort_key());
+            offered.insert(at, c);
+            at
+        })
+    });
+    model.screen_resolutions = offered;
+    model.current_resolution = current;
 }
 
 /// What `GetVideoCaps` answers, in `OptionsFrame.lua:59`'s order: anisotropic, pixel shaders,
@@ -239,6 +307,26 @@ impl super::UiScript {
             .collect()
     }
 
+    /// Every row of the mirror as `(name, value, default, reset)`, in its list order (each row's
+    /// insertion), for the console's prints inside a `ConsoleExec` call: the mirror holds what
+    /// the chunk's own writes left, as the reference's one record does.
+    pub fn cvar_rows(&self) -> Vec<(String, String, String, Option<String>)> {
+        let model = self.model_mut();
+        let mut slots: Vec<&CvarSlot> = model.cvars.values().collect();
+        slots.sort_by_key(|s| s.seq);
+        slots
+            .into_iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.value.clone(),
+                    s.default.clone(),
+                    s.reset.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Drain the lines CVar change callbacks printed since the last call, for the console.
     pub fn take_cvar_console_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.model_mut().cvar_console)
@@ -325,21 +413,10 @@ impl super::UiScript {
     /// `arg[GetCurrentResolution()]` and silently falls back to 4:3 on a miss.
     pub fn set_screen_resolutions(
         &mut self,
-        mut offered: Vec<ScreenResolution>,
+        offered: Vec<ScreenResolution>,
         current: Option<ScreenResolution>,
     ) {
-        offered.sort_by_key(ScreenResolution::sort_key);
-        offered.dedup();
-        let current = current.map(|c| {
-            offered.iter().position(|r| *r == c).unwrap_or_else(|| {
-                let at = offered.partition_point(|r| r.sort_key() < c.sort_key());
-                offered.insert(at, c);
-                at
-            })
-        });
-        let mut model = self.model_mut();
-        model.screen_resolutions = offered;
-        model.current_resolution = current;
+        seat_resolutions(&mut self.model_mut(), offered, current);
     }
 
     /// Publish what this run's device and presentation path offer, behind `GetVideoCaps`.
@@ -638,6 +715,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "GetMultisampleFormats",
         lua.create_function(|lua, ()| {
+            read_multisample_formats(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             // Flat, three per entry (`0x48c360`); no formats is no values and an empty menu.
             let mut out = mlua::MultiValue::new();
@@ -652,6 +730,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "GetCurrentMultisampleFormat",
         lua.create_function(|lua, ()| {
+            read_multisample_formats(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let cvar = |n: &str| model.cvars.get(n).and_then(|s| s.value.parse::<u32>().ok());
             let (Some(color), Some(depth), Some(samples)) = (
@@ -676,6 +755,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "SetMultisampleFormat",
         lua.create_function(|lua, id: Value| {
+            read_multisample_formats(lua);
             // `lua_isnumber` (`0x48c659`): a non-number is a missing id, which the deviation below
             // ignores.
             let id = crate::script::binding_abi::is_number(lua, id);
@@ -793,6 +873,7 @@ fn install_video_verbs(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "GetScreenResolutions",
         lua.create_function(|lua, ()| {
+            read_screen_modes(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let mut out = mlua::MultiValue::new();
             for r in &model.screen_resolutions {
@@ -813,6 +894,7 @@ fn install_video_verbs(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "GetCurrentResolution",
         lua.create_function(|lua, ()| {
+            read_screen_modes(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(model.current_resolution.map_or(1.0, |i| (i + 1) as f64))
         })?,
@@ -831,6 +913,7 @@ fn install_video_verbs(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "SetScreenResolution",
         lua.create_function(|lua, id: Option<Value>| {
+            read_screen_modes(lua);
             // `is-number` (`0x48bfe8`) false leaves the index at entry 1 (`0x48bfe6`).
             let idx = match id {
                 Some(v) => lua.coerce_number(v)?.map_or(0, super::binding_abi::ftol),
@@ -951,11 +1034,12 @@ fn install_video_verbs(lua: &Lua) -> mlua::Result<()> {
             let gamma = model
                 .cvars
                 .get(&CVAR_GAMMA.to_ascii_lowercase())
-                .and_then(|slot| slot.value.parse::<f64>().ok())
+                // The record's float (`fld dword [eax+0x24]`, `0x4891cd`), not the text.
+                .map(|slot| super::binding_abi::record_float(&slot.value))
                 // A bare VM with no `gamma` row answers as if the default stood; the reference
                 // always finds its record (`0x63de30`).
                 .unwrap_or(1.0);
-            Ok(1.0 - gamma)
+            Ok(1.0 - f64::from(gamma))
         })?,
     )?;
     lua.globals().set(
@@ -963,17 +1047,7 @@ fn install_video_verbs(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, value: Value| {
             // `lua_isnumber` (`0x4891fe`): a number or a numeric string; anything else raises
             // (`0x6f4940`).
-            let v = match &value {
-                Value::Integer(i) => *i as f64,
-                Value::Number(n) => *n,
-                Value::String(s) => {
-                    match s.to_str().ok().and_then(|s| s.trim().parse::<f64>().ok()) {
-                        Some(n) => n,
-                        None => return Err(mlua::Error::runtime(USAGE_SET_GAMMA)),
-                    }
-                }
-                _ => return Err(mlua::Error::runtime(USAGE_SET_GAMMA)),
-            };
+            let v = super::binding_abi::float_arg(lua, value, USAGE_SET_GAMMA)?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             write_cvar(&mut model, CVAR_GAMMA, format_f(1.0 - v));
             // Zero return values, not nil (`eax = 0` at every `ret`).
@@ -1029,27 +1103,13 @@ fn install_world_detail_verbs(lua: &Lua) -> mlua::Result<()> {
         "SetWorldDetail",
         lua.create_function(|lua, value: Value| {
             // `lua_isnumber`: a number or a numeric string; anything else is the usage error.
-            let n = match &value {
-                Value::Integer(i) => *i as f64,
-                Value::Number(n) => *n,
-                Value::String(s) => {
-                    match s.to_str().ok().and_then(|s| s.trim().parse::<f64>().ok()) {
-                        Some(n) => n,
-                        None => return Err(mlua::Error::runtime(USAGE_SET_WORLD_DETAIL)),
-                    }
-                }
-                _ => return Err(mlua::Error::runtime(USAGE_SET_WORLD_DETAIL)),
+            let n = super::binding_abi::number_arg(lua, value, USAGE_SET_WORLD_DETAIL)?;
+            // `_ftol` (`0x488e0a`), then a signed `0..3` (`0x488e13`, `0x488e1c`): -0.5 is stop 0,
+            // only <= -1 raises, and NaN is stop 0, its QWORD `fistp` having a low dword of 0.
+            let stop = match usize::try_from(n) {
+                Ok(stop) if stop < 3 => stop,
+                _ => return Err(mlua::Error::runtime(RANGE_SET_WORLD_DETAIL)),
             };
-            // Truncate toward zero, then the reference's bounds: -0.5 is stop 0 and only <= -1
-            // raises. NaN raises too, as the reference's `fistp` gives the negative indefinite.
-            if n.is_nan() {
-                return Err(mlua::Error::runtime(RANGE_SET_WORLD_DETAIL));
-            }
-            let stop = n.trunc();
-            if !(0.0..3.0).contains(&stop) {
-                return Err(mlua::Error::runtime(RANGE_SET_WORLD_DETAIL));
-            }
-            let stop = stop as usize;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             // The reference's two writes, `frillDensity` as "%d" (`0x488e26`) and `smallCull` as
             // "%f" of the f32 (`0x488e63`), then ours, the stop: writing it here keeps
@@ -1213,6 +1273,7 @@ mod tests {
     #[test]
     fn console_exec_writes_a_valued_cvar_and_hands_a_bare_name_to_the_host() {
         let mut s = script_with_volume();
+        s.keep_calls();
         s.run(r#"ConsoleExec("MusicVolume 0.2")"#).unwrap();
         assert_eq!(
             s.eval::<String>(r#"return GetCVar("MusicVolume")"#)

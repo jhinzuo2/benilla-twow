@@ -1,20 +1,21 @@
-//! The gossip bindings: the app pushes the open menu ([`UiScript::set_gossip`]), each select hands
-//! the host its call ([`GossipCall`]), which reads the message's slots and sends before the verb
-//! returns, and `CloseGossip` leaves its teardown to the app.
+//! The gossip bindings: the getters read the message's slots and the drawn text through the host
+//! at the call ([`GossipQuery`]), each select hands the host its call ([`GossipCall`]), which
+//! reads the slots and sends before the verb returns, and `CloseGossip` leaves its teardown to the
+//! app.
 //!
 //! `GetGossipOptions()` returns flat `(text, type)` pairs, `type` the lowercase icon name the app
 //! maps from the wire `GOSSIP_ICON`. A coded option selected with no code fires
 //! `GOSSIP_ENTER_CODE`, whose stock popup (`StaticPopup.lua:1383`) calls
 //! `SelectGossipOption(index, code)`.
 //!
-//! A menu is pushed only once its greeting (`SMSG_NPC_TEXT_UPDATE`) has arrived; until then the
-//! VM keeps its last menu, as the reference's frame keeps its last paint: its handler returns on a
-//! cache miss without an event, and the greeting write and `GOSSIP_SHOW` share one success path
-//! (`0x4e2010`, `0x4e22b0`).
+//! The message writes the slots at once (`0x4e26e0`), and the text only once its greeting is
+//! drawn (`0x4e229a`), right before `GOSSIP_SHOW`; while the text query is out the getters read
+//! the new slots beside the last text, and nothing signals, so the frame keeps its last paint.
 
 use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi;
+use super::live::{ask, LiveQuery};
 use super::Model;
 
 /// One gossip option; its 1-based index is its place in [`GossipMenu::options`].
@@ -38,10 +39,11 @@ pub struct GossipQuestRow {
     pub active: bool,
 }
 
-/// One open gossip menu, pushed whole by the app.
+/// The gossip store as the getters read it: the host's answer at the call, else the VM's copy,
+/// which only a test sets.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GossipMenu {
-    /// The NPC greeting, always resolved.
+    /// The drawn text `0xbbb678`, expanded at its draw, which `GetGossipText` returns (`0x4e28c0`).
     pub greeting: String,
     /// Quest rows from the same packet.
     pub quests: Vec<GossipQuestRow>,
@@ -63,20 +65,34 @@ pub enum GossipCall {
     Close,
 }
 
+/// The question the gossip getters ask at the call: the text buffer (`0xbbb678`), the used option
+/// slots in slot order (`0xbbbe90`, `0x4e28d0`) and the quest rows (`0xbb74c0`).
+pub struct GossipQuery;
+
+impl LiveQuery for GossipQuery {
+    type Answer = GossipMenu;
+}
+
+/// `f` over the store now: the host's, else the VM's copy; `None` with neither.
+fn read<T>(lua: &Lua, f: impl FnOnce(&GossipMenu) -> T) -> Option<T> {
+    match ask(lua, &GossipQuery) {
+        Some(menu) => Some(f(&menu)),
+        None => {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            model.gossip.as_ref().map(f)
+        }
+    }
+}
+
 /// Hand `call` to the host, which applies it before this returns ([`super::calls::submit`]).
 fn submit(lua: &Lua, call: GossipCall) -> mlua::Result<()> {
     super::calls::submit(lua, super::ScriptCall::Gossip(call))
 }
 
 impl super::UiScript {
-    /// Push (or clear, with `None`) the open gossip menu.
+    /// Set (or clear, with `None`) the VM's copy of the store, for a test.
     pub fn set_gossip(&mut self, menu: Option<GossipMenu>) {
         self.model_mut().gossip = menu;
-    }
-
-    /// The menu the VM holds, as last pushed.
-    pub fn gossip(&self) -> Option<GossipMenu> {
-        self.model_ref().gossip.clone()
     }
 
     /// `ResetGossipOptions` (`0x4e26a0`) as the getters see it: no option and no quest row; the
@@ -96,11 +112,6 @@ impl super::UiScript {
         })
     }
 
-    /// Whether `CloseGossip` was called since the last drain; the 1.12 close sends no packet.
-    pub fn take_gossip_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().gossip_close)
-    }
-
     /// The quest selects a harness's VM kept ([`Self::keep_calls`]): whether active, and the
     /// 1-based row in its list.
     pub fn take_gossip_quest_selects(&mut self) -> Vec<(bool, u32)> {
@@ -117,17 +128,13 @@ impl super::UiScript {
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
+    // The static buffer `0xbbb678` (`0x4e28c0`): "" before any gossip (.bss), never nil, and what
+    // the last window drew after it closes.
     g.set(
         "GetGossipText",
         lua.create_function(|lua, ()| {
-            let text = {
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.gossip.as_ref().map(|m| m.greeting.clone())
-            };
-            match text {
-                Some(t) => Ok(Value::String(lua.create_string(&t)?)),
-                None => Ok(Value::Nil),
-            }
+            let text = read(lua, |m| m.greeting.clone()).unwrap_or_default();
+            lua.create_string(&text)
         })?,
     )?;
 
@@ -135,15 +142,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetGossipOptions",
         lua.create_function(|lua, ()| {
             // Copy out under one short borrow; build the Lua values with none held.
-            let pairs: Vec<(String, String)> = {
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.gossip.as_ref().map_or_else(Vec::new, |m| {
-                    m.options
-                        .iter()
-                        .map(|o| (o.label.clone(), o.icon_type.clone()))
-                        .collect()
-                })
-            };
+            let pairs: Vec<(String, String)> = read(lua, |m| {
+                m.options
+                    .iter()
+                    .map(|o| (o.label.clone(), o.icon_type.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
             let mut out: Vec<Value> = Vec::with_capacity(pairs.len() * 2);
             for (label, icon) in pairs {
                 out.push(Value::String(lua.create_string(&label)?));
@@ -175,32 +180,24 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // CloseGossip(): the cell zeroed in the call, and the teardown owed to the app.
+    // CloseGossip() (`0x4e2b20`): the close core `0x4e1fa0` with a zero guid, inside the call.
     g.set(
         "CloseGossip",
-        lua.create_function(|lua, ()| {
-            submit(lua, GossipCall::Close)?;
-            lua.app_data_mut::<Model>()
-                .expect("model app_data")
-                .gossip_close = true;
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, GossipCall::Close))?,
     )?;
 
     // ══ The two quest lists ══
     // The reference splits the quest rows by wire icon, 3 and 4 active and the rest available,
     // behind two vararg verbs (`0x4e2430`, `0x4e2580`); the app splits them at parse time.
     fn quest_rows(lua: &Lua, active: bool) -> mlua::Result<MultiValue> {
-        let rows: Vec<(String, u32)> = {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            model.gossip.as_ref().map_or_else(Vec::new, |m| {
-                m.quests
-                    .iter()
-                    .filter(|q| q.active == active)
-                    .map(|q| (q.title.clone(), q.level))
-                    .collect()
-            })
-        };
+        let rows: Vec<(String, u32)> = read(lua, |m| {
+            m.quests
+                .iter()
+                .filter(|q| q.active == active)
+                .map(|q| (q.title.clone(), q.level))
+                .collect()
+        })
+        .unwrap_or_default();
         let mut out = Vec::with_capacity(rows.len() * 2);
         for (title, level) in rows {
             out.push(Value::String(lua.create_string(&title)?));
@@ -279,7 +276,11 @@ mod tests {
     fn gossip_snapshot_reads_and_selects_queue() {
         let mut s = UiScript::new().unwrap();
         s.keep_calls();
-        assert!(s.eval::<bool>("return GetGossipText() == nil").unwrap());
+        assert_eq!(
+            s.eval::<String>("return GetGossipText()").unwrap(),
+            "",
+            "the buffer is empty before any gossip, never nil (`0x4e28c0`)"
+        );
         assert_eq!(s.arity("GetGossipOptions()").unwrap(), 0);
 
         s.set_gossip(Some(menu()));
@@ -332,10 +333,13 @@ mod tests {
         );
         assert!(s.take_gossip_selects().is_empty(), "taken");
 
-        assert!(!s.take_gossip_close());
         s.run("CloseGossip()").unwrap();
-        assert!(s.take_gossip_close());
-        assert!(!s.take_gossip_close(), "drained");
+        assert!(
+            s.take_calls_where(|call| match call {
+                super::super::ScriptCall::Gossip(super::GossipCall::Close) => Some(()),
+                _ => None,
+            }) == [()]
+        );
     }
 
     #[test]
@@ -401,7 +405,7 @@ mod tests {
         let mut s = UiScript::new().unwrap();
         s.set_gossip(Some(menu()));
         s.set_gossip(None);
-        assert!(s.eval::<bool>("return GetGossipText() == nil").unwrap());
+        assert_eq!(s.eval::<String>("return GetGossipText()").unwrap(), "");
         assert_eq!(s.arity("GetGossipOptions()").unwrap(), 0);
     }
 }

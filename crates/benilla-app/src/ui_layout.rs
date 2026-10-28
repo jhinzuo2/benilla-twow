@@ -208,14 +208,28 @@ pub(crate) fn load_layout(
     mut hosted_vm: crate::script_calls::HostedVm,
     roster: Res<crate::glue_session::roster::Roster>,
     mut file: ResMut<LayoutFile>,
+    data: Option<Res<crate::account_data::AccountData>>,
 ) {
     hosted_vm.run(|script| {
         let Some(script) = script else { return };
         let Some(id) = crate::ui_macro::identity(&roster) else {
             return;
         };
-        if file.identity.get(script).as_ref() == Some(&id) {
-            return; // already restored into the live VM
+        // The reader (`0x490380`) registers once per VM through `0x5afe50` (`0x4900c2`): it reads
+        // now on a settled section, else when the section settles, and at every later settling.
+        let owed = data
+            .as_deref()
+            .is_some_and(|data| data.take_owed(crate::account_data::LAYOUT));
+        let first = file.identity.get(script).as_ref() != Some(&id);
+        if !owed && !first {
+            return; // read into the live VM, and nothing settled since
+        }
+        // Held, it reads nothing and nothing is written over the file ([`save_layout`]).
+        let held = data
+            .as_deref()
+            .is_some_and(|data| !data.register(crate::account_data::LAYOUT));
+        if held {
+            return;
         }
         file.path = crate::local_state::layout_character_path(&id.0, &id.1);
         *file.identity.get(script) = Some(id);
@@ -279,7 +293,8 @@ fn watch_layout(mut hosted_vm: crate::script_calls::HostedVm, mut file: ResMut<L
 fn save_layout(mut hosted_vm: crate::script_calls::HostedVm, mut file: ResMut<LayoutFile>) {
     hosted_vm.run(|script| {
         let Some(script) = script else { return };
-        if !*file.dirty.get(script) {
+        // Nothing read into this VM (a held reader): nothing of the player's to write.
+        if !*file.dirty.get(script) || file.identity.get(script).is_none() {
             return;
         }
         if !file.last_change.is_none_or(|t| t.elapsed() >= SAVE_QUIET) {

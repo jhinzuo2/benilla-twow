@@ -43,12 +43,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "ShowInventorySellCursor",
         lua.create_function(|lua, slot: Value| {
-            {
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                // `[0xbe2c4c] == 1`: repair mode (`0x4fbce3`) and the targeting arm move the base.
-                if model.spell_targeting || model.repair_mode {
-                    return Ok(());
-                }
+            if super::merchant::sell_cursor_shut(
+                &lua.app_data_ref::<Model>().expect("model app_data"),
+            ) {
+                return Ok(());
             }
             let slot0 = inventory_slot_arg(
                 lua,
@@ -61,7 +59,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             let sellable = usize::try_from(slot0 + 1)
                 .ok()
-                .and_then(|slot| model.inv_slot("player", slot))
+                .and_then(|slot| crate::script::char_stats::own_inv_view(lua, &model, slot))
                 .is_some_and(|v| v.item_id != 0 && !super::cursor::item_locked(&model, v.guid));
             if sellable {
                 model.ui_cursor = Some(UiCursorMode::Buy);

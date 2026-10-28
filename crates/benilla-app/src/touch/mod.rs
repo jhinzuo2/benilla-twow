@@ -253,16 +253,16 @@ impl Plugin for TouchPlugin {
             // `PreUpdate` system has already finished. That avoids naming an engine set whose
             // name has moved between releases, and costs nothing: the consumers are all in
             // `Update` too, ordered behind `TouchInputSet`.
-            // Before the UI feed, which reads `TouchPointer`, and so before the world input that
-            // runs after the UI pass.
-            .configure_sets(Update, TouchInputSet.before(crate::ui_script::UiInput))
-            // A VM holder (the UI hit test), so it declares its side of the tick: the feed phase.
-            .add_systems(
+            // At the head of the window input records, which carry the UI finger as a left button
+            // (`ui_script::records`), and so before the world input that runs after the UI pass.
+            .configure_sets(
                 Update,
-                classify_touches
-                    .in_set(TouchInputSet)
-                    .in_set(crate::ui_script::UiFeed),
+                TouchInputSet
+                    .in_set(crate::ui_script::UiInput)
+                    .before(crate::ui_script::collect_input_records),
             )
+            // A VM holder (the UI hit test), so it declares its side of the tick: the input phase.
+            .add_systems(Update, classify_touches.in_set(TouchInputSet))
             .add_plugins(joystick::JoystickVisualsPlugin);
     }
 }

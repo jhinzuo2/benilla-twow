@@ -85,18 +85,35 @@ fn the_sweep_prints_the_money_line_once_per_session() {
     );
 }
 
-/// `CloseLoot` on a disenchant window sweeps it, and the sweep's money line waits for the host
-/// behind the rows' stores, where 1.12.1 runs its listeners first (`0x4c2170` → `0x49a870`, ahead
-/// of `0x4c2180`): on the census list ([`crate::script_calls::census::SENDS_AHEAD`]).
+/// `CloseLoot` on a disenchant window sweeps it, and the sweep's money line runs its listeners in
+/// place, after the coin request and ahead of the rows' stores (`0x4c1ffc`, then `0x4c2170` →
+/// `AddChatLine 0x49a870`, then `0x4c2180`): nothing sends while one is held.
 #[test]
-fn a_sweep_sends_its_rows_ahead_of_its_held_money_line() {
+fn a_sweep_runs_its_money_lines_listeners_before_its_rows() {
     let mut l = client();
     note_money(&mut l);
+    run(
+        &mut l,
+        r#"local f = CreateFrame("Frame")
+        f:RegisterEvent("CHAT_MSG_MONEY")
+        f:SetScript("OnEvent", function() RandomRoll(1, 100) end)"#,
+    );
     open(&mut l, CORPSE, DISENCHANT, 500, vec![row(1, LINEN)]);
+    l.rx.try_iter().for_each(drop);
     benilla_ui::script::census::take();
     run(&mut l, "CloseLoot()");
     assert_eq!(money_lines(&mut l), ["You loot 5 Silver"]);
-    crate::script_calls::census::shows_only("Loot");
+    let wire: Vec<&str> =
+        l.rx.try_iter()
+            .filter_map(|c| match c {
+                ClientCommand::LootMoney => Some("LootMoney"),
+                ClientCommand::RandomRoll { .. } => Some("RandomRoll"),
+                ClientCommand::AutostoreLootItem { .. } => Some("AutostoreLootItem"),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(wire, ["LootMoney", "RandomRoll", "AutostoreLootItem"]);
+    assert!(benilla_ui::script::census::take().is_empty());
 }
 
 /// A party member in the first party slot (`[0xbc6f48]`, `0x4c2030`) or a raid roster
@@ -261,4 +278,71 @@ fn auto_loot_default_sweeps_a_pickpocket_and_a_disenchant_window() {
             );
         }
     }
+}
+
+/// `SMSG_LOOT_MONEY_NOTIFY` queues `LOOT_MONEY_SPLIT` over the coins as a `CHAT_MSG_MONEY` line at
+/// its packet's place in the chat queue (`0x5ebf20` → `0x5ec011`): the first nonzero coin as `"%d %s"` and each later
+/// one as `", %d %s"` (`0x5ebf88`, `0x5ebf9f`), so a zero middle coin leaves no empty separator;
+/// an amount of 0 shows nothing (`0x5ebf3a`).
+#[test]
+fn a_group_coin_share_queues_its_line_at_its_packet() {
+    let mut l = client();
+    note_money(&mut l);
+    for amount in [10_203, 10_003, 500, 7, 0] {
+        packets(&mut l, vec![SessionEvent::LootMoneyNotify { amount }]);
+    }
+    assert_eq!(
+        seen(&mut l),
+        "",
+        "queued behind the packets before it, not shown in place"
+    );
+    crate::ui_chat::feed_chat_once(l.app.world_mut());
+    assert_eq!(
+        money_lines(&mut l),
+        [
+            "Your share of the loot is 1 Gold, 2 Silver, 3 Copper.",
+            "Your share of the loot is 1 Gold, 3 Copper.",
+            "Your share of the loot is 5 Silver.",
+            "Your share of the loot is 7 Copper.",
+        ]
+    );
+    assert_eq!(
+        seen(&mut l),
+        "CHAT_MSG_MONEY,CHAT_MSG_MONEY,CHAT_MSG_MONEY,CHAT_MSG_MONEY"
+    );
+}
+
+/// A release in the frame of an auto-looted response with money: the reference swept inside the
+/// response (`0x4c1ed3` → `0x4c1fa0`) before the release arrived, whose close took the window and
+/// cleared the money line's flag (`0x4c1d95`). Here the release has taken the window before the
+/// lane fires the response, so its end sends nothing after the release and leaves the flag clear:
+/// the next corpse's sweep prints its line.
+#[test]
+fn a_release_in_the_frame_of_a_swept_response_leaves_the_next_line() {
+    let mut l = client();
+    note_money(&mut l);
+    let _ = sent(&l);
+    l.app.world_mut().resource_mut::<AutoLootByte>().0 = true;
+    l.app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
+    packets(
+        &mut l,
+        vec![
+            SessionEvent::LootResponse {
+                guid: CORPSE,
+                loot_type: 1,
+                gold: 150,
+                items: vec![row(0, LINEN)],
+            },
+            SessionEvent::LootReleaseResponse {
+                guid: CORPSE,
+                result: 1,
+            },
+        ],
+    );
+    feed(&mut l);
+    assert!(sent(&l).is_empty(), "nothing after the release");
+    assert_eq!(seen(&mut l), "LOOT_OPENED,LOOT_CLOSED");
+    assert!(!l.app.world().resource::<super::LootState>().coin_line_shown);
+    auto_open(&mut l, 1, 250, vec![row(0, WOOL), row(1, LINEN)]);
+    assert_eq!(money_lines(&mut l), ["You loot 2 Silver, 50 Copper"]);
 }

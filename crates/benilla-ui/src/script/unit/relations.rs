@@ -32,9 +32,111 @@ pub trait UnitRelations {
     fn is_pvp(&self, guid: u64) -> Option<bool>;
 }
 
+/// A relation function's question of the lent host ([`super::super::live::ask`]), by guid, the
+/// units as of the call: the reference's verbs run the engine's functions over the objects they
+/// resolve inside the call (`0x515940`, then `0x6061e0`, `0x606980`, `0x6066f0`, `0x606ba0`,
+/// `0x605ff0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationQuery {
+    /// [`UnitRelations::holds`].
+    Holds(u64),
+    /// [`UnitRelations::reaction`].
+    Reaction(u64, u64),
+    /// [`UnitRelations::can_attack`].
+    CanAttack(u64, u64),
+    /// [`UnitRelations::can_assist`].
+    CanAssist(u64, u64),
+    /// [`UnitRelations::can_cooperate`].
+    CanCooperate(u64, u64),
+    /// [`UnitRelations::is_pvp`].
+    IsPvp(u64),
+}
+
+/// A [`RelationQuery`]'s answer, the shape of the method it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationAnswer {
+    /// [`RelationQuery::Holds`]'s.
+    Holds(bool),
+    /// [`RelationQuery::Reaction`]'s.
+    Reaction(Option<u8>),
+    /// The predicates'.
+    Flag(Option<bool>),
+}
+
+impl super::super::live::LiveQuery for RelationQuery {
+    type Answer = RelationAnswer;
+}
+
+impl RelationQuery {
+    /// The question put to `rel`, the host's relation functions.
+    pub fn answer(self, rel: &dyn UnitRelations) -> RelationAnswer {
+        match self {
+            Self::Holds(guid) => RelationAnswer::Holds(rel.holds(guid)),
+            Self::Reaction(a, b) => RelationAnswer::Reaction(rel.reaction(a, b)),
+            Self::CanAttack(a, b) => RelationAnswer::Flag(rel.can_attack(a, b)),
+            Self::CanAssist(a, b) => RelationAnswer::Flag(rel.can_assist(a, b)),
+            Self::CanCooperate(a, b) => RelationAnswer::Flag(rel.can_cooperate(a, b)),
+            Self::IsPvp(guid) => RelationAnswer::Flag(rel.is_pvp(guid)),
+        }
+    }
+}
+
+/// The lent host's relation functions, each method one [`RelationQuery`] as of its call.
+struct LiveRelations<'l>(&'l Lua);
+
+impl LiveRelations<'_> {
+    fn flag(&self, q: RelationQuery) -> Option<bool> {
+        match super::super::live::ask(self.0, &q) {
+            Some(RelationAnswer::Flag(f)) => f,
+            _ => None,
+        }
+    }
+}
+
+impl UnitRelations for LiveRelations<'_> {
+    fn holds(&self, guid: u64) -> bool {
+        matches!(
+            super::super::live::ask(self.0, &RelationQuery::Holds(guid)),
+            Some(RelationAnswer::Holds(true))
+        )
+    }
+    fn reaction(&self, a: u64, b: u64) -> Option<u8> {
+        match super::super::live::ask(self.0, &RelationQuery::Reaction(a, b)) {
+            Some(RelationAnswer::Reaction(r)) => r,
+            _ => None,
+        }
+    }
+    fn can_attack(&self, a: u64, b: u64) -> Option<bool> {
+        self.flag(RelationQuery::CanAttack(a, b))
+    }
+    fn can_assist(&self, a: u64, b: u64) -> Option<bool> {
+        self.flag(RelationQuery::CanAssist(a, b))
+    }
+    fn can_cooperate(&self, a: u64, b: u64) -> Option<bool> {
+        self.flag(RelationQuery::CanCooperate(a, b))
+    }
+    fn is_pvp(&self, guid: u64) -> Option<bool> {
+        self.flag(RelationQuery::IsPvp(guid))
+    }
+}
+
+/// `f` over the relation functions as of the call: the lent host's, whose units are the object
+/// manager's at the call; with no host to ask, the pushed snapshot's
+/// ([`super::super::UiScript::set_unit_relations`]); `None` with neither.
+pub(crate) fn with_relations<T>(
+    lua: &Lua,
+    model: &Model,
+    f: impl FnOnce(&dyn UnitRelations) -> T,
+) -> Option<T> {
+    if super::super::live::ask(lua, &RelationQuery::Holds(0)).is_some() {
+        return Some(f(&LiveRelations(lua)));
+    }
+    model.unit_relations.as_deref().map(f)
+}
+
 impl super::super::UiScript {
-    /// Push the relation functions the six verbs ask. `None`, the state before the first push,
-    /// holds no unit, so every verb answers as for two units not held.
+    /// Seat the relation functions the six verbs ask with no host to ask ([`RelationQuery`]).
+    /// `None` holds no unit, so every verb answers as for two units not held.
     pub fn set_unit_relations(&mut self, relations: Option<Rc<dyn UnitRelations>>) {
         self.model_mut().unit_relations = relations;
     }
@@ -45,29 +147,28 @@ impl super::super::UiScript {
     }
 
     /// The drunk watcher's test on the active player (`0x5e2afb`-`0x5e2b2a`): the target global
-    /// `[0xb4e2d8]` names a unit the host holds (`0x468460`, typemask 8) and
-    /// `CanAttack 0x606980(player, target)` holds.
+    /// `[0xb4e2d8]`, read through the lent host as of here, names a unit the host holds
+    /// (`0x468460`, typemask 8) and `CanAttack 0x606980(player, target)` holds.
     pub fn player_can_attack_target(&self) -> bool {
         let model = self.model_ref();
         let guids = &model.unit_guids;
-        model.unit_relations.as_deref().is_some_and(|rel| {
-            guids.target != 0
-                && rel.holds(guids.target)
-                && rel.can_attack(guids.player, guids.target) == Some(true)
+        let target = super::UnitTokenGlobals::target(&super::LiveGlobals::asked(self.lua(), guids));
+        with_relations(self.lua(), &model, |rel| {
+            target != 0 && rel.holds(target) && rel.can_attack(guids.player, target) == Some(true)
         })
+        .unwrap_or(false)
     }
 }
 
 /// `GetGUIDFromName 0x515970` on one token: the guid of the unit it names, 0 for nobody. An
 /// unknown token raises `Unknown unit name` (`0x515c14`).
-fn guid_of(model: &Model, token: &str) -> mlua::Result<u64> {
+fn guid_of(lua: &Lua, model: &Model, token: &str) -> mlua::Result<u64> {
     check_unit_token(&Some(token.to_string()))?;
-    Ok(model.unit(token).map_or(0, |u| u.guid))
+    Ok(super::view(lua, model, token).map_or(0, |u| u.guid))
 }
 
-/// The guid when the host holds it as a unit: `None` is the null object a verb answers nil for.
-fn held(model: &Model, guid: u64) -> Option<u64> {
-    let rel = model.unit_relations.as_deref()?;
+/// The guid when `rel` holds it as a unit: `None` is the null object a verb answers nil for.
+fn held(rel: &dyn UnitRelations, guid: u64) -> Option<u64> {
     (guid != 0 && rel.holds(guid)).then_some(guid)
 }
 
@@ -99,14 +200,12 @@ fn ask_pair<T>(
     ask: impl FnOnce(&dyn UnitRelations, u64, u64) -> Option<T>,
 ) -> mlua::Result<Option<T>> {
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let (ga, gb) = (guid_of(&model, a)?, guid_of(&model, b)?);
-    let (Some(ga), Some(gb)) = (held(&model, ga), held(&model, gb)) else {
-        return Ok(None);
-    };
-    Ok(model
-        .unit_relations
-        .as_deref()
-        .and_then(|rel| ask(rel, ga, gb)))
+    let (ga, gb) = (guid_of(lua, &model, a)?, guid_of(lua, &model, b)?);
+    Ok(with_relations(lua, &model, |rel| {
+        let (ga, gb) = (held(rel, ga)?, held(rel, gb)?);
+        ask(rel, ga, gb)
+    })
+    .flatten())
 }
 
 /// `UnitIsFriend` and `UnitCanCooperate`'s shape (`0x516961`-`0x516a1d`, `0x516aa1`-`0x516b5c`):
@@ -120,12 +219,13 @@ fn predicate_or_group(
     predicate: impl FnOnce(&dyn UnitRelations, u64, u64) -> Option<bool>,
 ) -> mlua::Result<bool> {
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let (ga, gb) = (guid_of(&model, a)?, guid_of(&model, b)?);
-    let hit = held(&model, ga)
-        .zip(held(&model, gb))
-        .zip(model.unit_relations.as_deref())
-        .and_then(|((ga, gb), rel)| predicate(rel, ga, gb))
-        .unwrap_or(false);
+    let (ga, gb) = (guid_of(lua, &model, a)?, guid_of(lua, &model, b)?);
+    let hit = with_relations(lua, &model, |rel| {
+        let (ga, gb) = (held(rel, ga)?, held(rel, gb)?);
+        predicate(rel, ga, gb)
+    })
+    .flatten()
+    .unwrap_or(false);
     let player = |t: &str| t.eq_ignore_ascii_case("player");
     let guids = &model.unit_guids;
     Ok(hit || player(a) && member_or_pet(guids, gb) || player(b) && member_or_pet(guids, ga))
@@ -137,14 +237,14 @@ fn predicate_or_group(
 /// unknown token raises (`0x515c14`).
 pub(super) fn unit_is_pvp(lua: &Lua, token: &str) -> mlua::Result<Value> {
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let guid = guid_of(&model, token)?;
-    let answer = match held(&model, guid) {
-        Some(guid) => model
-            .unit_relations
-            .as_deref()
-            .and_then(|rel| rel.is_pvp(guid))
-            .unwrap_or(false),
-        None => model.unit(token).is_some_and(|u| u.pvp),
+    let guid = guid_of(lua, &model, token)?;
+    let held = with_relations(lua, &model, |rel| {
+        held(rel, guid).map(|guid| rel.is_pvp(guid).unwrap_or(false))
+    })
+    .flatten();
+    let answer = match held {
+        Some(pvp) => pvp,
+        None => super::view(lua, &model, token).is_some_and(|u| u.pvp),
     };
     Ok(flag(answer))
 }

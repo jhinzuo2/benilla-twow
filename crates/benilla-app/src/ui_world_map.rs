@@ -339,21 +339,6 @@ struct LandmarkKey {
     marker: Option<(u32, [u32; 3], u32)>,
 }
 
-impl LandmarkKey {
-    fn matches(
-        &self,
-        map: u32,
-        states: u64,
-        explored: &[u32],
-        marker: Option<(u32, [u32; 3], u32)>,
-    ) -> bool {
-        self.map == map
-            && self.states == states
-            && self.marker == marker
-            && self.explored == explored
-    }
-}
-
 /// [`WorldMapLandmarkSource::icons`]' order.
 const LEVELS: [WorldMapLevel; 3] = [
     WorldMapLevel::World,
@@ -521,31 +506,154 @@ fn install_world_loc_projector(script: &mut UiScript, data: &WorldMapUiData) {
 #[derive(Default)]
 struct FeedMemos {
     explored: Option<Vec<u32>>,
-    landmarks: Option<LandmarkKey>,
     /// The world-enter sync has run: the reference's `old == 0` gate.
     map_synced: bool,
     /// `GetWorldLocMapPosition`'s projection is installed over the current catalog.
     projector: bool,
 }
 
+/// What the landmark sources are a function of, as a system reads them.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct LandmarkReads<'w, 's> {
+    map: Option<Res<'w, CurrentMap>>,
+    self_q: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
+    areas: Option<Res<'w, crate::area::AreaTableRes>>,
+    poi_marker: Res<'w, crate::poi_marker::PoiMarker>,
+    pois: Option<Res<'w, crate::area_poi::AreaPoiRes>>,
+    world_states: Res<'w, crate::world_state::WorldStates>,
+}
+
+impl LandmarkReads<'_, '_> {
+    /// The key the sources are rebuilt on, `None` without the map and the area table.
+    fn key(&self) -> Option<LandmarkKey> {
+        let (map, _) = (self.map.as_deref()?, self.areas.as_deref()?);
+        let explored: Vec<u32> = self
+            .self_q
+            .iter()
+            .next()
+            .map(|store| {
+                (0..benilla_protocol::messages::PLAYER_EXPLORED_ZONES_SLOTS)
+                    .map(|i| store.0.player_explored_zone_slot(i))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let marker = self
+            .poi_marker
+            .on_map(map.0)
+            .map(|m| (m.continent_id, m.pos.map(f32::to_bits), m.icon));
+        Some(LandmarkKey {
+            map: map.0,
+            states: self.world_states.generation(),
+            explored,
+            marker,
+        })
+    }
+
+    /// The DBC rows first, in file order, the Lua landmark index (`0x4a6819`'s walk of
+    /// `[0xc0e054]`), then the guard-directions marker, last (`0x4a69c7`): no gate and no icon
+    /// substitution, only the near-zero skip.
+    fn sources(&self, key: &LandmarkKey) -> Vec<WorldMapLandmarkSource> {
+        let Some(areas) = self.areas.as_deref() else {
+            return Vec::new();
+        };
+        let mut sources: Vec<WorldMapLandmarkSource> = self
+            .pois
+            .as_ref()
+            .map(|pois| {
+                pois.0
+                    .rows()
+                    .filter_map(|(_, poi)| {
+                        let icons = LEVELS.map(|level| {
+                            landmark_gates_pass(
+                                poi,
+                                level,
+                                &areas.0,
+                                &key.explored,
+                                &self.world_states,
+                            )
+                            .then(|| landmark_texture_index(poi, level))
+                        });
+                        icons
+                            .iter()
+                            .any(Option::is_some)
+                            .then(|| WorldMapLandmarkSource {
+                                name: poi.name.clone(),
+                                description: poi.description.clone(),
+                                map: poi.continent_id,
+                                pos: (poi.pos[0], poi.pos[1]),
+                                icons,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(poi) = self.poi_marker.on_map(key.map) {
+            sources.push(WorldMapLandmarkSource {
+                name: poi.name.clone(),
+                description: poi.description.clone(),
+                map: poi.continent_id,
+                pos: (poi.pos[0], poi.pos[1]),
+                icons: [Some(poi.icon); 3],
+            });
+        }
+        sources
+    }
+
+    /// A world-state packet's rebuild, made where its signal fires so the `WORLD_MAP_UPDATE` that
+    /// follows reads the new list (`0x4a67a0` builds, then signals).
+    pub(crate) fn rebuild_for_packet(&self, script: &mut UiScript) {
+        if let Some(key) = self.key() {
+            script.rebuild_world_map_landmarks(self.sources(&key));
+        }
+    }
+}
+
+/// The landmark sources, rebuilt only when a `LandmarkKey` input moves; the engine projects them
+/// onto each selection it stores. A change of the world states alone is a packet's, whose signal
+/// is the lane's, so that rebuild queues none.
+fn feed_landmarks(
+    mut vm: crate::script_calls::HostedVm,
+    reads: LandmarkReads,
+    mut memo: Local<crate::ui_script::VmMemo<Option<LandmarkKey>>>,
+) {
+    vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        let Some(key) = reads.key() else {
+            return;
+        };
+        let before = memo.get(script).as_ref();
+        if before.is_some_and(|k| *k == key) {
+            return;
+        }
+        let packet = before.is_some_and(|k| k.states != key.states);
+        let sources = reads.sources(&key);
+        *memo.get(script) = Some(key);
+        if packet {
+            script.rebuild_world_map_landmarks(sources);
+        } else {
+            script.set_world_map_landmark_sources(sources);
+        }
+    })
+}
+
 fn feed_world_map(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // The death stores, which the death calls write: the corpse is read before the Lua runs.
+    mut vm: crate::script_calls::VmWith<Res<'static, crate::death::DeathNet>>,
     data: Option<Res<WorldMapUiData>>,
     player: Res<Player>,
     map: Option<Res<CurrentMap>>,
     world: benilla_world::world_point::WorldPoint,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     areas: Option<Res<crate::area::AreaTableRes>>,
-    death_net: Res<crate::death::DeathNet>,
-    poi_marker: Res<crate::poi_marker::PoiMarker>,
     group: Res<crate::ui_party::GroupState>,
     guids: Res<crate::net::GuidIndex>,
     unit_pos: Query<&GlobalTransform, With<crate::net::NetEntity>>,
-    pois: Option<Res<crate::area_poi::AreaPoiRes>>,
-    world_states: Res<crate::world_state::WorldStates>,
     mut memo: Local<crate::ui_script::VmMemo<FeedMemos>>,
 ) {
-    hosted_vm.run(|script| {
+    let corpse = vm.own().corpse;
+    vm.run(|script| {
         let (Some(script), Some(data), Some(map), Some(areas)) = (script, data, map, areas) else {
             return;
         };
@@ -603,7 +711,7 @@ fn feed_world_map(
         };
         let uv = project(map.0, wx, wy);
         // The corpse at the query answer's display position, a dungeon corpse at its entrance.
-        let corpse_uv = death_net.corpse.and_then(|cp| {
+        let corpse_uv = corpse.and_then(|cp| {
             project(
                 u32::try_from(cp.display_map).unwrap_or(u32::MAX),
                 cp.position[0],
@@ -611,72 +719,14 @@ fn feed_world_map(
             )
         });
 
-        // The landmark sources, rebuilt only when a `LandmarkKey` input moves; the engine projects
-        // them onto each selection it stores.
-        let marker = poi_marker
-            .on_map(map.0)
-            .map(|m| (m.continent_id, m.pos.map(f32::to_bits), m.icon));
-        let states_gen = world_states.generation();
-        let unchanged = memo
-            .get(script)
-            .landmarks
-            .as_ref()
-            .is_some_and(|k| k.matches(map.0, states_gen, &explored, marker));
-        if !unchanged {
-            // The DBC rows first, in file order, the Lua landmark index (`0x4a6819`'s walk of
-            // `[0xc0e054]`).
-            let mut sources: Vec<WorldMapLandmarkSource> = pois
-                .as_ref()
-                .map(|pois| {
-                    pois.0
-                        .rows()
-                        .filter_map(|(_, poi)| {
-                            let icons = LEVELS.map(|level| {
-                                landmark_gates_pass(poi, level, &areas.0, &explored, &world_states)
-                                    .then(|| landmark_texture_index(poi, level))
-                            });
-                            icons
-                                .iter()
-                                .any(Option::is_some)
-                                .then(|| WorldMapLandmarkSource {
-                                    name: poi.name.clone(),
-                                    description: poi.description.clone(),
-                                    map: poi.continent_id,
-                                    pos: (poi.pos[0], poi.pos[1]),
-                                    icons,
-                                })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            // Then the guard-directions marker, last (`0x4a69c7`): no gate and no icon
-            // substitution, only the near-zero skip.
-            if let Some(poi) = poi_marker.on_map(map.0) {
-                sources.push(WorldMapLandmarkSource {
-                    name: poi.name.clone(),
-                    description: poi.description.clone(),
-                    map: poi.continent_id,
-                    pos: (poi.pos[0], poi.pos[1]),
-                    icons: [Some(poi.icon); 3],
-                });
-            }
-            memo.get(script).landmarks = Some(LandmarkKey {
-                map: map.0,
-                states: states_gen,
-                explored: explored.clone(),
-                marker,
-            });
-            script.set_world_map_landmark_sources(sources);
-        }
-
         // The `party1..4` blips: a streamed member's transform, else the `i16` position from
         // `SMSG_PARTY_MEMBER_STATS`. That packet carries a zone, not a map, so the map is the
         // continent owning that zone, else ours.
-        let member_uv = |m: &benilla_protocol::messages::GroupMemberEntry| {
-            let (px, py) = crate::minimap::party_member_pos(m, &group, &guids, &unit_pos)?;
+        let member_uv = |guid: u64| {
+            let (px, py) = crate::minimap::party_member_pos(guid, &group, &guids, &unit_pos)?;
             let member_map = group
                 .stats
-                .get(&m.guid)
+                .get(&guid)
                 .and_then(|st| st.zone)
                 .and_then(|zone| {
                     data.continents
@@ -687,16 +737,15 @@ fn feed_world_map(
                 .unwrap_or(map.0);
             project(member_map, px, py).filter(|uv| *uv != (0.0, 0.0))
         };
-        let party_uv: Vec<Option<(f32, f32)>> = group.party_slots().map(member_uv).collect();
+        let party_uv: Vec<Option<(f32, f32)>> =
+            group.party_slots().map(|m| member_uv(m.guid)).collect();
 
-        // The `raid1..40` blips in the raid roster's order, so `raidN` matches: the members, then
+        // The `raid1..40` blips in the stored rows' order, so `raidN` matches: the members, then
         // our own row; the stock map skips our own slot by `UnitIsUnit` (`WorldMapFrame.lua:381`).
         let raid_uv: Vec<Option<(f32, f32)>> = group
-            .raid_rows()
-            .map(|guid| match group.members.iter().find(|m| m.guid == guid) {
-                Some(m) => member_uv(m),
-                None => uv,
-            })
+            .raid
+            .iter()
+            .map(|row| if row.own { uv } else { member_uv(row.guid) })
             .collect();
 
         script.set_world_map_feed(
@@ -725,6 +774,7 @@ fn dev_map_jump(
     mut hosted_vm: crate::script_calls::HostedVm,
     data: Option<Res<WorldMapUiData>>,
     net: Res<crate::net::NetCommands>,
+    widescreen: Option<Res<crate::video::Widescreen>>,
 ) {
     hosted_vm.run(|script| {
         // A dev affordance compiled into every build, so gated at run time.
@@ -742,7 +792,8 @@ fn dev_map_jump(
             return;
         };
         // Window px (y-down) to the VM's y-up root units, as the pointer feed converts them.
-        let at = crate::ui_script::window_to_ui(window.height(), cursor);
+        let screen = crate::ui_script::UiScreen::of_window(window, widescreen.as_deref());
+        let at = crate::ui_script::window_to_ui(screen, cursor);
         let Some((u, v)) = script.world_map_uv_at(at.x, at.y) else {
             return;
         };
@@ -797,9 +848,10 @@ impl Plugin for WorldMapUiPlugin {
             Update,
             (
                 // After the script tick: a selection changed this tick projects on the next.
-                feed_world_map.after(crate::ui_script::UiInput),
+                feed_world_map.after(crate::ui_script::UiTick),
+                feed_landmarks.after(crate::ui_script::UiTick),
                 // After the script tick, so the jump hit-tests this tick's frame rects.
-                dev_map_jump.after(crate::ui_script::UiInput),
+                dev_map_jump.after(crate::ui_script::UiTick),
             ),
         );
     }

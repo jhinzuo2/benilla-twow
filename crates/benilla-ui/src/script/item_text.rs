@@ -1,7 +1,8 @@
 //! The `ItemTextFrame` Lua surface (letters, books, plaques) over the read session the app owns:
-//! getters over the pushed [`ItemTextState`], and the close and page-turn intents. The app fires
-//! `ITEM_TEXT_BEGIN` then `ITEM_TEXT_READY` (`ItemTextFrame.lua:11`, `:38`), and `ITEM_TEXT_CLOSED`
-//! after `CloseItemText()`, the frame's OnHide (`ItemTextFrame.xml:349`).
+//! getters over the pushed [`ItemTextState`], and the close and the page turns, which the host
+//! applies inside their calls ([`ItemTextCall`]). The app fires `ITEM_TEXT_BEGIN` then
+//! `ITEM_TEXT_READY` (`ItemTextFrame.lua:11`, `:38`), and the close core `ITEM_TEXT_CLOSED` inside
+//! `CloseItemText()`, the frame's OnHide (`ItemTextFrame.xml:349`).
 
 use mlua::{Lua, Value};
 
@@ -31,30 +32,46 @@ impl super::UiScript {
         self.model_mut().item_text = state;
     }
 
-    /// Whether `CloseItemText()` was called since the last drain (and clear the flag).
+    /// Whether a harness's VM kept a `CloseItemText()` ([`Self::keep_calls`]).
     pub fn take_item_text_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().item_text_close)
+        self.take_calls_like(&super::ScriptCall::ItemText(ItemTextCall::Close)) > 0
     }
 
-    /// Drain the `ItemTextPrevPage()`/`ItemTextNextPage()` turns (`-1`/`+1`, in click order).
+    /// The `ItemTextPrevPage()`/`ItemTextNextPage()` turns a harness's VM kept (`-1`/`+1`, in
+    /// click order).
     pub fn take_item_text_page_turns(&mut self) -> Vec<i32> {
-        std::mem::take(&mut self.model_mut().item_text_page_turns)
+        self.take_calls_where(|c| match c {
+            super::ScriptCall::ItemText(ItemTextCall::Turn(delta)) => Some(*delta),
+            _ => None,
+        })
     }
+}
+
+/// An item text verb the host applies inside its call ([`super::ScriptCall::ItemText`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemTextCall {
+    /// `ItemTextPrevPage()` (`0x4e3b50` → `0x4e3870`) as -1, `ItemTextNextPage()` (`0x4e3b60` →
+    /// `0x4e38b0`) as +1: the page moved and shown (`0x4e35b0`), its record asked for when not
+    /// cached.
+    Turn(i32),
+    /// `CloseItemText()` (`0x4e3b70`): the close core `0x4e32e0(0, 0)`.
+    Close,
 }
 
 /// Register the item-text globals.
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
+    // `ItemTextGetItem()` (`0x4e38f0`): the open object's name (`0x4e391f`), nil with no object
+    // (`0x4e3919`), `lua_pushstring(NULL)` (`0x4e3928`).
     g.set(
         "ItemTextGetItem",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(model
-                .item_text
-                .as_ref()
-                .map(|s| s.item.clone())
-                .unwrap_or_default())
+            match model.item_text.as_ref() {
+                Some(s) => Ok(Value::String(lua.create_string(&s.item)?)),
+                None => Ok(Value::Nil),
+            }
         })?,
     )?;
 
@@ -118,10 +135,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "CloseItemText",
         lua.create_function(|lua, ()| {
-            lua.app_data_mut::<Model>()
-                .expect("model app_data")
-                .item_text_close = true;
-            Ok(())
+            super::calls::submit(lua, super::ScriptCall::ItemText(ItemTextCall::Close))
         })?,
     )?;
 
@@ -129,11 +143,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         g.set(
             name,
             lua.create_function(move |lua, ()| {
-                lua.app_data_mut::<Model>()
-                    .expect("model app_data")
-                    .item_text_page_turns
-                    .push(delta);
-                Ok(())
+                super::calls::submit(lua, super::ScriptCall::ItemText(ItemTextCall::Turn(delta)))
             })?,
         )?;
     }
@@ -160,8 +170,10 @@ mod tests {
     #[test]
     fn getters_mirror_the_pushed_state() {
         let mut s = UiScript::new().unwrap();
-        // No session: empty defaults; the frame reads these only while shown.
-        assert_eq!(s.eval::<String>("return ItemTextGetItem()").unwrap(), "");
+        s.keep_calls();
+        // No session: no object to name, so nil (`0x4e3919`); the frame reads these only while
+        // shown.
+        assert!(s.eval::<bool>("return ItemTextGetItem() == nil").unwrap());
         assert!(s
             .eval::<bool>("return ItemTextGetCreator() == nil")
             .unwrap());
@@ -183,19 +195,24 @@ mod tests {
         assert!(s
             .eval::<bool>("return ItemTextGetMaterial() == nil")
             .unwrap());
+
+        // The close clears the session: `if ItemTextGetItem() then` is false again.
+        s.set_item_text(None);
+        assert!(s.eval::<bool>("return ItemTextGetItem() == nil").unwrap());
     }
 
     #[test]
-    fn close_and_page_intents_queue_and_drain() {
+    fn close_and_page_calls_reach_the_host() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_item_text(Some(state()));
         assert!(!s.take_item_text_close());
         s.run("CloseItemText()").unwrap();
         assert!(s.take_item_text_close());
-        assert!(!s.take_item_text_close(), "drained");
+        assert!(!s.take_item_text_close(), "taken");
 
         s.run("ItemTextNextPage() ItemTextPrevPage()").unwrap();
         assert_eq!(s.take_item_text_page_turns(), vec![1, -1]);
-        assert!(s.take_item_text_page_turns().is_empty(), "drained");
+        assert!(s.take_item_text_page_turns().is_empty(), "taken");
     }
 }

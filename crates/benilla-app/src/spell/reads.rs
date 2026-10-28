@@ -1,26 +1,18 @@
-//! What a spell computation read of the caster's live state, reported where it reads it, for a
-//! caller that keeps the result and builds it again when one of those inputs moves: the spell
-//! tooltip feed (`crate::ui_tooltip`). The reference computes at every call and keeps nothing.
+//! What a spell computation read of the caster's live state, reported where it reads it. The
+//! reference computes at every call and keeps nothing, and so does every caller here
+//! ([`Unrecorded`]).
 
 /// A caster unit field a cost, cast-time or cooldown computation reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnitField {
     BaseMana,
     BaseHealth,
-    RangedTime,
     /// `UNIT_MOD_CAST_SPEED`, the cast-time factor (`0x6e342c`).
     CastSpeed,
     /// `UNIT_FIELD_POWER_COST_MODIFIER`, the seven schools' flat cost terms (`0x6e32ad`).
     PowerCostModifier,
     /// `UNIT_FIELD_POWER_COST_MULTIPLIER`, the seven schools' cost factors less 1 (`0x6e32c0`).
     PowerCostMultiplier,
-}
-
-impl UnitField {
-    /// The field's bit in a mask of them.
-    pub(crate) fn bit(self) -> u16 {
-        1 << self as u16
-    }
 }
 
 /// The reads a computation reports, each where it makes it.
@@ -39,12 +31,12 @@ pub(crate) trait SpellReads {
 /// term reads it.
 #[derive(Clone, Copy)]
 pub(crate) enum SpellLevel<'a> {
-    /// The active player's, `CGPlayer_C::GetSpellSkillLevel 0x5ea690`: the skill in the spell's
-    /// own line, capped at `maxLevel × 5` ([`benilla_formats::SpellDisplay::skill_level`]); no
-    /// line reads 0 (`0x5ea6f0`). A read of that line.
+    /// The active player's ([`super::player_spell_level`]): its skill in the line of the spell
+    /// `GetSkillSpell 0x5ea5d0` names, capped by that spell's `maxLevel`. A read of that line and
+    /// of the hands it asked.
     Player {
         me: Option<&'a crate::net::ObjectStore>,
-        skill_lines: Option<&'a benilla_formats::SkillLineCatalog>,
+        skills: super::PlayerSkills<'a>,
     },
     /// A level already found: a pet's (`0x60cd80`), which is a pet input and recorded nowhere.
     Known(u32),
@@ -55,13 +47,7 @@ impl SpellLevel<'_> {
     pub(crate) fn read(self, d: &benilla_formats::SpellDisplay, reads: &mut dyn SpellReads) -> u32 {
         match self {
             Self::Known(level) => level,
-            Self::Player { me, skill_lines } => {
-                let Some(line) = skill_lines.and_then(|c| c.spell_to_line(d.id)) else {
-                    return 0;
-                };
-                reads.skill_line(line);
-                d.skill_level(super::skill_line_value(me, line))
-            }
+            Self::Player { me, skills } => super::player_spell_level(me, skills, d, reads),
         }
     }
 }

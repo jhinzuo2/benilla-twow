@@ -27,8 +27,8 @@ const JERKY_ICON: &str = "Interface\\Icons\\INV_Misc_Food_16";
 fn app_with_food_on_the_bar() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
-    actions.buttons.insert(
+    let mut slots = crate::ui_action::ActionSlots::default();
+    slots.buttons.insert(
         JERKY_SLOT,
         ActionButton {
             slot: JERKY_SLOT,
@@ -37,7 +37,7 @@ fn app_with_food_on_the_bar() -> (App, crossbeam_channel::Receiver<ClientCommand
         },
     );
     // As `SMSG_ACTION_BUTTONS` sets it; the feed's first pass clears it.
-    actions.dirty = true;
+    slots.dirty = true;
 
     let displays = HashMap::from([(
         JERKY_DISPLAY,
@@ -47,7 +47,8 @@ fn app_with_food_on_the_bar() -> (App, crossbeam_channel::Receiver<ClientCommand
         },
     )]);
 
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .init_resource::<Items>()
         .init_resource::<crate::net::GuidIndex>()
         .init_resource::<MountErrors>()
@@ -160,11 +161,13 @@ fn a_landed_item_template_also_lands_the_consumable_gate() {
 
 /// `PickupAction` and `PlaceAction` fire their slots' `ACTIONBAR_SLOT_CHANGED` in place
 /// (`0x4e5db0` and `0x4e684f` into `0x4e58e0`), each reading the slot as written, count and
-/// consumable gate included; the store catching up a frame later fires nothing more.
+/// consumable gate included; the feed resolving the stored slots after fires nothing more.
 #[test]
 fn a_bar_drag_fires_its_slots_in_place_and_the_feed_adds_nothing() {
     let (mut app, _rx) = app_with_food_on_the_bar();
-    app.add_systems(Update, super::drain::drain_action_sets.after(feed_actions));
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .keep_calls();
     let mut info = test_template("Tough Jerky");
     info.display_info_id = JERKY_DISPLAY;
     info.spells = vec![ItemSpellEntry {
@@ -211,12 +214,18 @@ fn a_bar_drag_fires_its_slots_in_place_and_the_feed_adds_nothing() {
         ],
         "both slots signal before the verbs return, the placed one with its gate"
     );
+    // The slot writes as the host applies them inside the calls.
+    let sets = script(&mut app).take_action_sets();
+    let mut bar = bevy::ecs::system::SystemState::<super::ActionBarSteps>::new(app.world_mut());
+    for (id, packed) in sets {
+        bar.get_mut(app.world_mut()).set(id, packed);
+    }
 
     app.update();
     app.update();
     let late: Vec<String> = script(&mut app).eval("return SLOT_EVENTS").unwrap();
     assert!(late.is_empty(), "the feed re-fired {late:?}");
-    let bar = app.world().resource::<PlayerActions>();
+    let bar = app.world().resource::<crate::ui_action::ActionSlots>();
     assert!(bar.buttons.contains_key(&0) && !bar.buttons.contains_key(&JERKY_SLOT));
 }
 
@@ -368,8 +377,8 @@ fn a_macro_slot_shows_the_macros_own_icon_and_follows_an_edit() {
     const ACTION: u32 = 1;
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
-    actions.buttons.insert(
+    let mut slots = crate::ui_action::ActionSlots::default();
+    slots.buttons.insert(
         SLOT,
         ActionButton {
             slot: SLOT,
@@ -377,8 +386,9 @@ fn a_macro_slot_shows_the_macros_own_icon_and_follows_an_edit() {
             kind: ACTION_KIND_MACRO,
         },
     );
-    actions.dirty = true;
-    app.insert_resource(actions)
+    slots.dirty = true;
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .init_resource::<Items>()
         .init_resource::<crate::net::GuidIndex>()
         .init_resource::<MountErrors>()
@@ -611,6 +621,49 @@ fn report_feed(spells: crate::ui_action::Spells, reports: crate::ui_cast::CastRe
     app.insert_non_send_resource(UiScript::new().unwrap());
     app.add_systems(Update, crate::ui_cast::signal_reports);
     app
+}
+
+/// A validator rung's own line (`0x496720` from `0x6098a2`, `0x609930`, `0x6e6ab4`) shows as its
+/// catalog record does, its `%s` filled: `ERR_SPELL_ALREADY_KNOWN_S` with the taught spell's name,
+/// and `ERR_TAME_FAILED` with the `PETTAME_TOOMANY` string, each a `UI_ERROR_MESSAGE`.
+#[test]
+fn a_validator_line_shows_as_its_message_does() {
+    use crate::ui_action::{FillArg, Spells, UiError};
+    let mut reports = crate::ui_cast::CastReports::default();
+    reports.line(UiError {
+        key: "ERR_SPELL_ALREADY_KNOWN_S",
+        args: vec![FillArg::S("Fireball".into())],
+    });
+    reports.line(UiError {
+        key: "ERR_TAME_FAILED",
+        args: vec![FillArg::Global("PETTAME_TOOMANY".into())],
+    });
+    let mut app = report_feed(Spells::empty_for_tests(), reports);
+    app.world_mut()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"ERR_SPELL_ALREADY_KNOWN_S = "You already know %s.";
+               ERR_TAME_FAILED = "%s.";
+               PETTAME_TOOMANY = "You have too many pets already";
+               SEEN = {}
+               local f = CreateFrame("Frame")
+               f:RegisterEvent("UI_ERROR_MESSAGE")
+               f:SetScript("OnEvent", function() table.insert(SEEN, arg1) end)"#,
+        )
+        .unwrap();
+    app.update();
+    let seen = app
+        .world_mut()
+        .non_send_resource::<UiScript>()
+        .eval::<Vec<String>>("return SEEN")
+        .unwrap();
+    assert_eq!(
+        seen,
+        [
+            "You already know Fireball.",
+            "You have too many pets already."
+        ]
+    );
 }
 
 /// `HandleCastFailed 0x6e1a00` logs through `0x62c360`; `HandlePetCastFailed 0x6e8eb0` calls only
@@ -851,8 +904,11 @@ fn a_refusal_of_the_armed_craft_disarms_the_batch() {
                 product_item_level: 0,
                 reagents: vec![],
                 tools: vec![],
+                icon_pending: None,
+                tools_pending: Vec::new(),
             }],
         }));
+        script.keep_calls();
         script.run("DoTradeSkill(2, 3)").unwrap();
     }
     let repeat = |app: &App| {
@@ -1027,10 +1083,10 @@ fn the_feed_signals_no_macro_slot_of_its_own() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
+    let mut slots = crate::ui_action::ActionSlots::default();
     // Macro 1 on slots 1 and 3, macro 2 on slot 2.
     for (slot, id) in [(0u8, 1u32), (1, 2), (2, 1)] {
-        actions.buttons.insert(
+        slots.buttons.insert(
             slot,
             ActionButton {
                 slot,
@@ -1039,8 +1095,9 @@ fn the_feed_signals_no_macro_slot_of_its_own() {
             },
         );
     }
-    actions.dirty = true;
-    app.insert_resource(actions)
+    slots.dirty = true;
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .init_resource::<Items>()
         .init_resource::<crate::net::GuidIndex>()
         .init_resource::<MountErrors>()

@@ -51,8 +51,10 @@ fn stops_and_selections(f: &Frame) -> Vec<String> {
         .collect()
 }
 
-/// The bar's attack latch up on `PET`; `possessed` makes it `0x5ee5a0`'s answer.
+/// The bar's attack latch up on `PET`; `possessed` makes it `0x5ee5a0`'s answer. The world is
+/// entered first, as the bar comes after it: the entry's pet reset drops a bar (`0x4bc6f0`).
 fn with_pet_attacking(f: &mut Frame, possessed: bool) {
+    settle(f);
     let world = f.app.world_mut();
     let pet = world
         .spawn((
@@ -85,7 +87,7 @@ fn with_pet_attacking(f: &mut Frame, possessed: bool) {
 
 /// `SetSelection` refreshes the usable states (`0x493892`) and signals `PLAYER_TARGET_CHANGED`
 /// (`0x49389c`) before it returns, and so does its release (`0x493a69`, `0x493a73`): the chunk's
-/// next line has heard both, in that order, and the feeds signal the change no second time.
+/// next line has heard both, in that order, and the feeds signal no change of their own.
 #[test]
 fn a_selection_call_signals_its_target_change_inside_the_call() {
     let mut f = frame(true);
@@ -108,12 +110,10 @@ fn a_selection_call_signals_its_target_change_inside_the_call() {
     assert_eq!(seen(&mut f), "SPELL_UPDATE_USABLE,PLAYER_TARGET_CHANGED");
     feeds(&mut f);
     assert_eq!(events(&mut f).len(), 2, "the release's, once");
-    // A change no call made is the feeds' to signal, each once.
+    // The feeds signal no change: every writer of the selection signals its own.
     f.app.world_mut().resource_mut::<Selection>().guid = Some(NEW);
     feeds(&mut f);
-    let mut heard = events(&mut f);
-    heard.sort();
-    assert_eq!(heard, ["PLAYER_TARGET_CHANGED", "SPELL_UPDATE_USABLE"]);
+    assert_eq!(events(&mut f), Vec::<String>::new());
 }
 
 /// The release `0x493910` calls a possessed unit off (`0x4bd650` at `0x493a18`) behind
@@ -165,7 +165,7 @@ fn a_deselect_without_a_possession_leaves_the_pets_attack() {
 /// We swing at `OLD`, the selection, as the server echoed it. `OLD`, `NEW` and `MOB` stream as
 /// units (`OBJECT_FIELD_TYPE` 0x9), which the re-swing's latch looks the outgoing selection up as
 /// (`0x49365f`).
-fn swinging_at_old(f: &mut Frame) {
+pub(super) fn swinging_at_old(f: &mut Frame) {
     let world = f.app.world_mut();
     for guid in [OLD, NEW, MOB] {
         let Some(&unit) = world.resource::<GuidIndex>().0.get(&guid) else {
@@ -461,13 +461,15 @@ fn a_switch_to_a_friend_while_swinging_stops_again() {
 
 /// StartAttack selects its target (`0x5ecca0`-`0x5eccaa` → `0x493540`) after the stand and before
 /// the swing: the attack a stealth opener defers to its `SMSG_SPELL_GO` (`0x6e8402` → `0x6131a0`
-/// → `0x5ecb70`) selects the GO's first hit, whatever is selected, then swings at it.
+/// → `0x5ecb70`) selects the GO's first hit, whatever is selected, and its `PLAYER_TARGET_CHANGED`
+/// (`0x49389c`) runs its listeners before the swing (`0x5ecd3c`).
 #[test]
 fn a_go_deferred_attack_selects_its_hit_before_it_swings() {
     const BACKSTAB: u32 = 53;
     let mut f = frame(true);
     spawn_mob(&mut f, &[]);
     swinging_at_old(&mut f);
+    on_target_changed(&mut f, "RandomRoll(1, 100)");
     let world = f.app.world_mut();
     let me = world.resource::<GuidIndex>().0[&ME];
     world
@@ -503,6 +505,8 @@ fn a_go_deferred_attack_selects_its_hit_before_it_swings() {
             misses: vec![],
             target: Some(MOB),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: None,
@@ -510,7 +514,10 @@ fn a_go_deferred_attack_selects_its_hit_before_it_swings() {
         }],
     );
     assert_eq!(selected(&f), Some(MOB));
-    assert_eq!(attack_wire(&f), ["SetSelection 0x31", "AttackSwing 0x31"]);
+    assert_eq!(
+        attack_wire(&f),
+        ["SetSelection 0x31", "RandomRoll", "AttackSwing 0x31"]
+    );
 }
 
 /// The wire a pick and what follows it send, in order: selections, rolls, Sinister Strike's casts
@@ -530,15 +537,13 @@ fn pick_wire(f: &Frame) -> Vec<String> {
         .collect()
 }
 
-/// `MOB` is named, as the unit feed names it to the VM.
+/// `MOB` is named in the name cache, which the getters read at the call off a held unit.
 fn with_named_mob(f: &mut Frame) {
     let world = f.app.world_mut();
     world
         .resource_mut::<crate::names::NameCache>()
         .insert_player(MOB, "Red Affinity".into(), None);
-    world
-        .run_system_once(crate::ui_unit::feed_name_candidates)
-        .expect("the candidate feed runs as a one-shot system");
+    as_creature(world, MOB);
 }
 
 /// TryCast's attack pick (`0x6e4efb` → `0x612df0` → `0x493f60`) commits through `SetSelection`,
@@ -583,7 +588,7 @@ fn an_attacks_pick_signals_its_target_change_before_the_swing() {
         spawn_mob(&mut f, &[(TEMPLATE, FOE)]);
         f.app
             .world_mut()
-            .resource_mut::<crate::ui_action::PlayerActions>()
+            .resource_mut::<crate::ui_action::ActionSlots>()
             .buttons
             .insert(
                 0,
@@ -681,8 +686,10 @@ fn an_assists_own_select_signals_inside_the_call_after_a_listener_retargets() {
 const SUMMONEDBY: u16 = 12;
 
 /// The bar's unit `PET`, alive, ours (summoned by us) or, `possessed`, possessed with our view on
-/// it, with `slot1` the bar's first word; the VM shows the bar, as its feed pushes it.
+/// it, with `slot1` the bar's first word; the VM shows the bar, as its feed pushes it. The world
+/// is entered first, as the bar comes after it: the entry's pet reset drops a bar (`0x4bc6f0`).
 fn with_pet(f: &mut Frame, possessed: bool, slot1: u32) {
+    settle(f);
     let world = f.app.world_mut();
     let mut fields = vec![(22, 100), (28, 100)];
     if possessed {
@@ -769,8 +776,8 @@ fn a_pet_attacks_pick_signals_its_target_change_before_the_order() {
 
 /// A possessed unit's Attack raises its attack latch (`0x4bd42e`) and signals `PET_BAR_UPDATE`
 /// (`0x4bd438`) past the validator and ahead of `CMSG_PET_ACTION` (`0x4bd4a4`): the listener's
-/// packet goes out between the pick's selection and the order, it reads the Attack button lit,
-/// and the bar's feed signals no second time.
+/// packet goes out between the pick's selection and the order, and it reads the Attack button lit
+/// through the lent host.
 #[test]
 fn a_possessed_attacks_latch_signals_its_bar_before_the_order() {
     let attack = benilla_protocol::messages::PET_COMMAND_ATTACK
@@ -780,12 +787,6 @@ fn a_possessed_attacks_latch_signals_its_bar_before_the_order() {
     spawn_mob(&mut f, &[(TEMPLATE, FOE)]);
     with_pet(&mut f, true, attack);
     feeds(&mut f);
-    // The bar as its feed paints it, Attack a command token.
-    let bar_feed = crate::ui_pet::pet_bar_feed(f.app.world_mut());
-    f.app
-        .world_mut()
-        .run_system(bar_feed)
-        .expect("the feed runs");
     f.rx.try_iter().for_each(drop);
     run(
         &mut f,
@@ -808,15 +809,6 @@ fn a_possessed_attacks_latch_signals_its_bar_before_the_order() {
     assert!(
         eval::<bool>(&mut f, "return LIT == 1"),
         "the latch lit Attack"
-    );
-    f.app
-        .world_mut()
-        .run_system(bar_feed)
-        .expect("the feed runs");
-    assert_eq!(
-        eval::<i64>(&mut f, "return HEARD"),
-        1,
-        "the feed signals no second time"
     );
 }
 
@@ -863,4 +855,94 @@ fn a_unit_casters_pick_signals_its_target_change_before_the_cast_and_the_order()
             "PetAction 0x31"
         ]
     );
+}
+
+/// A queued on-next-swing strike in the in-flight slot, Heroic Strike's.
+pub(super) fn queue_strike(f: &mut Frame) {
+    let world = f.app.world_mut();
+    world
+        .resource_mut::<crate::spell::QueuedMeleeSpell>()
+        .arm(78);
+    world
+        .resource_mut::<crate::spell::PendingCast>()
+        .fill_record();
+}
+
+/// A deselect while swinging runs StopAttack in its teardown (`0x493a08`), whose next-swing
+/// cancel (`0x5ecb63` → `0x6e6f30`) reports the strike's stop there, ahead of the release's
+/// `PLAYER_TARGET_CHANGED` (`0x493a73`).
+#[test]
+fn a_teardowns_strike_cancel_reports_before_the_target_change() {
+    let mut f = frame(true);
+    swinging_at_old(&mut f);
+    queue_strike(&mut f);
+    run(
+        &mut f,
+        r#"ORDER = {}
+        local r = CreateFrame("Frame")
+        r:RegisterEvent("SPELLCAST_STOP")
+        r:RegisterEvent("PLAYER_TARGET_CHANGED")
+        r:SetScript("OnEvent", function() table.insert(ORDER, event) end)"#,
+    );
+    run(&mut f, r#"ClearTarget() SEEN = table.concat(ORDER, ",")"#);
+    assert_eq!(seen(&mut f), "SPELLCAST_STOP,PLAYER_TARGET_CHANGED");
+}
+
+/// `UnitCreatureFamily("target")` (`0x51a310`) reads the held unit's cached creature record
+/// (`0x6055e0`: `[[unit+0xb30]+0x1c]`) through `CreatureFamily.dbc` inside its call, though no
+/// snapshot carries the word; a unit whose record the cache lacks answers nil.
+#[test]
+fn a_creature_family_is_read_off_the_held_units_record() {
+    const OBJECT_FIELD_TYPE: u16 = 2;
+    const OBJECT_FIELD_ENTRY: u16 = 3;
+    const BOAR: u32 = 1_126;
+    let mut f = frame(false);
+    // A unit object (`TYPEMASK_OBJECT | TYPEMASK_UNIT`) of the boar's template.
+    spawn_mob(
+        &mut f,
+        &[(OBJECT_FIELD_TYPE, 0x9), (OBJECT_FIELD_ENTRY, BOAR)],
+    );
+    // The world entry first, as a session has it: the target comes after.
+    settle(&mut f);
+    f.app.world_mut().resource_mut::<Selection>().guid = Some(MOB);
+    settle(&mut f);
+    let family =
+        |f: &mut Frame| eval::<Option<String>>(f, r#"return UnitCreatureFamily("target")"#);
+    assert_eq!(family(&mut f), None, "no record cached yet");
+
+    let world = f.app.world_mut();
+    world
+        .resource_mut::<crate::names::NameCache>()
+        .insert_creature(
+            BOAR,
+            Some(crate::names::CreatureRecord {
+                name: "Stonetusk Boar".into(),
+                subname: None,
+                creature_type: 1,
+                pet_family: 5,
+                rank: 0,
+                type_flags: 0,
+                pet_spell_list: 0,
+                civilian: false,
+                racial_leader: false,
+                display_id: 607,
+            }),
+        );
+    world.insert_resource(crate::ui_pet_stats::PetFamilyTables {
+        families: benilla_formats::CreatureFamilies::from_rows([(
+            5,
+            benilla_formats::CreatureFamily {
+                name: "Boar".into(),
+                icon: "Interface\\Icons\\Ability_Hunter_Pet_Boar".into(),
+                pet_food_mask: 0,
+                min_scale: 1.0,
+                min_scale_level: 0,
+                max_scale: 1.0,
+                max_scale_level: 0,
+                skill_lines: [0, 0],
+            },
+        )]),
+        foods: Default::default(),
+    });
+    assert_eq!(family(&mut f).as_deref(), Some("Boar"));
 }

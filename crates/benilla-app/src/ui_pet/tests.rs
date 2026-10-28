@@ -324,58 +324,46 @@ fn a_press_latches_the_state_the_server_never_echoes() {
     );
 }
 
-/// The reaction and Stay/Follow presses signal in the VM's verb (`0x4bc956`, `0x4bc979`), and the
-/// possessed Attack latch in the call host (`0x4bd438`), so the app's mirror of the latch signals
-/// nothing.
+/// The reaction and Stay/Follow presses write the state word, which signals `PET_BAR_UPDATE`
+/// ahead of the send (`0x4bc956`, `0x4bc979`); Dismiss, a spell and Attack write none, the
+/// possessed Attack's latch signalling in the call host instead (`0x4bd438`).
 #[test]
-fn no_press_signals_from_the_apps_latch() {
+fn only_the_state_writes_signal() {
     let mut bar = PetBar {
         spells: state(PET_COMMAND_FOLLOW, PET_REACT_DEFENSIVE),
         ..Default::default()
     };
     let mut latch = PetAttackLatch::default();
-    let signals = |b: &PetBar| b.bar_signals;
-
-    let before = signals(&bar);
-    latch_press(
+    let mut press =
+        |bar: &mut PetBar, word, possessing| latch_press(bar, Some(&mut latch), word, possessing);
+    assert!(press(
         &mut bar,
-        Some(&mut latch),
         packed(PET_COMMAND_STAY, PET_ACT_COMMAND),
-        false,
-    );
+        false
+    ));
     assert_eq!(bar.spells.command_state(), PET_COMMAND_STAY, "mirrored");
-    latch_press(
+    assert!(press(
         &mut bar,
-        Some(&mut latch),
         packed(PET_REACT_PASSIVE, PET_ACT_REACTION),
-        false,
-    );
+        false
+    ));
     assert_eq!(bar.spells.react_state(), PET_REACT_PASSIVE, "mirrored");
-    latch_press(
+    assert!(!press(
         &mut bar,
-        Some(&mut latch),
         packed(PET_COMMAND_DISMISS, PET_ACT_COMMAND),
-        false,
-    );
-    latch_press(
+        false
+    ));
+    assert!(!press(&mut bar, packed(3010, PET_ACT_ENABLED), false));
+    assert!(!press(
         &mut bar,
-        Some(&mut latch),
-        packed(3010, PET_ACT_ENABLED),
-        false,
-    );
-    latch_press(
-        &mut bar,
-        Some(&mut latch),
         packed(PET_COMMAND_ATTACK, PET_ACT_COMMAND),
-        false,
-    );
-    latch_press(
+        false
+    ));
+    assert!(!press(
         &mut bar,
-        Some(&mut latch),
         packed(PET_COMMAND_ATTACK, PET_ACT_COMMAND),
-        true,
-    );
-    assert_eq!(signals(&bar), before, "none of these signals from the app");
+        true
+    ));
 }
 
 /// The latch's possession gate is `0x4bd420`.
@@ -752,84 +740,6 @@ fn the_dismiss_word_is_the_carved_literal() {
     assert!(!entry.is_spell(), "dismiss is a command, never a cast");
 }
 
-/// A cooldown moves no bar: the feed pushes the new triple and fires nothing, for its events are
-/// the list's flush (`0x4b31b0`, `0x4bce90`), which `flush_tests` covers.
-#[test]
-fn a_cooldown_alone_is_pushed_with_no_event_from_the_bar_feed() {
-    use bevy::prelude::*;
-    use std::collections::HashMap;
-    const CLAW: u32 = 3010;
-    let claw = || benilla_formats::SpellDisplay {
-        recovery_ms: 8_000,
-        ..spell("Claw", None)
-    };
-    let mut bar = PetBar {
-        spells: state(PET_COMMAND_FOLLOW, PET_REACT_DEFENSIVE),
-        ..Default::default()
-    };
-    bar.spells.bar[3] = packed(CLAW, PET_ACT_ENABLED);
-    let mut app = App::new();
-    app.init_resource::<crate::ui_script::UiClock>()
-        .init_resource::<crate::net::GuidIndex>()
-        .init_resource::<crate::net::SelfGuid>()
-        .insert_resource(crate::ui_action::Spells {
-            catalog: benilla_formats::SpellCatalog::from_displays(HashMap::from([(CLAW, claw())])),
-            ..crate::ui_action::Spells::empty_for_tests()
-        })
-        .insert_resource(bar)
-        .init_resource::<PetAttackLatch>()
-        .add_systems(Update, super::bar::feed_pet_bar);
-    let script = benilla_ui::script::UiScript::new().unwrap();
-    script
-        .run(
-            r#"
-            SEEN = {}
-            local f = CreateFrame("Frame")
-            f:RegisterEvent("PET_BAR_UPDATE")
-            f:RegisterEvent("PET_BAR_UPDATE_COOLDOWN")
-            f:SetScript("OnEvent", function() table.insert(SEEN, event) end)
-        "#,
-        )
-        .unwrap();
-    app.insert_non_send_resource(script);
-    let seen = |app: &mut App| -> Vec<String> {
-        app.update();
-        let mut s = app
-            .world_mut()
-            .non_send_resource_mut::<benilla_ui::script::UiScript>();
-        s.resolve();
-        let out = s.eval::<Vec<String>>("return SEEN").unwrap();
-        s.run("SEEN = {}").unwrap();
-        out
-    };
-    assert_eq!(
-        seen(&mut app),
-        vec!["PET_BAR_UPDATE".to_string()],
-        "the bar arrives"
-    );
-    assert_eq!(seen(&mut app), Vec::<String>::new(), "nothing moved");
-
-    app.world_mut()
-        .resource_mut::<PetBar>()
-        .cooldowns
-        .start_spell(CLAW, &claw(), 0, std::time::Instant::now(), None);
-    assert_eq!(
-        seen(&mut app),
-        Vec::<String>::new(),
-        "a cooldown alone is neither the bar's event nor this feed's"
-    );
-    let (start, duration, enable): (f64, f64, i32) = app
-        .world_mut()
-        .non_send_resource_mut::<benilla_ui::script::UiScript>()
-        .eval("return GetPetActionCooldown(4)")
-        .unwrap();
-    assert!(
-        duration > 7.9 && duration < 8.1,
-        "the triple was pushed: {start} {duration}"
-    );
-    assert_eq!(enable, 1);
-}
-
 /// `0x4bcc19` calls `0x4bd190`, which copies the toggled word into the pet spellbook.
 #[test]
 fn a_bar_autocast_toggle_reaches_the_pet_spellbook() {
@@ -928,18 +838,12 @@ fn a_held_pet_reads_connected_and_its_stock_power_bar_shows_its_power() {
         .init_resource::<crate::net::GuidIndex>()
         .init_resource::<crate::net::SelfGuid>()
         .init_resource::<crate::names::NameCache>()
-        .insert_resource(PetBar {
-            spells: PetSpells {
-                pet_guid: PET,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
         .add_systems(Update, feed_pet_unit);
     let (tx, rx) = crossbeam_channel::unbounded();
     // Kept alive for the run: a dropped receiver would fail the name query.
     std::mem::forget(rx);
     app.insert_resource(NetCommands(tx));
+    summoning(&mut app, 0x77, PET);
     let pet = app
         .world_mut()
         .spawn((
@@ -957,6 +861,11 @@ fn a_held_pet_reads_connected_and_its_stock_power_bar_shows_its_power() {
     let mut script = app
         .world_mut()
         .non_send_resource_mut::<benilla_ui::script::UiScript>();
+    // The bar's `UNIT_PET` (`0x4bc84f`), which shows the frame on the snapshot just pushed.
+    script.fire_event(
+        "UNIT_PET",
+        vec![benilla_ui::script::ScriptValue::Str("player".into())],
+    );
     script.resolve();
     let (connected, shown, value, max, r, g, b) = script
         .eval::<(Option<f64>, Option<f64>, f64, f64, f64, f64, f64)>(
@@ -967,7 +876,7 @@ fn a_held_pet_reads_connected_and_its_stock_power_bar_shows_its_power() {
         )
         .unwrap();
     assert_eq!(connected, Some(1.0), "a held pet is connected");
-    assert_eq!(shown, Some(1.0), "the feed's UNIT_PET showed the frame");
+    assert_eq!(shown, Some(1.0), "the bar's UNIT_PET showed the frame");
     assert_eq!(
         (value, max),
         (45.0, 80.0),
@@ -1030,6 +939,7 @@ fn a_held_pet_names_its_templates_creature_type() {
     // Kept alive for the run: a dropped receiver would fail the name query.
     std::mem::forget(rx);
     app.insert_resource(NetCommands(tx));
+    summoning(&mut app, 0x77, PET);
     let pet = app
         .world_mut()
         .spawn((
@@ -1155,6 +1065,7 @@ fn a_pet_with_no_object_exists_and_is_not_visible() {
     // Kept alive for the run: a dropped receiver would fail the name query.
     std::mem::forget(rx);
     app.insert_resource(NetCommands(tx));
+    summoning(&mut app, 0x77, PET);
     app.insert_non_send_resource(benilla_ui::script::UiScript::new().unwrap());
 
     app.update();
@@ -1166,8 +1077,13 @@ fn a_pet_with_no_object_exists_and_is_not_visible() {
     assert_eq!(exists, Some(1.0), "the pet exists with no object");
     assert_eq!(visible, None, "and has none to see");
 
-    // The bar torn down: no pet at all.
-    app.world_mut().resource_mut::<PetBar>().spells.pet_guid = 0;
+    // The pet dismissed: our summon cleared, no pet at all.
+    let me = app.world().resource::<crate::net::GuidIndex>().0[&0x77];
+    app.world_mut()
+        .entity_mut(me)
+        .insert(ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+            (2, 0x19),
+        ])));
     app.update();
     let exists = app
         .world_mut()
@@ -1211,7 +1127,7 @@ fn a_rename_evicts_by_the_units_pet_number_for_any_unit() {
             },
             ..Default::default()
         })
-        .add_systems(Update, feed_pet_unit);
+        .init_resource::<crate::field_watch::NoticeLane>();
     let (tx, rx) = crossbeam_channel::unbounded();
     // Kept alive for the run: a dropped receiver would fail the name query.
     std::mem::forget(rx);
@@ -1236,17 +1152,6 @@ fn a_rename_evicts_by_the_units_pet_number_for_any_unit() {
     };
     let pet = spawn(PET, 55, ME as u32);
     let other = spawn(OTHER, 66, 0x99);
-    let script = benilla_ui::script::UiScript::new().unwrap();
-    script
-        .run(
-            r#"RENAMED = 0
-            local f = CreateFrame("Frame")
-            f:RegisterEvent("LOCALPLAYER_PET_RENAMED")
-            f:SetScript("OnEvent", function() RENAMED = RENAMED + 1 end)"#,
-        )
-        .unwrap();
-    app.insert_non_send_resource(script);
-    app.update();
 
     for e in [pet, other] {
         crate::net::apply_fields_for_test(
@@ -1255,7 +1160,8 @@ fn a_rename_evicts_by_the_units_pet_number_for_any_unit() {
             ObjectFields::from_pairs(&[(STAMP, 2)]),
         );
     }
-    app.update();
+    // The update packet's end, which runs the name stamp's watch on each edge.
+    crate::field_callbacks::run_written(app.world_mut());
     let names = app.world().resource::<crate::names::NameCache>();
     let named = |e: Entity, guid: u64| {
         let store = app.world().get::<ObjectStore>(e).unwrap();
@@ -1277,9 +1183,66 @@ fn a_rename_evicts_by_the_units_pet_number_for_any_unit() {
     );
     assert_eq!(by_bits(OTHER).as_deref(), Some("Eight"));
     let renamed = app
-        .world_mut()
-        .non_send_resource_mut::<benilla_ui::script::UiScript>()
+        .world()
+        .resource::<crate::field_watch::NoticeLane>()
+        .iter()
+        .filter(|n| {
+            **n == crate::field_watch::FieldNotice::Global {
+                id: crate::field_watch::id::LOCALPLAYER_PET_RENAMED,
+            }
+        })
+        .count();
+    assert_eq!(renamed, 1, "only our own pet's rename signals");
+
+    // The notices fired into a listening VM: the id names `LOCALPLAYER_PET_RENAMED`.
+    app.init_resource::<crate::ui_chat::ChatLog>()
+        .init_resource::<crate::sound::MessageSounds>();
+    let script = benilla_ui::script::UiScript::new().unwrap();
+    script
+        .run(
+            r#"RENAMED = 0
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("LOCALPLAYER_PET_RENAMED")
+            f:SetScript("OnEvent", function() RENAMED = RENAMED + 1 end)"#,
+        )
+        .unwrap();
+    app.insert_non_send_resource(script);
+    use bevy::ecs::system::RunSystemOnce;
+    app.world_mut()
+        .run_system_once(
+            |mut sink: crate::ui_action::MessageSink,
+             mut lane: ResMut<crate::field_watch::NoticeLane>,
+             mut vm: NonSendMut<benilla_ui::script::UiScript>| {
+                for n in lane.drain() {
+                    crate::ui_unit::field_events::fire(&mut vm, &mut sink, n);
+                }
+            },
+        )
+        .unwrap();
+    let heard = app
+        .world()
+        .non_send_resource::<benilla_ui::script::UiScript>()
         .eval::<i64>("return RENAMED")
         .unwrap();
-    assert_eq!(renamed, 1, "only our own pet's rename signals");
+    assert_eq!(heard, 1, "one LOCALPLAYER_PET_RENAMED reaches the listener");
+}
+
+/// Us, held as `me` and summoning `pet`: `"pet"` names our `UNIT_FIELD_SUMMON` (`0x515a6e`).
+fn summoning(app: &mut bevy::prelude::App, me: u64, pet: u64) {
+    app.insert_resource(crate::net::SelfGuid(Some(me)));
+    let e = app
+        .world_mut()
+        .spawn((
+            crate::net::Guid(me),
+            ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (2, 0x19),
+                (8, pet as u32),
+                (9, (pet >> 32) as u32),
+            ])),
+        ))
+        .id();
+    app.world_mut()
+        .resource_mut::<crate::net::GuidIndex>()
+        .0
+        .insert(me, e);
 }

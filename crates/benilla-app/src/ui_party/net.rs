@@ -7,6 +7,8 @@ use benilla_protocol::messages::{GroupLootInfo, GroupMemberEntry, PartyMemberSta
 use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
+use std::collections::HashMap;
+
 use benilla_protocol::{SessionEvent, SessionEventKind};
 
 use super::{GroupState, RosterRelease, GROUPTYPE_RAID};
@@ -14,7 +16,6 @@ use crate::names::NameCache;
 use crate::net::{ClientCommand, GuidIndex, NetCommands, NetHandlerApp, ObjectStore, SelfGuid};
 use crate::query_cache::Ask;
 use crate::sound::MessageSounds;
-use crate::target::DeselectGuid;
 use crate::ui_action::{UiError, UiErrorKeys};
 use crate::ui_quest::QuestGiver;
 
@@ -38,8 +39,7 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::ReadyCheckAnswer, on_ready_check_answer)
         .net_handler(K::RaidInstanceInfo, on_raid_instance_info)
         .net_handler(K::PlayerName, on_player_name)
-        .net_handler(K::Disconnected, on_session_end)
-        .add_message::<DeselectGuid>();
+        .net_handler(K::Disconnected, on_session_end);
 }
 
 /// The popup's signal; the feed shows its line after the event ([`GroupState::apply_invited`]).
@@ -62,8 +62,9 @@ fn on_uninvited(
     mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupUninvited = ev {
+        let before = teardown.before(&group);
         uninvited(&mut group, &errors);
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -86,8 +87,9 @@ fn on_destroyed(
     mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupDestroyed = ev {
+        let before = teardown.before(&group);
         destroyed(&mut group, &errors);
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -120,11 +122,12 @@ fn on_list(
                 ));
             }
         }
+        let before = teardown.before(&group);
         list(
             &mut group, &sounds, &mut quest, group_type, own_flags, members, leader, loot,
             &self_guid, &names, &index, &commands,
         );
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -140,31 +143,57 @@ fn on_command_result(
         result,
     } = ev
     {
+        let before = teardown.before(&group);
         command_result(&mut group, &errors, operation, &member, result);
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
+/// What a group packet's handler found before it wrote: the records and the roster cells.
+type Found = (HashMap<u64, PartyMemberStatsInfo>, super::RosterCells);
+
 /// The selection teardowns (`0x493910(guid, 1)`) a list or an ending raised
 /// ([`GroupState::take_released`]), resolved while the objects stand as the packet found them and
-/// handed to the guid-scoped deselect ([`DeselectGuid`]). A harness with no object index holds no
-/// object, and one with no selection drops them.
+/// owed at the packet's end ([`crate::target::OwedSelect::Deselect`]). A harness with no object
+/// index holds no object.
 #[derive(bevy::ecs::system::SystemParam)]
 struct RosterTeardown<'w, 's> {
     index: Option<Res<'w, GuidIndex>>,
     stores: Query<'w, 's, &'static ObjectStore>,
-    deselect: Option<MessageWriter<'w, DeselectGuid>>,
+    deselect: Option<ResMut<'w, crate::target::OwedSelects>>,
+    /// What each packet changed, for the views a listener reads ([`crate::ui_unit::views`]).
+    log: Option<ResMut<'w, crate::ui_unit::views::ViewLog>>,
 }
 
 impl RosterTeardown<'_, '_> {
-    fn run(&mut self, group: &mut GroupState) {
+    /// The records and the roster cells as the packet found them, for [`Self::run`] to log what
+    /// it changed, with the packet's entry opened ahead of its signals: a list writes each
+    /// member's record (`AddPartyMember`, `0x5e6c4a`) before it signals (`0x5e6c61`, `0x5e6c66`).
+    fn before(&mut self, group: &GroupState) -> Option<Found> {
+        let log = self.log.as_deref_mut()?;
+        log.open();
+        Some((group.stats.clone(), group.cells().to_owned()))
+    }
+
+    /// The packet's end: the records and cells it changed against `before` logged, then its
+    /// teardowns.
+    fn run(&mut self, group: &mut GroupState, before: Option<Found>) {
+        if let (Some(log), Some((records, cells))) = (self.log.as_deref_mut(), before) {
+            log.records(&records, &group.stats);
+            if group.cells() != cells.cells() {
+                log.roster(cells);
+            }
+            log.close();
+        }
         let released = group.take_released();
         let guids: Vec<u64> = released
             .into_iter()
             .filter_map(|release| self.released_guid(release))
             .collect();
-        if let Some(deselect) = &mut self.deselect {
-            deselect.write_batch(guids.into_iter().map(DeselectGuid));
+        if let Some(owed) = self.deselect.as_deref_mut() {
+            for guid in guids {
+                owed.deselect(guid);
+            }
         }
     }
 
@@ -196,10 +225,20 @@ fn on_member_stats(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
     mut notices: ResMut<crate::field_watch::NoticeLane>,
+    log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
 ) {
     if let SessionEvent::PartyMemberStats { guid, full, info } = ev {
-        let old = group.stats.get(&guid).cloned().unwrap_or_default();
+        let before = group.stats.get(&guid).cloned();
+        let old = before.clone().unwrap_or_default();
         group.apply_stats(guid, full, *info);
+        // Logged ahead of the signals, as the record copies precede them (`0x5e54c4`,
+        // `0x5e54d8`, then `0x5e54fa`).
+        if let Some(mut log) = log {
+            if group.stats.get(&guid) != before.as_ref() {
+                log.record(guid, before);
+            }
+            log.close();
+        }
         if let Some(new) = group.stats.get(&guid) {
             notices.write_batch(super::records::record_notices(guid, &old, new));
         }
@@ -252,8 +291,22 @@ fn on_player_name(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, names
 }
 
 /// The group state dies with the socket, after the bridge's own teardown.
-fn on_session_end(In(_): In<SessionEvent>, mut group: ResMut<GroupState>) {
+fn on_session_end(
+    In(_): In<SessionEvent>,
+    mut group: ResMut<GroupState>,
+    log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
+) {
+    let before = log
+        .is_some()
+        .then(|| (group.stats.clone(), group.cells().to_owned()));
     group.clear_session();
+    if let (Some(mut log), Some((records, cells))) = (log, before) {
+        log.records(&records, &group.stats);
+        if group.cells() != cells.cells() {
+            log.roster(cells);
+        }
+        log.close();
+    }
 }
 
 /// Queue the messages an `apply_*` named; `ui_action::feed_actions` resolves and shows them.
@@ -391,21 +444,62 @@ pub(crate) fn snapshot_pet_name(name: Option<&str>, script: Option<&UiScript>) -
     }
 }
 
+/// What the deactivate snapshot (`0x5f0880`) reads off the world beside the descriptors: the
+/// viewer's committed zone (`0x5f0957`) and the object's position at the snapshot (`0x5f096a`).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SnapshotPlace<'w, 's> {
+    committed: Option<Res<'w, crate::area::CommittedZone>>,
+    parents: Query<'w, 's, &'static ChildOf>,
+}
+
+impl SnapshotPlace<'_, '_> {
+    /// `0xb4e314`, the zone the zone-text commit stored ([`crate::area::CommittedZone`]), read as
+    /// its word (`0x5f095e`); 0 before the first commit.
+    pub(crate) fn zone(&self) -> u16 {
+        self.committed.as_deref().and_then(|z| z.0).unwrap_or(0) as u16
+    }
+
+    /// `entity`'s world x and y as of now, its own and each ancestor's local transform folded in
+    /// (`local` reads one), as the unit's position virtual answers (`0x5f096a`), not the
+    /// propagated transform a frame behind: `_ftol` of each (`0x5f0970`, `0x5f097c`), its low
+    /// word (`0x5f0978`, `0x5f0986`).
+    pub(crate) fn position(
+        &self,
+        entity: Option<Entity>,
+        local: impl Fn(Entity) -> Option<Transform>,
+    ) -> (i16, i16) {
+        let world = entity.and_then(|mut e| {
+            let mut global = GlobalTransform::from(local(e)?);
+            while let Ok(parent) = self.parents.get(e) {
+                e = parent.parent();
+                global = GlobalTransform::from(local(e)?) * global;
+            }
+            Some(global.translation())
+        });
+        let wow = world.map_or([0.0; 3], benilla_assets::coords::bevy_to_wow);
+        let word = |v: f32| benilla_ui::script::ftol(f64::from(v)) as i16;
+        (word(wow[0]), word(wow[1]))
+    }
+}
+
 /// The despawn hook, the reference's deactivate virtual `0x5e9aa0` (object destroyed or out of
-/// range): for a roster member, snapshot the live descriptor into their record (`0x5f0880`), their
-/// pet's too while `held` finds it, with the name `names` holds for it or `UNKNOWNOBJECT` on a miss
+/// range): for a roster member, snapshot the live descriptor into their record (`0x5f0880`), with
+/// the viewer's `zone` and the object's `position` ([`SnapshotPlace`]), their pet's block too
+/// while `held` finds it, with the name `names` holds for it or `UNKNOWNOBJECT` on a miss
 /// ([`snapshot_pet_name`]), then request their stats (`0x4e8646`). Nothing happens off the roster
 /// or without an object, since the hook is a virtual on the object.
+#[allow(clippy::too_many_arguments)] // the snapshot's reads, each as of the deactivate
 pub(crate) fn member_deactivated<'a>(
     guid: u64,
     group: &mut GroupState,
-    store: Option<&'a ObjectStore>,
+    object: Option<(&'a ObjectStore, (i16, i16))>,
+    zone: u16,
     held: impl Fn(u64) -> Option<&'a ObjectStore>,
     names: &NameCache,
     script: Option<&UiScript>,
     net_commands: &NetCommands,
 ) {
-    let Some(store) = store else {
+    let Some((store, position)) = object else {
         return;
     };
     if !group.members.iter().any(|m| m.guid == guid) {
@@ -421,6 +515,8 @@ pub(crate) fn member_deactivated<'a>(
         &store.0,
         pet.map(|p| &p.0),
         &pet_name,
+        zone,
+        position,
     );
     let _ = net_commands
         .0
@@ -428,11 +524,17 @@ pub(crate) fn member_deactivated<'a>(
 }
 
 /// [`member_deactivated`] for every streamed roster member: a cross-map transfer's teardown, where
-/// the reference destroys each object and runs the hook on each.
+/// the reference frees each object without its release (`0x467700` → `0x467800`), and the player's
+/// destructor runs the same roster search in mode 0 (`0x5dd600`, at `0x5dd6a0` → `0x4e85d0`): the
+/// record built (`0x4e8630`) and the stats asked, with no `PARTY_MEMBER_DISABLE`, which only the
+/// release signals (`0x5e9b78`).
+#[allow(clippy::too_many_arguments)] // the snapshot's reads, each as of the teardown
 pub(crate) fn roster_deactivated(
     group: &mut GroupState,
     index: &GuidIndex,
     stores: &Query<&mut ObjectStore>,
+    place: &SnapshotPlace,
+    local: &dyn Fn(Entity) -> Option<Transform>,
     names: &NameCache,
     script: Option<&UiScript>,
     net_commands: &NetCommands,
@@ -444,8 +546,10 @@ pub(crate) fn roster_deactivated(
         .filter(|g| index.0.contains_key(g))
         .collect();
     let held = |g: u64| index.0.get(&g).and_then(|e| stores.get(*e).ok());
+    let zone = place.zone();
     for guid in streamed {
-        member_deactivated(guid, group, held(guid), held, names, script, net_commands);
+        let object = held(guid).map(|s| (s, place.position(index.0.get(&guid).copied(), local)));
+        member_deactivated(guid, group, object, zone, held, names, script, net_commands);
     }
 }
 
@@ -728,7 +832,8 @@ mod tests {
         member_deactivated(
             guid,
             &mut group,
-            Some(&store),
+            Some((&store, (1234, -57))),
+            1537,
             |_| None,
             &NameCache::default(),
             None,
@@ -736,6 +841,9 @@ mod tests {
         );
 
         let rec = group.stats.get(&guid).expect("the member has a record");
+        // The viewer's zone and the object's position (`0x5f095e`, `0x5f0978`-`0x5f0986`), which
+        // the arrow and the roster's zone read until the stats reply.
+        assert_eq!((rec.zone, rec.position), (Some(1537), Some((1234, -57))));
         assert_eq!(
             (rec.cur_hp, rec.max_hp, rec.level),
             (Some(2400), Some(3000), Some(41)),
@@ -753,6 +861,46 @@ mod tests {
             "an object you can see belongs to an online, living, unflagged player"
         );
         assert_eq!(asked(&rx), vec![guid], "and the server is asked, once");
+    }
+
+    /// The snapshot's world reads: the zone the commit stored (`0xb4e314`), whatever the area
+    /// underfoot is now, and the object's x and y at the snapshot, its parents' transforms folded
+    /// in and not the propagated one a frame behind, as `_ftol`'s low words (`0x5f0970`-`0x5f0986`):
+    /// truncated toward zero and wrapped past 32767.
+    #[test]
+    fn the_snapshot_reads_the_committed_zone_and_the_objects_position_now() {
+        use bevy::ecs::system::RunSystemOnce;
+        let at = |x: f32, y: f32| {
+            Transform::from_translation(benilla_assets::coords::wow_to_bevy([x, y, 0.0]))
+        };
+        let mut world = World::new();
+        // Underfoot is Goldshire (87), but the last commit stored Elwynn (12).
+        world.insert_resource(benilla_world::terrain_stream::CurrentArea(Some(87)));
+        let ride = world
+            .spawn((at(-9000.0, 60.0), GlobalTransform::IDENTITY))
+            .id();
+        // The propagated transforms are stale: identity, a frame behind the locals.
+        let near = world
+            .spawn((at(-464.9, 2.7), GlobalTransform::IDENTITY, ChildOf(ride)))
+            .id();
+        let far = world
+            .spawn((at(40000.0, -0.5), GlobalTransform::IDENTITY))
+            .id();
+        let read = |world: &mut World| {
+            world
+                .run_system_once(move |place: SnapshotPlace, tf: Query<&Transform>| {
+                    let local = |e: Entity| tf.get(e).ok().copied();
+                    (
+                        place.zone(),
+                        place.position(Some(near), local),
+                        place.position(Some(far), local),
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(read(&mut world).0, 0, "no commit yet");
+        world.insert_resource(crate::area::CommittedZone(Some(12)));
+        assert_eq!(read(&mut world), (12, (-9464, 62), (-25536, 0)));
     }
 
     /// `0x5f098d`-`0x5f09f2`: a slot is copied when its id is set and its `AURAFLAGS` nibble has an
@@ -788,7 +936,16 @@ mod tests {
         let held = |g: u64| (g == pet_guid).then_some(&pet);
         let mut names = NameCache::default();
         names.insert_pet(4, "Whelp".into());
-        member_deactivated(guid, &mut group, Some(&store), held, &names, None, &net);
+        member_deactivated(
+            guid,
+            &mut group,
+            Some((&store, (0, 0))),
+            0,
+            held,
+            &names,
+            None,
+            &net,
+        );
 
         let rec = group.stats.get(&guid).expect("the member has a record");
         assert_eq!(
@@ -815,7 +972,8 @@ mod tests {
         member_deactivated(
             guid,
             &mut group,
-            Some(&store),
+            Some((&store, (0, 0))),
+            0,
             held,
             &unnamed,
             Some(&vm),
@@ -824,7 +982,16 @@ mod tests {
         assert_eq!(group.stats[&guid].pet_name.as_deref(), Some("Unknown"));
 
         // The pet not held: its block is emptied, not left as it was.
-        member_deactivated(guid, &mut group, Some(&store), |_| None, &names, None, &net);
+        member_deactivated(
+            guid,
+            &mut group,
+            Some((&store, (0, 0))),
+            0,
+            |_| None,
+            &names,
+            None,
+            &net,
+        );
         let rec = group.stats.get(&guid).unwrap();
         assert_eq!((rec.pet_guid, rec.pet_auras_negative.clone()), (None, None));
         assert_eq!(rec.pet_name, None, "and its name with it (`0x5f0a0f`)");
@@ -907,7 +1074,8 @@ mod tests {
             member_deactivated(
                 0x22,
                 &mut group,
-                Some(&store),
+                Some((&store, (0, 0))),
+                0,
                 held,
                 &NameCache::default(),
                 vm.as_ref(),
@@ -1212,7 +1380,8 @@ mod tests {
         member_deactivated(
             0xdead,
             &mut group,
-            Some(&store),
+            Some((&store, (0, 0))),
+            0,
             |_| None,
             &NameCache::default(),
             None,
@@ -1226,6 +1395,7 @@ mod tests {
             0x1234,
             &mut group,
             None,
+            0,
             |_| None,
             &NameCache::default(),
             None,

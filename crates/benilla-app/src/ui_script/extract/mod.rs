@@ -97,6 +97,7 @@ fn content_kind(c: &QuadContent) -> &'static str {
         QuadContent::Texture { .. } => "texture",
         QuadContent::ColorWheel => "colorwheel",
         QuadContent::ColorValue { .. } => "colorvalue",
+        QuadContent::Movie { .. } => "movie",
         QuadContent::Text { .. } => "text",
     }
 }
@@ -305,6 +306,7 @@ fn splice_simple(eq: &benilla_ui::script::ExtractedQuad) -> bool {
         QuadContent::Frame
         // At most one quad and one idempotent tile request.
         | QuadContent::ModelPane { .. }
+        | QuadContent::Movie { .. }
         | QuadContent::ColorWheel
         | QuadContent::ColorValue { .. } => true,
         // Region text only: a message line's link spans replace the whole set, and a line losing
@@ -334,6 +336,7 @@ fn verify_splice(
     text_ui: Option<&benilla_ui::script::EditBoxTextUi>,
     caret_pinned: bool,
     script: &UiScript,
+    movies: &super::movie::MovieScreen,
 ) {
     let mut check: Vec<UiQuad> = Vec::with_capacity(quads.quads.len());
     let mut spans: Vec<u32> = Vec::with_capacity(prev.extracted.len());
@@ -354,6 +357,7 @@ fn verify_splice(
             &mut check,
             &mut links,
             &mut slot,
+            movies,
         );
         spans.push(check.len() as u32);
     }
@@ -428,9 +432,10 @@ pub(crate) fn seat_text_measurer(script: &mut UiScript, atlas: &UiFontAtlas, sea
     )));
 }
 
-/// The UI pass's first half, before `WorldStage::Input` because the camera reads the UI hover:
-/// screen size, `tick`, the measure round-trip, `resolve` and the script errors. The quads are
-/// [`paint_script`]'s, after the camera that places the `WorldFrame` nameplates.
+/// The UI pass's first half, the frame pass's `OnUpdate` walk (`0x764330` → `0x765650`), after the
+/// input pass and the feeds: screen size, `tick`, the measure round-trip, `resolve` and the script
+/// errors. The quads are [`paint_script`]'s, after the camera that places the `WorldFrame`
+/// nameplates.
 pub(super) fn tick_script(
     mut hosted_vm: crate::script_calls::HostedVm,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -455,7 +460,14 @@ pub(super) fn tick_script(
     ),
     mut ui_cost: ResMut<super::UiFrameCost>,
     mut pass: ResMut<super::UiPassState>,
+    // The loading screen, whose layer hides the interface's from the frame pass.
+    loading: Option<Res<crate::loading_screen::LoadingScreen>>,
+    // `widescreen`, which picks the aspect the interface's screen is built for.
+    widescreen: Option<Res<crate::video::Widescreen>>,
+    // The display size the display handler last ran for (`0x492e90`).
+    mut last_display: Local<Option<(u32, u32)>>,
 ) {
+    let covered = loading.is_some_and(|l| l.hides_interface());
     hosted_vm.run(|script| {
         pass.live = false;
         let Some(script) = script else {
@@ -470,7 +482,10 @@ pub(super) fn tick_script(
             booths.character.reset(0);
             return;
         };
-        let (w, h) = (window.width(), window.height());
+        // The interface's screen: the window's, or 4:3 and stretched across it
+        // ([`super::UiScreen`]).
+        let screen = super::UiScreen::of_window(window, widescreen.as_deref());
+        let h = screen.size.y;
         // The client's UI space is 768 units tall at every aspect (`f(screenH) = 768`, `0x41ad10`;
         // the caret's `H_px/192`, `0x77b8c0`), the dial being `UIParent`'s scale inside it. The VM
         // lives in it: quads scale ×s out, and the mouse and the measures ÷s in.
@@ -515,7 +530,7 @@ pub(super) fn tick_script(
         };
         {
             let _span = bevy::log::info_span!("ui_script: tick").entered();
-            let resized = script.set_window_size(w, h);
+            let resized = script.set_screen_aspect(screen.aspect);
             // The UI scale is `UIParent`'s, which only the in-game state has; the glue lays out on
             // the root alone (`0x46dd30`).
             if script.vm_kind() == benilla_ui::script::VmKind::InGame {
@@ -527,21 +542,31 @@ pub(super) fn tick_script(
                 // resize re-lays out the live UI, the chat bubbles' window-derived `BubbleGeometry`
                 // with it, because the window resizes freely and a reload on each resize would tear
                 // down every addon's state mid-play.
-                if resized {
-                    let display = (w.round() as u32, h.round() as u32);
+                // The handler runs on a display change (`0x492e90`), which with `widescreen` 0
+                // leaves the 4:3 cells as they were.
+                let display = screen.display();
+                let mut applied = false;
+                if resized || *last_display != Some(display) {
+                    *last_display = Some(display);
                     let mut none = None;
                     let cache = auto_cache.as_deref_mut().map_or(&mut none, |c| &mut c.0);
-                    script.apply_ui_scale(display, cache);
+                    applied = script.apply_ui_scale(display, cache);
                 }
                 let rescaled = script.set_ui_scale(ui_scale.0);
-                // Either re-runs what the interface computed from the old `GetScreenHeight()`.
-                if resized || rescaled {
+                // Any re-runs what the interface computed from the old `GetScreenHeight()`.
+                if resized || rescaled || applied {
                     super::manifest::on_screen_resized(script);
                 }
             } else if resized && script.vm_kind() == benilla_ui::script::VmKind::Glue {
                 super::glue::on_glue_screen_resized(script);
             }
-            script.tick(step.delta.as_secs_f32());
+            // Under the loading screen the pass calls no `OnUpdate` and drops the frame's time
+            // (`0x4424b9`, `0x4426c3`), so the first walk after the reveal gets one frame's.
+            if covered {
+                script.tick_covered(step.delta.as_secs_f32());
+            } else {
+                script.tick(step.delta.as_secs_f32());
+            }
         }
         // The VM's clock anchored at the instant the paced clock stands at, which moves by the same
         // steps; every `Instant` to `GetTime` conversion goes through this pair, never
@@ -607,9 +632,8 @@ pub(super) fn tick_script(
         }
         drop(measure_span);
         let us_measure = lap();
-        // Script errors reach the Lua handler (`_ERRORMESSAGE`, `BasicControls.xml:16`) before the
-        // log, so a failing handler lands in this frame's drain.
-        script.dispatch_script_errors_to_handler();
+        // Script errors reached the Lua handler (`_ERRORMESSAGE`, `BasicControls.xml:16`) as they
+        // were raised; the log drains them here.
         for err in script.take_errors() {
             warn!("ui_script: {err}");
         }
@@ -649,11 +673,12 @@ pub(super) fn paint_script(
     mut font_atlas: Option<ResMut<UiFontAtlas>>,
     // The booth seam both ways: the bakes regions sample, and the pane aspects published back.
     mut booths: crate::portrait::BoothBridge,
-    // Capture mode (the cursor icon quad) and [`super::UiCostWanted`], tupled to stay inside
-    // Bevy's 16-parameter system limit.
+    // Capture mode (the cursor icon quad), [`super::UiCostWanted`] and `widescreen`, tupled to
+    // stay inside Bevy's 16-parameter system limit.
     run: (
         Option<Res<crate::run_mode::CaptureMode>>,
         Res<super::UiCostWanted>,
+        Option<Res<crate::video::Widescreen>>,
     ),
     // The `<Minimap>` widget slot, parked for `minimap::emit_minimap` to fill later in the frame.
     mut parked_minimap: ResMut<crate::minimap::MinimapWidget>,
@@ -664,9 +689,12 @@ pub(super) fn paint_script(
     mut prev: Local<crate::ui_script::VmMemo<GateInputs>>,
     mut ui_cost: ResMut<super::UiFrameCost>,
     pass: Res<super::UiPassState>,
+    movies: Option<Res<super::movie::MovieScreen>>,
 ) {
+    let no_movies = super::movie::MovieScreen::default();
+    let movies = movies.as_deref().unwrap_or(&no_movies);
     hosted_vm.run(|script| {
-        let (capture, ui_cost_wanted) = run;
+        let (capture, ui_cost_wanted, widescreen) = run;
         // Stand down with the tick half, which already cleared the booth panes.
         if !pass.live {
             return;
@@ -678,7 +706,8 @@ pub(super) fn paint_script(
         let Ok(window) = window.single() else {
             return;
         };
-        let (w, h) = (window.width(), window.height());
+        let screen = super::UiScreen::of_window(window, widescreen.as_deref());
+        let Vec2 { x: w, y: h } = screen.size;
         let (s, dpi) = (pass.seam, pass.dpi);
         let (us_tick, us_resolve) = (pass.us_tick, pass.us_resolve);
         let (solves_before, derives_before) = (Some(pass.solves_before), Some(pass.derives_before));
@@ -889,6 +918,7 @@ pub(super) fn paint_script(
                     &mut scratch,
                     &mut scratch_links,
                     &mut scratch_slot,
+                    movies,
                 );
                 scratch_ranges.push(at..scratch.len());
             }
@@ -974,6 +1004,7 @@ pub(super) fn paint_script(
                     text_ui.as_ref(),
                     capture.is_some(),
                     script,
+                    movies,
                 );
             }
             drop(extract_span);
@@ -1037,6 +1068,7 @@ pub(super) fn paint_script(
                 &mut out,
                 &mut link_spans,
                 &mut minimap_slot,
+                movies,
             );
             spans.push(out.len() as u32);
         }
@@ -1053,11 +1085,14 @@ pub(super) fn paint_script(
                 CursorPayload::PetAction(p) => p.texture,
                 CursorPayload::StablePet(p) => Some(p.texture),
                 CursorPayload::Merchant(m) => m.texture,
+                CursorPayload::Ammo(a) => a.texture,
                 CursorPayload::Money(m) => {
                     Some(benilla_ui::script::coin_icon(i64::from(m.copper)).to_string())
                 }
             });
-            if let (Some(texture), Some(pos)) = (texture, window.cursor_position()) {
+            if let (Some(texture), Some(pos)) =
+                (texture, window.cursor_position().map(|p| screen.point(p)))
+            {
                 if let Some(handle) = assets
                     .as_mut()
                     .and_then(|a| a.sprite_texture(&texture, &mut images))
@@ -1160,7 +1195,13 @@ fn convert_entry(
         String,
     )>,
     minimap_slot: &mut Option<crate::minimap::MinimapSlot>,
+    movies: &super::movie::MovieScreen,
 ) {
+    // A movie's picture is placed on the window, not on its frame's rect ([`super::movie`]).
+    if let QuadContent::Movie { handle } = eq.content {
+        out.extend(movies.quad(handle, w, h, eq.z));
+        return;
+    }
     let Some(r) = eq.rect else { return };
     // WoW UI space is y-up from the bottom-left: scale ×s, then flip through the window height.
     let rect = Rect::new(r.left * s, h - r.top * s, r.right * s, h - r.bottom * s);
@@ -1172,8 +1213,9 @@ fn convert_entry(
         .clip
         .map(|c| Rect::new(c.left * s, h - c.top * s, c.right * s, h - c.bottom * s));
     match eq.content {
-        // A frame draws nothing itself; its regions carry the visuals.
-        QuadContent::Frame => {}
+        // A frame draws nothing itself; its regions carry the visuals. A movie's picture was
+        // placed above.
+        QuadContent::Frame | QuadContent::Movie { .. } => {}
         // The `<Minimap>` content hole, parked for the minimap renderer to fill at this `z`.
         QuadContent::Minimap { zoom, inside_zoom } => {
             *minimap_slot = Some(crate::minimap::MinimapSlot {
@@ -1338,8 +1380,8 @@ fn convert_entry(
             rotation,
             desaturated,
         } => {
-            // A live unit portrait (`SetPortraitTexture(region, unit)`): the model bake, or the
-            // reference's 2D TemporaryPortrait while the model streams; no entry yet draws nothing.
+            // A live unit portrait (`SetPortraitTexture(region, unit)`): the model bake, a 2D
+            // stand-in for a unit the client does not hold, or no image, which draws nothing.
             if let Some(token) = &portrait_unit {
                 use crate::portrait::PortraitSource;
                 // The aspect, published before the readiness check as in the model-pane arm; a
@@ -1358,7 +1400,7 @@ fn convert_entry(
                         assets.as_mut().and_then(|a| a.sprite_texture(p, images)),
                         false,
                     ),
-                    None => (None, false),
+                    Some(PortraitSource::Empty) | None => (None, false),
                 };
                 let Some(handle) = handle else {
                     return;

@@ -95,18 +95,6 @@ fn needs_equipped_item(d: &SpellDisplay) -> bool {
         && d.targets & TARGET_FLAG_ITEM == 0
 }
 
-/// The equipment slots [`equipped_item_fits`] reads for `d`, a bit each: none unless it searches,
-/// else the slots its hand restriction leaves and both hands, which the disarm ladder reads
-/// whatever the restriction (`0x5f0c69`, `0x5f0c91`).
-#[cfg(test)]
-pub(crate) fn worn_slots_read(d: &SpellDisplay) -> u32 {
-    if needs_equipped_item(d) {
-        (hand_mask(d) | HANDS) & EQUIPMENT_MASK
-    } else {
-        0
-    }
-}
-
 /// The main and off hand, the two slots the disarm ladder tells apart.
 const HANDS: u32 =
     1 << crate::items::EQUIPMENT_SLOT_MAINHAND | 1 << crate::items::EQUIPMENT_SLOT_OFFHAND;
@@ -265,18 +253,6 @@ impl SlotItem {
             } => c == class && subclass_mask & (1 << sub) != 0,
         }
     }
-}
-
-/// Equipment slot `slot`'s [`SlotItem`] from the cached records, without an ask.
-pub(crate) fn slot_item_cached(
-    store: &ObjectStore,
-    slot: u8,
-    objects: &Objects,
-    items: &Items,
-) -> SlotItem {
-    SlotItem::of(store.0.player_inv_slot(slot).unwrap_or(0), |guid| {
-        worn_item_cached(guid, objects, items)
-    })
 }
 
 /// The equipped-item refusal reason, keyed on `AttributesEx3` alone (`0x6e40e0` at
@@ -478,7 +454,12 @@ pub(crate) fn spell_usable(
         return (false, false);
     }
     // Leg 12 (`0x6e3fba`..`0x6e3feb`): power, the only notEnoughMana writer.
-    if !can_afford(d, ctx.store, ctx.skill_lines, ctx.spell_mods) {
+    let skills = crate::spell::PlayerSkills {
+        lines: ctx.skill_lines,
+        spells: Some(&spells.catalog),
+        items: Some(items),
+    };
+    if !can_afford(d, ctx.store, skills, ctx.spell_mods) {
         return (false, true);
     }
     (true, false)
@@ -497,13 +478,13 @@ pub(crate) fn spell_usable(
 pub(crate) fn power_cost(
     d: &SpellDisplay,
     store: &ObjectStore,
-    skill_lines: Option<&benilla_formats::SkillLineCatalog>,
+    skills: crate::spell::PlayerSkills,
     mods: &SpellModifiers,
     reads: &mut dyn SpellReads,
 ) -> i32 {
     let level = SpellLevel::Player {
         me: Some(store),
-        skill_lines,
+        skills,
     };
     power_cost_at(d, &store.0, level, mods, reads)
 }
@@ -617,7 +598,7 @@ fn cost_basis(d: &SpellDisplay) -> CostBasis {
 pub(crate) fn can_afford(
     d: &SpellDisplay,
     store: &ObjectStore,
-    skill_lines: Option<&benilla_formats::SkillLineCatalog>,
+    skills: crate::spell::PlayerSkills,
     mods: &SpellModifiers,
 ) -> bool {
     let power_type = d.power_type as i32;
@@ -626,7 +607,7 @@ pub(crate) fn can_afford(
     } else {
         store.0.unit_power(power_type as u8).unwrap_or(0)
     };
-    avail as i32 >= power_cost(d, store, skill_lines, mods, &mut Unrecorded)
+    avail as i32 >= power_cost(d, store, skills, mods, &mut Unrecorded)
 }
 
 #[cfg(test)]
@@ -1126,19 +1107,41 @@ mod tests {
         let mods = SpellModifiers::default();
         let with_gear = player(&[(22, 400), (28, 4_000), (163, 1_689)]);
         assert_eq!(
-            power_cost(&bloodrage, &with_gear, None, &mods, &mut Unrecorded),
+            power_cost(
+                &bloodrage,
+                &with_gear,
+                Default::default(),
+                &mods,
+                &mut Unrecorded
+            ),
             337
         );
-        assert!(can_afford(&bloodrage, &with_gear, None, &mods));
+        assert!(can_afford(
+            &bloodrage,
+            &with_gear,
+            Default::default(),
+            &mods
+        ));
         assert_eq!(walk(&bloodrage, &with_gear), (true, false));
 
         let below_cost = player(&[(22, 336), (28, 4_000), (163, 1_689)]);
-        assert!(!can_afford(&bloodrage, &below_cost, None, &mods));
+        assert!(!can_afford(
+            &bloodrage,
+            &below_cost,
+            Default::default(),
+            &mods
+        ));
         assert_eq!(walk(&bloodrage, &below_cost), (false, true));
 
         let without_gear = player(&[(22, 400), (28, 1_689), (163, 1_689)]);
         assert_eq!(
-            power_cost(&bloodrage, &without_gear, None, &mods, &mut Unrecorded),
+            power_cost(
+                &bloodrage,
+                &without_gear,
+                Default::default(),
+                &mods,
+                &mut Unrecorded
+            ),
             337
         );
     }
@@ -1176,7 +1179,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                power_cost(&spell, &store, None, &mods, &mut Unrecorded),
+                power_cost(&spell, &store, Default::default(), &mods, &mut Unrecorded),
                 cost,
                 "type {power_type}"
             );
@@ -1198,19 +1201,22 @@ mod tests {
         let mut mods = SpellModifiers::default();
         mods.set_class_family(3);
         assert_eq!(
-            power_cost(&d, &store, None, &mods, &mut Unrecorded),
+            power_cost(&d, &store, Default::default(), &mods, &mut Unrecorded),
             100,
             "no packet yet — the flat DBC cost"
         );
         assert!(
-            !can_afford(&d, &store, None, &mods),
+            !can_afford(&d, &store, Default::default(), &mods),
             "80 mana does not buy a 100 mana spell"
         );
 
         mods.set(false, 5, OP_COST, -30);
-        assert_eq!(power_cost(&d, &store, None, &mods, &mut Unrecorded), 70);
+        assert_eq!(
+            power_cost(&d, &store, Default::default(), &mods, &mut Unrecorded),
+            70
+        );
         assert!(
-            can_afford(&d, &store, None, &mods),
+            can_afford(&d, &store, Default::default(), &mods),
             "the talent brings it inside the pool, so TryCast must send the cast"
         );
 
@@ -1220,7 +1226,13 @@ mod tests {
             ..d
         };
         assert_eq!(
-            power_cost(&other_class, &store, None, &mods, &mut Unrecorded),
+            power_cost(
+                &other_class,
+                &store,
+                Default::default(),
+                &mods,
+                &mut Unrecorded
+            ),
             100
         );
     }
@@ -1243,8 +1255,8 @@ mod tests {
             mods.set(true, 5, OP_COST, flat);
             let store = player(fields);
             (
-                power_cost(&d, &store, None, &mods, &mut Unrecorded),
-                can_afford(&d, &store, None, &mods),
+                power_cost(&d, &store, Default::default(), &mods, &mut Unrecorded),
+                can_afford(&d, &store, Default::default(), &mods),
             )
         };
         let f = |v: f32| v.to_bits();

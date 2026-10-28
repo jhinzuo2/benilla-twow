@@ -4,8 +4,7 @@
 //! [`go_is_nearest`] as the click router does. The pick stands for the WorldFrame's own update
 //! (`0x481790`), which picks only while the WorldFrame holds the hover (`0x4817ae`); the loss when
 //! the cursor moves onto a window is published by the WorldFrame's leave in the UI's walk, before
-//! the window's `OnEnter`. The spell views are built and pushed ahead of a hover by
-//! [`spell_feed`].
+//! the window's `OnEnter`. The spell views are built at the setter's call ([`live`]).
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -13,19 +12,19 @@ use bevy::window::PrimaryWindow;
 use benilla_ui::script::{TooltipTint, UnitState};
 use benilla_ui::strings::Arg;
 
+use crate::go_templates::MeetingStoneTemplate;
 use crate::names::NameCache;
 use crate::net::{NetCommands, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::target::{go_is_nearest, Hovered, HoveredObject, GO_FLAG_LOCKED, GO_TYPE_GENERIC};
-use crate::ui_script::UiFeed;
-use crate::ui_trainer::TrainerFeed;
 use crate::ui_unit::{
     enrich_unit, player_reaction, snapshot, unit_reaction, SnapshotTables, UnitFeed,
 };
 
-mod spell_deps;
-mod spell_feed;
-use spell_feed::feed_spell_tooltips;
+mod live;
+mod spell_view;
+pub(crate) use live::TooltipLive;
+pub(crate) use spell_view::tooltip_text;
 
 pub struct UiTooltipPlugin;
 
@@ -38,19 +37,9 @@ impl Plugin for UiTooltipPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (
-                drive_mouseover_tooltip
-                    .in_set(UnitFeed)
-                    .in_set(MouseoverPublish),
-                // After the trainer and quest feeds, so a list that lands this frame is hoverable
-                // in its tick; outside `UnitFeed`, which the trainer feed follows, so it takes that
-                // set's gate.
-                feed_spell_tooltips
-                    .in_set(UiFeed)
-                    .after(TrainerFeed)
-                    .after(crate::ui_quest::feed_quest)
-                    .run_if(crate::ui_script::ingame_ui_up),
-            ),
+            drive_mouseover_tooltip
+                .in_set(UnitFeed)
+                .in_set(MouseoverPublish),
         );
     }
 }
@@ -123,6 +112,29 @@ struct GoLock<'a> {
     matched: Option<crate::target::lock::LockMatch>,
 }
 
+/// The type handler's lines, slot 33 of its table (`[vtbl+0x84]`, called at `0x52aad4`) after
+/// the name and before the lock lines; the base slot adds none (`0x5f9f10`). A meeting stone's
+/// (`0x5f6b10`) adds its area's `AreaTable` name when the row exists (`0x5f6b3d`-`0x5f6b68`),
+/// then `MEETINGSTONE_LEVEL` of its minimum and maximum levels (`0x5f6b6d`-`0x5f6bdf`), both in
+/// gold (`0x530380`).
+fn go_handler_lines(
+    stone: Option<MeetingStoneTemplate>,
+    area_name: &dyn Fn(u32) -> Option<String>,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, TooltipTint)> {
+    let Some(stone) = stone else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    lines.extend(area_name(stone.area).map(|name| (name, TooltipTint::Gold)));
+    let levels = [
+        Arg::D(i64::from(stone.min_level)),
+        Arg::D(i64::from(stone.max_level)),
+    ];
+    lines.extend(keyed(get, "MEETINGSTONE_LEVEL", &levels).map(|l| (l, TooltipTint::Gold)));
+    lines
+}
+
 /// The builder's lock lines (`0x52aa20`): "Locked" iff `GO_FLAG_LOCKED` (`0x52aae5`), then one line
 /// from `Lock.dbc` slot 0 only, if it passes the Action gate (`0x52ab7e`): a key in white
 /// (`0x52acd9`), named by its item, which waits for the template (`0x52aca6`); a skill, named by
@@ -185,36 +197,23 @@ fn go_lock_lines(
 /// A fresh hover's unit, seated where it is published: the publisher writes the mouseover pair
 /// (`0x492890`) before it signals (`0x4929b3`), and `CanInspect` (`0x48a1b0`),
 /// `CheckInteractDistance` (`0x48ba00`) and the slot getters (`0x4c8328`) read the object it names
-/// at once. So the resolver holds it, the reach map measures it and a player's visible items are
-/// in, ahead of the frame's token, reach and inspect feeds.
+/// at once. So the resolver holds it ahead of the frame's token feed; the range verbs measure it
+/// and the slot getters read its visible items through the lent host as they run.
 fn seat_fresh_hover(
     script: &mut benilla_ui::script::UiScript,
     guid: u64,
     entity: Entity,
     stores: &Query<&ObjectStore>,
-    hover: &HoverRelations,
-    visible: &crate::ui_inspect::VisibleItemTables,
 ) {
     let Ok(store) = stores.get(entity) else {
         return;
     };
     script.seat_world_mouseover_unit(guid, store.0.unit_target().unwrap_or(0));
-    if let Some(reach) = hover.unit.and_then(|u| u.reach) {
-        script.set_unit_reach_of(guid, reach);
-    }
-    let me = hover.me;
-    if store.0.object_type() == Some(benilla_protocol::messages::ObjectType::Player)
-        && me != Some(guid)
-    {
-        script.set_visible_equipment(guid, Some(visible.slots(store)));
-    }
 }
 
 /// What the hover reads of the relation inputs, taken before any Lua runs, as a call its
 /// handlers make can write them.
 struct HoverRelations {
-    /// The active player's guid.
-    me: Option<u64>,
     factions: Option<crate::target::Factions>,
     /// The hovered unit's.
     unit: Option<HoveredRelations>,
@@ -225,20 +224,21 @@ struct HoveredRelations {
     /// `UnitReaction(unit, "player")` and the player's toward it.
     reaction: u8,
     player_reaction: u8,
-    /// Its reach map entry, with the player's pose.
-    reach: Option<benilla_ui::script::UnitReach>,
 }
 
-fn drive_mouseover_tooltip(
+pub(crate) fn drive_mouseover_tooltip(
     mut vm: crate::script_calls::VmWith<crate::target::RelationWorld<'static, 'static>>,
     hovered: Res<Hovered>,
     hovered_go: Res<HoveredObject>,
-    // Seats the cursor-anchored GameObject plate.
-    window: Query<&Window, With<PrimaryWindow>>,
+    // Seats the cursor-anchored GameObject plate, on the interface's screen.
+    (window, widescreen): (
+        Query<&Window, With<PrimaryWindow>>,
+        Option<Res<crate::video::Widescreen>>,
+    ),
     stores: Query<&ObjectStore>,
     // The stored GAMEOBJECT_STATE the lock lines' Action gate reads.
     anims: Query<&crate::go_anim::GoAnim>,
-    self_q: Query<(&ObjectStore, Option<&Transform>), With<SelfPlayer>>,
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
     // The lock chain's data, shared with the click router (`target::lock`) so hover and click
@@ -252,30 +252,21 @@ fn drive_mouseover_tooltip(
     tables: SnapshotTables,
     // The guild cache, the hovered player's guild leg.
     guild: Res<crate::ui_guild::GuildState>,
-    // A fresh hover's reach and visible items, which its event's handlers read.
-    seat: (crate::ui_inspect::VisibleItemTables, Query<&Transform>),
+    // The meeting stone's area name (`0x5f6b49`).
+    areas: Option<Res<crate::area::AreaTableRes>>,
 ) {
     let hover_relations = {
         let relations = vm.own();
         let me = relations.me();
-        let self_at = self_q
-            .iter()
-            .next()
-            .and_then(|(_, tf)| tf.map(|t| t.translation));
         HoverRelations {
-            me: me.map(|m| m.guid),
             factions: relations.factions().cloned(),
             unit: hovered.mouseover(&hovered_go).and_then(|(entity, guid)| {
                 let store = stores.get(entity).ok()?;
                 let rel = relations.get();
                 let subject = relations.unit_of(guid, store);
-                let reach = seat.1.get(entity).ok().zip(self_at).map(|(tf, me_at)| {
-                    crate::ui_unit::unit_reach(&relations, guid, Some(store), tf.translation, me_at)
-                });
                 Some(HoveredRelations {
                     reaction: unit_reaction(&rel, &subject, me.as_ref()),
                     player_reaction: player_reaction(&rel, &subject, me.as_ref()),
-                    reach,
                 })
             }),
         }
@@ -289,7 +280,7 @@ fn drive_mouseover_tooltip(
         // The publisher's change check (`0x482090`) compares against the VM's last publish.
         let last = script.world_mouseover();
         let published = memo.published.get(script);
-        let self_store = self_q.iter().next().map(|(store, _)| store);
+        let self_store = self_q.iter().next();
         let chr = tables.unit_names();
         let types = tables.types(&names);
 
@@ -355,7 +346,7 @@ fn drive_mouseover_tooltip(
             let key = lines_view(&state);
             let changed = script.publish_world_mouseover(Some(guid));
             if let Some((entity, _)) = hovered.mouseover(&hovered_go).filter(|_| changed) {
-                seat_fresh_hover(script, guid, entity, &stores, &hover_relations, &seat.0);
+                seat_fresh_hover(script, guid, entity, &stores);
             }
             script.set_unit("mouseover", Some(state));
             *published = true;
@@ -430,7 +421,9 @@ fn drive_mouseover_tooltip(
                         w.cursor_position()
                             .or_else(crate::target::hover_probe_point)
                             .map(|c| {
-                                let at = crate::ui_script::window_to_ui(w.height(), c);
+                                let screen =
+                                    crate::ui_script::UiScreen::of_window(w, widescreen.as_deref());
+                                let at = crate::ui_script::window_to_ui(screen, c);
                                 (at.x, at.y)
                             })
                     })
@@ -468,7 +461,8 @@ fn drive_mouseover_tooltip(
             let Some(template) = go_inputs.templates.of(fields).cloned() else {
                 return;
             };
-            // The builder's lock lines ([`go_lock_lines`]).
+            // The type handler's lines ([`go_handler_lines`]), then the lock lines
+            // ([`go_lock_lines`]).
             let go_store = stores.get(entity).ok();
             let flags = go_store.map_or(0, |s| s.0.gameobject_flags());
             let flag_locked = flags & GO_FLAG_LOCKED != 0;
@@ -496,7 +490,17 @@ fn drive_mouseover_tooltip(
                     &mut matched,
                 )
             });
-            let lines = go_lock_lines(
+            let mut lines = go_handler_lines(
+                template.meeting_stone,
+                &|id| {
+                    areas
+                        .as_deref()
+                        .and_then(|a| a.0.name(id))
+                        .map(str::to_string)
+                },
+                &|key: &str| benilla_ui::strings::global(script.lua(), key),
+            );
+            lines.extend(go_lock_lines(
                 GoLock {
                     slots,
                     state,
@@ -518,7 +522,7 @@ fn drive_mouseover_tooltip(
                         .map(str::to_string)
                 },
                 &|key: &str| benilla_ui::strings::global(script.lua(), key),
-            );
+            ));
             script.publish_world_mouseover(Some(guid));
             script.world_tooltip_gameobject(&template.name, &lines, cursor_seated);
             return;
@@ -529,14 +533,10 @@ fn drive_mouseover_tooltip(
 }
 
 #[cfg(test)]
-mod bench;
-#[cfg(test)]
-mod deps_tests;
-#[cfg(test)]
-mod feed_tests;
-#[cfg(test)]
 mod go_lock_tests;
 #[cfg(test)]
 mod hover_order_tests;
+#[cfg(test)]
+mod live_tests;
 #[cfg(test)]
 mod tests;
