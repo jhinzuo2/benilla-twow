@@ -558,15 +558,6 @@ fn drive_vplates(
             .map(|p| ui_screen.point(p)) else {
                 continue;
             };
-            // TWoW (pfUI): no plate until the unit's name is known. A plate built before the name
-            // carries an empty one, which `FontString:GetText()` reads as nil, and pfUI's first
-            // `OnDataChanged` indexes a table by that text (`libunitscan.lua:43`: `table index is
-            // nil`) for every plate born in the first second after world entry. The plate appears
-            // the frame the name lands. Not checked against the reference: whether it plates a unit
-            // whose name is still unknown.
-            if names.resolve_unit(guid.0, store, Ask::Read).is_none() {
-                continue;
-            }
             cands.push((
                 screen.distance_squared(sort_pt),
                 screen,
