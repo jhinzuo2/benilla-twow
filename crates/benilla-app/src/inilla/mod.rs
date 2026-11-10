@@ -122,7 +122,8 @@ impl Plugin for InillaPlugin {
             Update,
             synth::apply
                 .in_set(crate::ui_script::UiInput)
-                .after(crate::bindings::BindingSet)
+                .after(crate::bindings::BindingHead)
+                .before(crate::bindings::BindingTail)
                 .before(benilla_world::schedule::WorldStage::Input),
         )
         .add_systems(OnEnter(ClientState::InWorld), synth::release_all)

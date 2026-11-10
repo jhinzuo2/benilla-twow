@@ -1475,7 +1475,7 @@ pub(super) fn run_look_session(
         // run holds too.
         if holds(LookButton::Right) {
             *face_yaw = cam.yaw;
-            handed = motion != Vec2::ZERO;
+            handed = delta != Vec2::ZERO;
         }
     }
     handed
