@@ -234,10 +234,11 @@ impl Header<'_> {
         if level > 0 && (sz == 0 || off == 0) {
             return Ok(None);
         }
-        bytes
-            .get(off..off + sz)
-            .map(Some)
-            .ok_or(Error::OutOfBounds { level })
+        match bytes.get(off..off.saturating_add(sz)) {
+            Some(data) => Ok(Some(data)),
+            None if level > 0 => Ok(None),
+            None => Err(Error::OutOfBounds { level }),
+        }
     }
 
     /// DXTC level `level` as the reference reads it: `bpp·max(4,w)·max(4,h)/8` bytes from the
@@ -799,5 +800,24 @@ mod tests {
         assert_eq!((decoded.width, decoded.height), (4, 4));
         assert_eq!(decoded.mips.len(), 1);
         assert_eq!(decoded.mips[0].rgba.len(), 4 * 4 * 4);
+    }
+
+    /// A paletted BLP whose last level the header points at the file's end with a garbage size
+    /// (Turtle's `Robe_A_01TWOW_*` component textures) decodes the levels it carries.
+    #[test]
+    fn a_paletted_level_past_the_file_ends_the_chain() {
+        let mut offsets = [0u32; 16];
+        let mut sizes = [0u32; 16];
+        let level0 = (HEADER_SIZE + PALETTE_SIZE) as u32;
+        offsets[0] = level0;
+        sizes[0] = 2;
+        offsets[1] = level0 + 2; // the file's end
+        sizes[1] = 0xFFFF_A5E8;
+        let mut b = header(1, 0, 0, 1, 2, 1, offsets, sizes);
+        b.resize(HEADER_SIZE + PALETTE_SIZE, 0);
+        b.extend_from_slice(&[0, 0]);
+        let decoded = decode(&b).expect("level 0 is whole");
+        assert_eq!(decoded.mips.len(), 1);
+        assert_eq!(decode_native(&b).expect("level 0 is whole").mips.len(), 1);
     }
 }

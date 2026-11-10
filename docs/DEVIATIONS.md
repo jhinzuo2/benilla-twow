@@ -548,7 +548,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### (crate root)
 
-- Past the file's end `pad_to` zero-fills, because the reference reads stale buffer bytes there. ([`src/lib.rs:248`](../crates/benilla-blp/src/lib.rs#L248))
+- Past the file's end `pad_to` zero-fills, because the reference reads stale buffer bytes there. ([`src/lib.rs:249`](../crates/benilla-blp/src/lib.rs#L249))
 ### benilla-formats
 
 #### chain
