@@ -1147,7 +1147,12 @@ fn physically_down(
 
 /// One matching press: the command's body with `keystate = "down"`, and a latch on its input so
 /// the release can run the up-half.
-pub(crate) fn press(state: &mut BindingLatches, script: Option<&mut UiScript>, command: &str, key: Held) {
+pub(crate) fn press(
+    state: &mut BindingLatches,
+    script: Option<&mut UiScript>,
+    command: &str,
+    key: Held,
+) {
     if let Some(s) = script {
         if let Err(e) = s.execute_binding(command, true) {
             warn!("bindings({command}): {e}");

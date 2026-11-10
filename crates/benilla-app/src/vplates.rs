@@ -32,8 +32,8 @@ use benilla_ui::script::{
 
 use crate::entities::{overhead_anchor, BoneAttach, OverheadFallback, SceneDrawn};
 use crate::names::NameCache;
-use crate::query_cache::Ask;
 use crate::net::{Embodied, Guid, NetEntity, ObjectStore, SelfPlayer};
+use crate::query_cache::Ask;
 use crate::target::{Hovered, Selection, TargetUpdate};
 use benilla_world::view::WorldCamera;
 
