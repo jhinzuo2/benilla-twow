@@ -14,7 +14,7 @@ use benilla_assets::coords::wow_to_bevy;
 
 use super::PetBar;
 use crate::net::{GuidIndex, NetHandlerApp, PetDismissSoundMessage, PetTalkMessage};
-use crate::ui_action::{PetTameFailures, Spells, UiError, UiErrorKeys};
+use crate::ui_action::{FillArg, Spells, UiError, UiErrorKeys};
 use crate::ui_cast::CastReports;
 
 pub(super) fn register(app: &mut App) {
@@ -48,19 +48,44 @@ fn on_spells(
     player: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
     mut bar: ResMut<PetBar>,
     mut latch: ResMut<super::PetAttackLatch>,
+    mut lane: ResMut<crate::field_watch::NoticeLane>,
 ) {
     if let SessionEvent::PetSpells(spells) = ev {
         // The pet list's category pad (`0x6e2b60` with the pet flag): op 11 alone.
         let pad = crate::spell::CategoryPad::for_list(true, player.iter().next());
-        if pet_spells(*spells, catalog.as_deref(), mods.as_deref(), pad, &mut bar) {
+        let changed = pet_spells(*spells, catalog.as_deref(), mods.as_deref(), pad, &mut bar);
+        if changed {
             latch.0 = None;
         }
+        // The pet book's sort on every packet, an empty list included (`0x4bdadb` →
+        // `0x4b2fd0(0, 1)`), which signals `SPELLS_CHANGED` (`0x4b302a`) ahead of the macro
+        // derivation (`0x4bdae0`) and the guid's store.
+        lane.write(crate::field_watch::FieldNotice::Global {
+            id: crate::field_watch::id::SPELLS_CHANGED,
+        });
+        // Then the macros that follow the pet's book derived again (`0x4bdae0` → `0x4f0ce0`).
+        lane.write(crate::field_watch::FieldNotice::PetMacros);
+        // `SetPetGuid`'s signals at the packet's place (`0x4bdaf0` → `0x4bc7e0`): the pet frame's
+        // `UnitExists("pet")` reads our summon field as this packet left it.
+        lane.write(crate::field_watch::FieldNotice::PetGuidSet {
+            changed,
+            guid: bar.spells.pet_guid,
+        });
     }
 }
 
-fn on_mode(In(ev): In<SessionEvent>, mut bar: ResMut<PetBar>) {
+fn on_mode(
+    In(ev): In<SessionEvent>,
+    mut bar: ResMut<PetBar>,
+    mut lane: ResMut<crate::field_watch::NoticeLane>,
+) {
     if let SessionEvent::PetMode(mode) = ev {
-        pet_mode(mode, &mut bar);
+        if pet_mode(mode, &mut bar) {
+            // `0x4bdb4f`: `PET_BAR_UPDATE` inside the handler, at the packet's place.
+            lane.write(crate::field_watch::FieldNotice::Global {
+                id: crate::field_watch::id::PET_BAR_UPDATE,
+            });
+        }
     }
 }
 
@@ -76,9 +101,9 @@ fn on_cast_failed(In(ev): In<SessionEvent>, mut reports: ResMut<CastReports>) {
     }
 }
 
-fn on_tame_failure(In(ev): In<SessionEvent>, mut failures: ResMut<PetTameFailures>) {
+fn on_tame_failure(In(ev): In<SessionEvent>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::PetTameFailure { reason } = ev {
-        pet_tame_failure(reason, &mut failures);
+        pet_tame_failure(reason, &errors);
     }
 }
 
@@ -186,20 +211,20 @@ fn pet_spells(
             .seed_pet(cd, display, mods.unwrap_or(&no_mods), pad, now);
     }
     bar.spells = spells;
-    // `SetPet` (`0x4bc7e0`) ends in `SignalEvent(0x161)` on every packet (`0x4bc90c`), whatever
-    // changed: the one repaint a packet that moves only the pet's cooldowns gets.
-    bar.bar_signals = bar.bar_signals.wrapping_add(1);
     new_pet
 }
 
-/// `SMSG_PET_MODE`: the state word alone, applied only to the bar of the pet it names.
-fn pet_mode(mode: PetMode, bar: &mut PetBar) {
-    if bar.spells.pet_guid == 0 || bar.spells.pet_guid != mode.pet_guid {
-        return;
+/// `SMSG_PET_MODE` (`0x4bdb10`): the state word alone, applied only when the packet's guid is the
+/// bar's cached one (`0x4bdb33`, `0x4bdb3f`), a zero guid against no bar included; whether it was,
+/// for the signal that follows the store (`0x4bdb4f`).
+fn pet_mode(mode: PetMode, bar: &mut PetBar) -> bool {
+    if bar.spells.pet_guid != mode.pet_guid {
+        return false;
     }
     debug!("net: pet mode — state {:#010x}", mode.state);
     // The whole dword, as the client stores both packets' state (`0x4bc930`).
     bar.spells.state = mode.state;
+    true
 }
 
 /// `SMSG_PET_ACTION_FEEDBACK`: a refused order's reason byte, onto the red line.
@@ -224,14 +249,18 @@ fn pet_feedback_key(reason: u8) -> Option<&'static str> {
     })
 }
 
-/// `SMSG_PET_TAME_FAILURE`: the reason byte, queued. vmangos also sends it for a summon while a
-/// pet or a charmed unit is out (`Spell.cpp:5467`).
-fn pet_tame_failure(reason: u8, failures: &mut PetTameFailures) {
-    debug!(
-        "net: pet tame failure {reason} ({})",
-        benilla_protocol::messages::pet_tame_failure_key(reason)
-    );
-    failures.0.push(reason);
+/// `SMSG_PET_TAME_FAILURE` (`0x6e97e0` → `0x6e6a20`), the handler's one signal: the reason's
+/// `PETTAME_*` string (the jump table `0x6e6ac0`, `PETTAME_UNKNOWNERROR` outside 1 to 11), read
+/// through `FrameScript_GetText` (`0x6e6a91`, `""` when missing) as `ERR_TAME_FAILED`'s `%s`
+/// (`DisplayError(0xee)`, `0x6e6ab4`). vmangos also sends it for a summon while a pet or a charmed
+/// unit is out (`Spell.cpp:5467`).
+fn pet_tame_failure(reason: u8, errors: &UiErrorKeys) {
+    let key = benilla_protocol::messages::pet_tame_failure_key(reason);
+    debug!("net: pet tame failure {reason} ({key})");
+    errors.push(UiError::args(
+        "ERR_TAME_FAILED",
+        vec![FillArg::Global(key.to_string())],
+    ));
 }
 
 /// `SMSG_PET_NAME_INVALID`, an empty body: the reference raises `ERR_INVALID_PETNAME` and reads

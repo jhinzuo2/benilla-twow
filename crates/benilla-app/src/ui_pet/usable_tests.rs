@@ -502,6 +502,20 @@ fn with_stock_ui(rig: &mut Rig) {
     let failures = crate::ui_script::load_default_ui(&script);
     assert!(failures.is_empty(), "manifest load errors: {failures:#?}");
     rig.app.world_mut().insert_non_send_resource(script);
+    // The bar's own `PET_BAR_UPDATE`, as its packet signals it (`0x4bc90c`), on the bar pushed.
+    rig.feed.run(rig.app.world_mut());
+    ui(rig, |s| s.fire_event("PET_BAR_UPDATE", vec![]));
+}
+
+/// The pet's `UNIT_FIELD_FLAGS` watch, as an update packet's runs it: `UNIT_FLAGS("pet")`
+/// (`0x515e7a`), on which the stock bar repaints (`PetActionBarFrame.lua:45-47`).
+fn pet_flags_moved(rig: &mut Rig) {
+    ui(rig, |s| {
+        s.fire_event(
+            "UNIT_FLAGS",
+            vec![benilla_ui::script::ScriptValue::Str("pet".into())],
+        )
+    });
 }
 
 /// The feeds, then the VM's clock and layout, so the bar's slide and repaint have happened.
@@ -574,6 +588,7 @@ fn the_stock_bar_greys_a_stunned_pet_and_its_click_sends_nothing() {
     );
 
     set_pet(&mut rig, &[(FLAGS, 0x0004_0000)]);
+    pet_flags_moved(&mut rig);
     settle(&mut rig);
 
     assert!(icon_is_grey(&mut rig, ICON), "a stunned pet's bar greys");
@@ -587,6 +602,7 @@ fn the_stock_bar_greys_a_stunned_pet_and_its_click_sends_nothing() {
 
     // The same click again once the stun ends.
     set_pet(&mut rig, &[]);
+    pet_flags_moved(&mut rig);
     settle(&mut rig);
     assert!(!icon_is_grey(&mut rig, ICON));
     click_first_button(&mut rig);

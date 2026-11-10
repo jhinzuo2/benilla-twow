@@ -79,6 +79,8 @@ pub enum QuadContent {
         character: bool,
         /// The `SetModel` file; `None` for a unit pane or an empty one.
         model: Option<String>,
+        /// The instance keeps its depth fill ([`crate::widget::ModelState::depth_fill`]).
+        depth_fill: bool,
         /// `SetFacing`'s radians (0 default).
         facing: f32,
         /// `SetModelScale`'s factor (1 default).
@@ -103,6 +105,13 @@ pub enum QuadContent {
         fog: Option<crate::widget::ModelFog>,
         /// A `ModelFFX` (`0x46fa00`): the glue screens' scene, which the app's glue booth draws.
         ffx: bool,
+    },
+    /// A playing `MovieFrame`'s picture, its draw callback's quad (`0x78d1a0`): placed on the
+    /// whole window, not the frame's rect, from the movie's [`crate::script::MovieBitmap`]; the
+    /// pixels are [`crate::script::UiScript::write_movie_rgba`]'s.
+    Movie {
+        /// The movie frame, which keys its picture.
+        handle: crate::widget::FrameHandle,
     },
     /// A `Texture` region: a BLP path, a solid or vertex colour, or both (a tinted texture).
     Texture {
@@ -419,9 +428,9 @@ pub(crate) struct RegionData {
     /// regions.
     ///
     /// Deviation: kept apart from [`Self::vertex_color`], which the reference's `Texture:SetAlpha`
-    /// (`0x79b580`) rewrites, because the drawn product differs only on a region that sets both,
-    /// or a gradient and an alpha, which no stock code does, and a FontString's `SetAlpha` then
-    /// keeps its font colour.
+    /// (`0x79b580`) rewrites, because where stock sets both on one region (`PlayerFrame.lua:25-26`,
+    /// `TargetFrame.lua:408` with `420-426`) the drawn product differs for about one frame, and a
+    /// FontString's `SetAlpha` then keeps its font colour.
     pub(crate) alpha: Option<u8>,
     /// The texture slot (`+0xcc`): a path (`SetTexture("Interface\\...")`) or a solid fill
     /// (`SetTexture(r, g, b, a)`, an XML `<Color>` with no `file=`), each clearing the other. The

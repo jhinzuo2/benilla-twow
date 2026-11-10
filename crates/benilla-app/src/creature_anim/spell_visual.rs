@@ -58,6 +58,7 @@ pub(crate) fn meeting_stone_join_fx(visuals: &SpellVisuals, entity: Entity) -> O
             effect,
             path: path.to_string(),
         }],
+        at: None,
     })
 }
 
@@ -77,10 +78,16 @@ pub(crate) enum SpellKitSound {
         entity: Entity,
         spell_id: u32,
         kit_sound: u32,
+        /// Rung by a cast's hold, a precast's or a channel's kit, which a replacing hold stops
+        /// ([`Self::StopHold`] with no spell).
+        cast_hold: bool,
+        /// Its packet's place ([`SpellKitFx::at`]), which a hold loop keeps for
+        /// [`Self::Rebuilt`].
+        at: Option<crate::lanes::Stamp>,
     },
-    /// Stop the unit's hold loop: for `Some(spell)`, only a loop that spell's kit rang, as
-    /// `0x614150(spell, 0)` stops only the effects whose spell matches (`0x614167`); for `None`,
-    /// whatever loop it holds, as a new hold replaces the old.
+    /// Stop the unit's hold loops: for `Some(spell)`, every loop that spell's kits rang, as
+    /// `0x614150(spell, 0)` stops every effect whose spell matches (`0x614167`); for `None`, every
+    /// loop a cast's hold rang, as a new hold replaces the old.
     StopHold {
         entity: Entity,
         spell_id: Option<u32>,
@@ -90,6 +97,30 @@ pub(crate) enum SpellKitSound {
     PlayAt { pos: Vec3, kit_sound: u32 },
     /// Stop this kit's sound on the unit as its aura leaves (`0x614150`, 0.15 s fade).
     StopKit { entity: Entity, kit_sound: u32 },
+    /// A display rebuild at `at` (`0x60abe0`): its loop `0x60ac10` stops each of the unit's
+    /// effects, fading each one's sound over 0.15 s (`0x6203e0`, `0x6204b6` → `0x7a5a10`), so the
+    /// unit's hold loop fades if it rang before `at`.
+    Rebuilt {
+        entity: Entity,
+        at: crate::lanes::Stamp,
+    },
+    /// The rebuild's replay at its place `at` of a kit it plays again, an aura slot's state kit
+    /// (`0x5ff130` at `0x60ada6`) or the channel's (`0x612a30` at `0x60adad`): the unit's sound
+    /// on that kit fades as the rebuild stopped its effect, and the kit rings afresh.
+    Replay {
+        entity: Entity,
+        spell_id: u32,
+        kit_sound: u32,
+        /// The channel's, a cast's hold ([`Self::Play`]).
+        cast_hold: bool,
+        at: crate::lanes::Stamp,
+    },
+    /// `ReleaseEffects` at `at` (`0x614120`): every effect the unit holds is released at once, its
+    /// sound faded over 0.15 s as `0x61f520` closes it (`0x61f57d`).
+    Release {
+        entity: Entity,
+        at: crate::lanes::Stamp,
+    },
 }
 
 /// A kit's camera shake (kit field 14 → `SpellEffectCameraShakes.dbc`), consumed by
@@ -156,6 +187,8 @@ pub(crate) enum SpellKitFx {
         /// The models' animation lifecycle ([`FxStage`]).
         stage: FxStage,
         effects: Vec<FxSlot>,
+        /// Its packet's place ([`SpellKitFx::at`]).
+        at: Option<crate::lanes::Stamp>,
     },
     /// Despawn the unit's persistent effects matching `(spell_id, class)` (`0x614150`).
     Reap {
@@ -165,7 +198,37 @@ pub(crate) enum SpellKitFx {
         /// `0x614150`'s `force`: the cast edges stop unforced, sparing the spell's state effects
         /// (kind 2), which the aura's removal and the channel's change stop forced.
         force: bool,
+        /// Its packet's place ([`SpellKitFx::at`]).
+        at: Option<crate::lanes::Stamp>,
     },
+    /// `ReleaseEffects` (`0x614120`): every effect on the unit's list is unlinked (`0x6203a0`)
+    /// and released (`0x6210e0`) at once, with no stop and no drain; at refcount 0 `0x61f520`
+    /// closes the model with its emitters.
+    Release {
+        entity: Entity,
+        /// Its packet's place ([`SpellKitFx::at`]).
+        at: Option<crate::lanes::Stamp>,
+    },
+}
+
+impl SpellKitFx {
+    /// The unit the edge plays on.
+    pub(crate) fn entity(&self) -> Entity {
+        match self {
+            Self::Begin { entity, .. }
+            | Self::Reap { entity, .. }
+            | Self::Release { entity, .. } => *entity,
+        }
+    }
+
+    /// The place of the packet that raised the edge among what the packets queue (a field
+    /// edge's or a cast packet's [`crate::lanes::Stamp`]), by which a display rebuild in the same
+    /// frame ends it or not; `None` for an edge the frame raised, after every packet.
+    pub(crate) fn at(&self) -> Option<crate::lanes::Stamp> {
+        match self {
+            Self::Begin { at, .. } | Self::Reap { at, .. } | Self::Release { at, .. } => *at,
+        }
+    }
 }
 
 /// A kit play whose `CharProc` slots name a beam, the dispatcher's chain case (`0x60da79`), run at
@@ -180,8 +243,37 @@ pub(crate) struct ChainProcPlay {
     pub(crate) proc: benilla_formats::ChainProc,
 }
 
-/// One projectile per target on the GO's Speed > 0 branch (`0x6e8a50` → `0x60a3d0`), consumed
-/// by `crate::entities::missile`.
+/// One unit a missile flies at (`0x6e8b84` → `0x60a3d0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MissileTarget {
+    pub(crate) unit: Entity,
+    /// `None` for a hit; for a miss the `SpellMissInfo`, where the missile still flies and the
+    /// arrival reports it (`0x61dd50`).
+    pub(crate) miss: Option<u8>,
+    /// The byte a reflect carries after its code (`0x6e8279`, the missile's `+0x4c`): the outcome
+    /// the flight turned back at the caster takes, 0 a hit (`0x61e17b`).
+    pub(crate) reflect: u8,
+}
+
+/// What a missile flown at a point carries (`0x60a5fc`-`0x60a6cd`): the list it was launched for,
+/// walked on arrival (`0x61d870`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GroundList {
+    /// The hit list, no reasons: each unit plays the impact kit (`0x61da2d`).
+    Hits(Vec<Entity>),
+    /// The miss list with its reasons: each unit with a nonzero one is reported (`0x61d9dc`).
+    Misses(Vec<(Entity, u8)>),
+}
+
+/// One missile at the GO's point, the launcher's location arm (`0x6e8bd4`, a zero guid).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GroundShot {
+    pub(crate) at: Vec3,
+    pub(crate) list: GroundList,
+}
+
+/// One GO's projectiles on the Speed > 0 branch (`0x6e8a50` → `0x60a3d0`), consumed by
+/// `crate::entities::missile`.
 #[derive(Message, Clone)]
 pub(crate) struct MissileSpawn {
     pub(crate) caster: Entity,
@@ -196,15 +288,11 @@ pub(crate) struct MissileSpawn {
     pub(crate) dest_tag: Option<u16>,
     /// `Spell.dbc` Speed; flight time is distance over speed (`0x61ceb0`).
     pub(crate) speed: f32,
-    /// `None` for a hit; for a miss the `SpellMissInfo`, where the missile still flies and arrival
-    /// plays the victim's dodge (3) or block (5) clip.
-    pub(crate) targets: Vec<(Entity, Option<u8>)>,
-    /// With no targets and a DEST point on the GO, one projectile flies at the point (`0x6e8a50`'s
-    /// empty-hit arm, `0x6e8aa2`), arriving as [`super::CastEventKind::GroundImpact`].
-    /// The reference latches on `flags & 0x60` and aims a SOURCE-only cast at a zeroed DEST
-    /// point; this launches only with a real DEST (`flags & 0x40`), a zeroed aim being a quirk
-    /// not aped.
-    pub(crate) ground_aim: Option<Vec3>,
+    /// One missile per listed unit, hits and misses.
+    pub(crate) targets: Vec<MissileTarget>,
+    /// The missiles at the GO's point, one per list that took the location arm, arriving as
+    /// [`super::CastEventKind::GroundImpact`].
+    pub(crate) grounds: Vec<GroundShot>,
     /// The caster's ranged fallback visual, carried to arrival when the caster may be gone.
     pub(crate) weapon_visual: Option<u32>,
     /// `SpellVisual` field 10: the sound the projectile loops in flight (`CMissile+0x40`).
@@ -468,6 +556,9 @@ pub(crate) struct KitPush {
     pub(crate) kit_id: u32,
     /// [`super::PlaySeq`] stamp at the wire drain, in packet order.
     pub(crate) seq: u64,
+    /// The packet's place ([`SpellKitFx::at`]); `None` for a push the frame raised, after every
+    /// packet.
+    pub(crate) at: Option<crate::lanes::Stamp>,
 }
 
 /// The kit lanes [`route_cast_visuals`] writes but does not own, bundled into one param because
@@ -494,6 +585,8 @@ struct KitOut<'a, 'w1, 'w2, 'w3, 'w4, 'w5, 'w6, 'w7, 'w8> {
     trails: &'a mut MessageWriter<'w7, crate::weapon_trail::TrailArm>,
     /// The base recompute a stage-2 kit's anim id spends itself on.
     recomputes: &'a mut MessageWriter<'w8, BaseAnimRecompute>,
+    /// The place of the packet the plays come from ([`SpellKitFx::at`]).
+    at: Option<crate::lanes::Stamp>,
 }
 
 /// One kit play's policy on the reference's `PlaySpellVisualKit` (`0x60edf0`):
@@ -558,6 +651,8 @@ fn play_kit(
             entity,
             spell_id,
             kit_sound,
+            cast_hold: false,
+            at: out.at,
         });
     }
     // The camera shake plays at every stage, gated on nothing.
@@ -590,6 +685,7 @@ fn play_kit(
             class: FxClass::Hold,
             stage: play.stage,
             effects,
+            at: out.at,
         });
     }
 }
@@ -646,6 +742,71 @@ fn play_impact(
     }
 }
 
+/// What one GO's two launcher calls fly (`0x6e823a` for the hits, `0x6e8279` for the misses with
+/// their reasons and reflect bytes, the second only for a nonempty miss list): the targets and the
+/// shots at the point of [`MissileSpawn`].
+#[derive(Default)]
+struct LauncherShots {
+    targets: Vec<MissileTarget>,
+    grounds: Vec<GroundShot>,
+}
+
+/// `0x6e8a50` per list: a nonempty list whose target mask has UNIT or GAMEOBJECT (`0x802`,
+/// `0x6e8ac6`) flies one missile per unit, passing over a dead one (`0x6e8b24`), unless the mask
+/// also carries a point (`0x60`) and the visual's field 15 lacks bit 0 (`0x6e8aab`, `0x6e8ad4`).
+/// Otherwise a mask with a point flies one missile at it carrying the list (`0x6e8ba4`,
+/// `0x6e8bd4`), the empty hit list included; with no point it flies nothing. It aims at the DEST
+/// point when the mask has one (`0x60a584`, `0x60a5b2`), else at the SOURCE point (`0x60a5ce`).
+fn launcher_shots(go: &SpellGoTargets, flags: u32, dead: impl Fn(Entity) -> bool) -> LauncherShots {
+    let points = go.target_mask & 0x60 != 0;
+    let point = if go.target_mask & 0x40 != 0 {
+        go.dest
+    } else {
+        go.source
+    };
+    let per_unit = go.target_mask & 0x802 != 0 && (!points || flags & 0x1 != 0);
+    let mut shots = LauncherShots::default();
+    let ground = |list: GroundList, shots: &mut LauncherShots| {
+        if let (true, Some(at)) = (points, point) {
+            shots.grounds.push(GroundShot { at, list });
+        }
+    };
+    if per_unit && !go.hits.is_empty() {
+        shots.targets.extend(
+            go.hits
+                .iter()
+                .filter(|&&e| !dead(e))
+                .map(|&unit| MissileTarget {
+                    unit,
+                    miss: None,
+                    reflect: 0,
+                }),
+        );
+    } else {
+        ground(GroundList::Hits(go.hits.clone()), &mut shots);
+    }
+    if go.misses.is_empty() {
+        // `0x6e8244`: no second call.
+    } else if per_unit {
+        shots
+            .targets
+            .extend(
+                go.misses
+                    .iter()
+                    .filter(|&&(e, ..)| !dead(e))
+                    .map(|&(unit, code, reflect)| MissileTarget {
+                        unit,
+                        miss: Some(code),
+                        reflect,
+                    }),
+            );
+    } else {
+        let list = go.misses.iter().map(|&(e, code, _)| (e, code)).collect();
+        ground(GroundList::Misses(list), &mut shots);
+    }
+    shots
+}
+
 /// The cast-edge router: wire [`CastEvent`]s and the public channel field → animation intents.
 ///
 /// - Start: the precast kit's anim becomes the [`CastHold`] (stage 4) and its sound rings.
@@ -700,6 +861,7 @@ pub(super) fn route_cast_visuals(
         shakes,
         trails,
         recomputes,
+        at: None,
     };
 
     // `holds` lags one command flush and an instant cast's START and GO drain together, so
@@ -713,6 +875,7 @@ pub(super) fn route_cast_visuals(
     };
 
     for p in pushes.read() {
+        out.at = p.at;
         // No kit-level scan, but each slot's same-(record, tag) replace (`0x6208e0`) swaps the old
         // batch out; the driver's same-id dedup (`0x5fdba0`) keeps a looping clip running.
         if let Some(kit) = visuals.0.kit(p.kit_id) {
@@ -734,6 +897,7 @@ pub(super) fn route_cast_visuals(
         if commands.get_entity(ev.entity).is_err() {
             continue;
         }
+        out.at = ev.at;
         match ev.kind {
             CastEventKind::Start => {
                 // A replacing cast reaps the prior hold's loop and persistent models first.
@@ -747,6 +911,7 @@ pub(super) fn route_cast_visuals(
                         spell_id: prior,
                         class: FxClass::Hold,
                         force: true,
+                        at: ev.at,
                     });
                 }
                 // A ranged-attribute START draws the ranged weapon (`0x6e78f3`); vmangos sends
@@ -791,6 +956,8 @@ pub(super) fn route_cast_visuals(
                             entity: ev.entity,
                             spell_id: ev.spell_id,
                             kit_sound,
+                            cast_hold: true,
+                            at: ev.at,
                         });
                     }
                     // Persistent until the cast resolves, re-armed forever (stage 4).
@@ -803,6 +970,7 @@ pub(super) fn route_cast_visuals(
                             class: FxClass::Hold,
                             stage: FxStage::Relive,
                             effects,
+                            at: ev.at,
                         });
                     }
                 }
@@ -835,6 +1003,7 @@ pub(super) fn route_cast_visuals(
                         spell_id: ev.spell_id,
                         class: FxClass::Hold,
                         force: false,
+                        at: ev.at,
                     });
                 }
                 // Then the running auto-repeat spell's on the same unit, `0x614150([0xceac30], 0)`
@@ -854,6 +1023,7 @@ pub(super) fn route_cast_visuals(
                         spell_id: repeat,
                         class: FxClass::Hold,
                         force: false,
+                        at: ev.at,
                     });
                 }
                 // A ranged-slot GO redraws ranged before the cast kit (`0x60f34c`, gate
@@ -890,14 +1060,17 @@ pub(super) fn route_cast_visuals(
                     );
                 }
             }
-            CastEventKind::Impact { weapon_visual } => {
-                // The arrival flinches every living target, no hostility test (`0x61dc74`).
+            CastEventKind::Impact {
+                weapon_visual,
+                wound,
+            } => {
+                // A hit arrival flinches every living target, no hostility test (`0x61dc74`).
                 play_impact(
                     ev.entity,
                     ImpactPlay {
                         spell_id: ev.spell_id,
                         weapon_visual,
-                        flinch: true,
+                        flinch: wound,
                         seq: ev.seq,
                     },
                     spells,
@@ -934,14 +1107,17 @@ pub(super) fn route_cast_visuals(
                     spell_id: ev.spell_id,
                     class: FxClass::Hold,
                     force: false,
+                    at: ev.at,
                 });
             }
         }
     }
 
     // Speed 0 plays every impact now (`0x6e8bf0`), with or without a caster unit (`0x6e816b`);
-    // Speed > 0 flies one projectile per target from a caster unit. Misses fly too; the reference deflects them off the target, which is not built.
+    // Speed > 0 flies the launcher's missiles from a caster unit ([`launcher_shots`]).
     for go in go_targets.read() {
+        // The GO's own place, not the frame's last cast edge's.
+        out.at = go.at;
         let Some(display) = spells.catalog.get(go.spell_id) else {
             continue;
         };
@@ -981,35 +1157,36 @@ pub(super) fn route_cast_visuals(
                 );
             }
         } else if let Some(caster) = go.caster {
-            // No caster unit flies nothing (`0x6e8219`). The spawn gate is Speed alone
-            // (`0x60a3d0`): basic shots have no visual row.
-            let path = stages.and_then(|s| {
-                (s.missile_model >= 1).then(|| {
-                    visuals
-                        .0
-                        .effect_path(s.missile_model)
-                        .unwrap_or(ERROR_CUBE)
-                        .to_string()
-                })
+            // No caster unit flies nothing (`0x6e8219`), nor does a spell with no visual row
+            // (`0x6e8041`); the launcher needs the visual's field 6 or the wire's ammo
+            // (`0x6e8a7f`, `0x6e8a88`).
+            let Some(stages) = stages.filter(|s| {
+                s.missile_gate != 0 || go.ammo_display_id.is_some_and(|ammo| ammo != 0)
+            }) else {
+                continue;
+            };
+            let path = (stages.missile_model >= 1).then(|| {
+                visuals
+                    .0
+                    .effect_path(stages.missile_model)
+                    .unwrap_or(ERROR_CUBE)
+                    .to_string()
             });
             // An out-of-table ordinal reads adjacent `.rdata` in the reference; here, the base.
-            let dest_tag =
-                stages.and_then(|s| MISSILE_ATTACH_TABLE.get(s.missile_attach as usize).copied());
-            let missile_sound = stages.and_then(|s| s.missile_sound);
-            let targets: Vec<(Entity, Option<u8>)> = go
-                .hits
-                .iter()
-                .map(|&e| (e, None))
-                .chain(go.misses.iter().map(|&(e, code)| (e, Some(code))))
-                .collect();
-            // Only an empty hit array consults the ground point (`0x6e8abc … je 0x6e8ba2`).
-            let ground_aim = targets.is_empty().then_some(go.dest).flatten();
-            if !targets.is_empty() || ground_aim.is_some() {
+            let dest_tag = MISSILE_ATTACH_TABLE
+                .get(stages.missile_attach as usize)
+                .copied();
+            let shots = launcher_shots(go, stages.flags, |e| {
+                units
+                    .get(e)
+                    .is_ok_and(|(_, store)| store.is_unit() && store.0.is_dead_or_ghost())
+            });
+            if !shots.targets.is_empty() || !shots.grounds.is_empty() {
                 // The release gate (`0x6e7a70`, inverted): a cast kit animation above 0 waits for
                 // the release keyframe (`0x6e8295 jg`); Stand launches at once (`0x6e829d`).
-                let awaits_release = stages
-                    .filter(|s| s.cast != 0)
-                    .and_then(|s| visuals.0.kit(s.cast))
+                let awaits_release = (stages.cast != 0)
+                    .then(|| visuals.0.kit(stages.cast))
+                    .flatten()
                     .is_some_and(|k| k.positive_anim().is_some());
                 missiles.write(MissileSpawn {
                     caster,
@@ -1018,10 +1195,10 @@ pub(super) fn route_cast_visuals(
                     ammo_display_id: go.ammo_display_id,
                     dest_tag,
                     speed: display.speed,
-                    targets,
-                    ground_aim,
+                    targets: shots.targets,
+                    grounds: shots.grounds,
                     weapon_visual: wv,
-                    missile_sound,
+                    missile_sound: stages.missile_sound,
                     awaits_release,
                 });
             }
@@ -1029,7 +1206,11 @@ pub(super) fn route_cast_visuals(
     }
 
     // The channel poll: `UNIT_CHANNEL_SPELL` edges drive an observed unit's channel (the self-only
-    // `MSG_CHANNEL_*` do not); a cleared field drops the hold even with no other wire trace.
+    // `MSG_CHANNEL_*` do not); a cleared field drops the hold even with no other wire trace. Its
+    // kits carry no place, falling after every packet's: the channel's watcher (field 144) runs
+    // after the display's (131) in an update, and across packets the rebuild replays the
+    // channel's kit (`0x612a30`), so either side of a rebuild leaves it on the new body once.
+    out.at = None;
     for (entity, store) in &units {
         let cur = store.0.unit_channel_spell();
         let prev = channel_cache.get(&entity).copied().unwrap_or(0);
@@ -1049,6 +1230,7 @@ pub(super) fn route_cast_visuals(
                     spell_id: prev,
                     class: FxClass::Hold,
                     force: true,
+                    at: None,
                 });
             }
             // No ranged fallback on the channel poll (`0x612a30`).
@@ -1068,6 +1250,8 @@ pub(super) fn route_cast_visuals(
                         entity,
                         spell_id: cur,
                         kit_sound,
+                        cast_hold: true,
+                        at: None,
                     });
                 }
                 // The CharProc dispatcher's second caller (`0x612b18`): Drain Life's beam is
@@ -1094,6 +1278,7 @@ pub(super) fn route_cast_visuals(
                         class: FxClass::Hold,
                         stage: FxStage::State,
                         effects,
+                        at: None,
                     });
                 }
             }
@@ -1112,6 +1297,7 @@ pub(super) fn route_cast_visuals(
                 spell_id: prev,
                 class: FxClass::Hold,
                 force: true,
+                at: None,
             });
         }
     }
@@ -1155,19 +1341,19 @@ pub(crate) fn arm_aura_state_fx(
     let (Some(visuals), Some(spells)) = (visuals.as_deref(), spells.as_deref()) else {
         return; // no client data
     };
+    // Each unit's kits carry the aura watcher's place, its first edge in the span (`0x604d00`).
+    let mut aura_at: EntityHashMap<crate::lanes::Stamp> = EntityHashMap::default();
     let scan = if full_sweep {
         units.iter().collect::<Vec<_>>()
     } else {
         let mut due: EntityHashSet = arrived.iter().collect();
-        due.extend(
-            edges
-                .read()
-                .filter(|e| {
-                    e.unit_array_slot(AURA_WATCH_BASE, AURA_WATCH_SPAN)
-                        .is_some()
-                })
-                .map(|e| e.entity),
-        );
+        for e in edges.read().filter(|e| {
+            e.unit_array_slot(AURA_WATCH_BASE, AURA_WATCH_SPAN)
+                .is_some()
+        }) {
+            due.insert(e.entity);
+            aura_at.entry(e.entity).or_insert(e.at);
+        }
         due.into_iter().filter_map(|e| units.get(e).ok()).collect()
     };
     for (entity, store) in scan {
@@ -1179,9 +1365,9 @@ pub(crate) fn arm_aura_state_fx(
         // (`0x604e7b`-`0x604e85`), so the highest new slot's effect ends at the head.
         //
         // Deviation: a spell's state kit and body procs are reaped only once no slot holds the
-        // spell. The reference's removal of one slot (`0x612320` → `0x5ff290`) stops every
+        // spell because the reference's removal of one slot (`0x612320` → `0x5ff290`) stops every
         // effect of that spell on the unit (`0x614150(spell, 1)` at `0x5ff2d2`, and its procs
-        // through `0x60d150` and `0x5ff320`), even while another slot holds the same spell: it
+        // through `0x60d150` and `0x5ff320`), even while another slot holds the same spell, which
         // drops a visual the server says still holds.
         let mut cur: Vec<u32> = Vec::new();
         for a in store.0.unit_auras() {
@@ -1196,6 +1382,7 @@ pub(crate) fn arm_aura_state_fx(
                     spell_id,
                     class: FxClass::AuraState,
                     force: true,
+                    at: aura_at.get(&entity).copied(),
                 });
                 procs.write(AuraProc::Reap { entity, spell_id });
                 // The forced stop takes the 0x1000 effect too (`0x614179`).
@@ -1238,6 +1425,7 @@ pub(crate) fn arm_aura_state_fx(
                     class: FxClass::AuraState,
                     stage: FxStage::State,
                     effects,
+                    at: aura_at.get(&entity).copied(),
                 });
             }
             if !nodes.is_empty() {
@@ -1253,6 +1441,8 @@ pub(crate) fn arm_aura_state_fx(
                     entity,
                     spell_id,
                     kit_sound,
+                    cast_hold: false,
+                    at: aura_at.get(&entity).copied(),
                 });
             }
             // The stage-2 anim leg, on the add edge only: an aura refreshed in place keeps its id,
@@ -1284,90 +1474,214 @@ pub(crate) fn arm_aura_state_fx(
     pinned.retain(|e, _| units.contains(*e));
 }
 
-/// Arm and reap the loot sparkle on a dead lootable unit and on a corpse object with
-/// `CORPSE_FIELD_DYNAMIC_FLAGS` bit 0 (`0x5d6de0`): the `"HARDCODED Loot Art"` row at `0x13`.
-/// Edge-driven (`0x600440`) with no viewer or distance logic, since the server strips the flag per
-/// viewer; the falling edge reaps with no fade (`0x600680`).
+/// Each unit's death stamp, the reference's `+0xcb4`: set as its Death clip ends (`0x5fc920` at
+/// `0x5fc95a`), as it is created dead (`0x5fba26`) or as it comes back dead (`0x5fbe64`), never in
+/// the update it dies in; cleared as it comes back to life (`0x5fef70` at `0x5fef85`). The
+/// dynamic-flags watcher's release waits on it, and the loot sparkle hangs as it is set.
+#[derive(Resource, Default)]
+pub(crate) struct DeathStamps {
+    stamped: EntityHashSet,
+    /// Stamped since the loot watcher last looked: the sparkle hangs at the stamp (`0x5fc962`,
+    /// `0x5fba33`, `0x5fbe6d`).
+    fresh: EntityHashSet,
+}
+
+impl DeathStamps {
+    /// The unit's death settled.
+    pub(crate) fn stamp(&mut self, unit: Entity) {
+        self.stamped.insert(unit);
+        self.fresh.insert(unit);
+    }
+
+    /// Whether the unit's death is stamped.
+    pub(crate) fn settled(&self, unit: Entity) -> bool {
+        self.stamped.contains(&unit)
+    }
+}
+
+/// The loot sparkle, the `"HARDCODED Loot Art"` row at `0x13`, on a unit or a corpse object whose
+/// dynamic flags carry bit 0 (`UNIT_DYNAMIC_FLAGS` for a unit, `CORPSE_FIELD_DYNAMIC_FLAGS`,
+/// `0x5d6de0`), with no viewer or distance logic, since the server strips the flag per viewer.
+///
+/// A unit's sparkle follows the reference's calls, not the flag's level. `AddLootSparkle`
+/// (`0x6005d0`) hangs one if bit 0 is set and none hangs: as the death stamp is set ([`DeathStamps`];
+/// `0x5fc962`, `0x5fba33`, `0x5fbe6d`), on the model's `$DTH` with no stamp test (`0x5fffb4` →
+/// `0x6247d0` → `0x624aa4`), and at a dynamic-flags write once the death is stamped (`0x60058e`).
+/// `RemoveLootSparkle` (`0x600680`) takes it with no fade only as bit 0 falls (`0x60047b`), or as
+/// the unit leaves, whose release frees it with the rest. A return to life takes nothing.
+///
+/// The unit's effects are released at once (`ReleaseEffects`, `0x614120`), the sparkle with them,
+/// at the two watcher sites, in wire order: the health watcher's death runs `OnDied` (`0x6047a3` →
+/// `0x605860`), which releases at `0x605922`; the dynamic-flags watcher, on any write that leaves
+/// bit 0 set on a unit whose death is stamped (`+0xcb4` above 0, `0x600574`, `0x60057c`), releases
+/// (`0x600587`) and hangs the sparkle again (`0x60058e`).
+#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 pub(super) fn arm_loot_fx(
-    // Re-read on an edge of any of the four fields and on first sight (armed at build, `0x5d6e30`).
     units: Query<(Entity, &ObjectStore, &crate::net::NetEntity)>,
     arrived: Query<Entity, (Added<ObjectStore>, Without<ItemObject>)>,
     mut edges: MessageReader<FieldChanged>,
+    mut model_events: MessageReader<super::AnimSoundEvent>,
     visuals: Option<Res<SpellVisuals>>,
     mut fx: MessageWriter<SpellKitFx>,
+    mut sounds: MessageWriter<SpellKitSound>,
+    mut stamps: ResMut<DeathStamps>,
+    // Who has a sparkle hanging, the reference's effect flagged `0x8` on `+0xb4`.
     mut armed: Local<EntityHashSet>,
-    mut tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
 ) {
+    use benilla_protocol::field::{
+        FIELD_CORPSE_DYNAMIC_FLAGS, FIELD_UNIT_DYNAMIC_FLAGS, FIELD_UNIT_HEALTH,
+    };
     let full_sweep = visuals.as_ref().is_some_and(|v| v.is_changed());
-    let Some((effect, path)) = visuals.as_ref().and_then(|v| v.0.loot_art_effect()) else {
+    let art = visuals.as_ref().and_then(|v| v.0.loot_art_effect());
+    let unit = |entity: Entity| {
+        units
+            .get(entity)
+            .ok()
+            .filter(|(_, _, net)| matches!(net.kind, EntityKind::Unit | EntityKind::Player))
+    };
+    // `AddLootSparkle` (`0x6005d0`): bit 0 set and none hanging.
+    let add = |entity: Entity,
+               at: Option<crate::lanes::Stamp>,
+               fx: &mut MessageWriter<SpellKitFx>,
+               armed: &mut EntityHashSet| {
+        let Some(art) = art else {
+            return; // no client data or no such row
+        };
+        if unit(entity).is_some_and(|(_, store, _)| store.0.unit_lootable()) && armed.insert(entity)
+        {
+            fx.write(sparkle(entity, art, FxStage::Relive, at));
+        }
+    };
+    let mut corpses: EntityHashMap<Option<crate::lanes::Stamp>> = arrived
+        .iter()
+        .filter(|&e| {
+            units
+                .get(e)
+                .is_ok_and(|(_, _, n)| n.kind == EntityKind::Corpse)
+        })
+        .map(|e| (e, None))
+        .collect();
+    for e in edges.read() {
+        if e.kind == benilla_protocol::messages::ObjectType::Corpse
+            && e.index == FIELD_CORPSE_DYNAMIC_FLAGS
+        {
+            corpses.insert(e.entity, Some(e.at));
+            continue;
+        }
+        let release = |sounds: &mut MessageWriter<SpellKitSound>,
+                       fx: &mut MessageWriter<SpellKitFx>,
+                       armed: &mut EntityHashSet| {
+            fx.write(SpellKitFx::Release {
+                entity: e.entity,
+                at: Some(e.at),
+            });
+            sounds.write(SpellKitSound::Release {
+                entity: e.entity,
+                at: e.at,
+            });
+            armed.remove(&e.entity);
+        };
+        if e.unit_died() {
+            release(&mut sounds, &mut fx, &mut armed);
+        }
+        // The health watcher's return to life clears the stamp (`0x6047ee` → `0x5fef70`).
+        if e.unit_field(FIELD_UNIT_HEALTH) && e.old as i32 <= 0 && e.new as i32 > 0 {
+            stamps.stamped.remove(&e.entity);
+            stamps.fresh.remove(&e.entity);
+        }
+        if !e.unit_field(FIELD_UNIT_DYNAMIC_FLAGS) {
+            continue;
+        }
+        if e.old & 0x1 != 0 && e.new & 0x1 == 0 {
+            if armed.remove(&e.entity) {
+                fx.write(SpellKitFx::Reap {
+                    entity: e.entity,
+                    spell_id: LOOT_FX_KEY,
+                    class: FxClass::Hold,
+                    force: true,
+                    at: Some(e.at),
+                });
+            }
+        } else if e.new & 0x1 != 0 && stamps.settled(e.entity) {
+            release(&mut sounds, &mut fx, &mut armed);
+            add(e.entity, Some(e.at), &mut fx, &mut armed);
+        }
+    }
+    for ev in model_events.read().filter(|ev| &ev.ident == b"$DTH") {
+        add(ev.entity, None, &mut fx, &mut armed);
+    }
+    // A unit created or brought back dead is stamped (`0x5fba1d`-`0x5fba26`, `0x5fbe51`-`0x5fbe64`).
+    for entity in arrived.iter() {
+        if unit(entity).is_some_and(|(_, store, _)| store.0.unit_is_dead()) {
+            stamps.stamp(entity);
+        }
+    }
+    let fresh: Vec<Entity> = if full_sweep {
+        // The art arrived late: hang what the stamps already settled.
+        stamps.fresh.clear();
+        stamps.stamped.iter().copied().collect()
+    } else {
+        stamps.fresh.drain().collect()
+    };
+    for entity in fresh {
+        add(entity, None, &mut fx, &mut armed);
+    }
+    // Streamed objects despawn on range-out; drop their rows.
+    armed.retain(|e| units.contains(*e));
+    stamps.stamped.retain(|e| units.contains(*e));
+    let Some(art) = art else {
         return; // no client data or no such row
     };
-    let scan = if full_sweep {
-        units.iter().collect::<Vec<_>>()
-    } else {
-        use benilla_protocol::field::{
-            FIELD_CORPSE_DYNAMIC_FLAGS, FIELD_UNIT_DYNAMIC_FLAGS, FIELD_UNIT_HEALTH,
-            FIELD_UNIT_MAXHEALTH,
-        };
-        let mut due: EntityHashSet = arrived.iter().collect();
-        due.extend(
-            edges
-                .read()
-                .filter(|e| {
-                    e.unit_field(FIELD_UNIT_DYNAMIC_FLAGS)
-                        || e.unit_field(FIELD_UNIT_HEALTH)
-                        || e.unit_field(FIELD_UNIT_MAXHEALTH)
-                        || (e.kind == benilla_protocol::messages::ObjectType::Corpse
-                            && e.index == FIELD_CORPSE_DYNAMIC_FLAGS)
-                })
-                .map(|e| e.entity),
+    // A corpse object's sparkle: bit 0 rising calls `0x5d6e30`, falling `0x5d6e80`.
+    if full_sweep {
+        corpses.extend(
+            (units.iter())
+                .filter(|(_, _, n)| n.kind == EntityKind::Corpse)
+                .map(|(e, _, _)| (e, None)),
         );
-        due.into_iter().filter_map(|e| units.get(e).ok()).collect()
-    };
-    for (entity, store, net) in scan {
-        // A corpse object's sparkle: bit 0 rising calls `0x5d6e30`, the same row at the same tag.
-        let lootable = if net.kind == benilla_protocol::EntityKind::Corpse {
-            store.0.corpse_lootable()
-        } else {
-            store.0.unit_is_dead() && store.0.unit_lootable()
+    }
+    for (entity, at) in corpses {
+        let Ok((_, store, _)) = units.get(entity) else {
+            continue;
         };
-        if lootable && armed.insert(entity) {
-            // The Looting tutorial on the rise (`0x60049b`).
-            if let Some(t) = tutorials.as_mut() {
-                t.write(crate::tutorial::TutorialEvent::trigger(
-                    crate::tutorial::id::LOOTING,
-                ));
+        if store.0.corpse_lootable() {
+            if armed.insert(entity) {
+                // A bare model with no sequence armed (`0x5d6e30`); this plumbing has no such
+                // instance, so it runs `OneShot` persistent.
+                fx.write(sparkle(entity, art, FxStage::OneShot, at));
             }
-            fx.write(SpellKitFx::Begin {
-                entity,
-                spell_id: LOOT_FX_KEY,
-                persistent: true,
-                class: FxClass::Hold,
-                // A unit's loot art loops its first sequence (`0x600640`). A corpse's is a bare
-                // model with no sequence armed (`0x5d6e30`); this plumbing has no such instance, so
-                // it runs `OneShot` persistent.
-                stage: if net.kind == benilla_protocol::EntityKind::Corpse {
-                    FxStage::OneShot
-                } else {
-                    FxStage::Relive
-                },
-                effects: vec![FxSlot {
-                    tag: HARDCODED_FX_ATTACH,
-                    effect,
-                    path: path.to_string(),
-                }],
-            });
-        } else if !lootable && armed.remove(&entity) {
+        } else if armed.remove(&entity) {
             fx.write(SpellKitFx::Reap {
                 entity,
                 spell_id: LOOT_FX_KEY,
                 class: FxClass::Hold,
                 force: true,
+                at,
             });
         }
     }
-    // Streamed units despawn on range-out; drop their rows.
-    armed.retain(|e| units.contains(*e));
+}
+
+/// The loot sparkle's play: a unit's loops its first sequence (`0x600640`).
+fn sparkle(
+    entity: Entity,
+    (effect, path): (u32, &str),
+    stage: FxStage,
+    at: Option<crate::lanes::Stamp>,
+) -> SpellKitFx {
+    SpellKitFx::Begin {
+        entity,
+        spell_id: LOOT_FX_KEY,
+        persistent: true,
+        class: FxClass::Hold,
+        stage,
+        effects: vec![FxSlot {
+            tag: HARDCODED_FX_ATTACH,
+            effect,
+            path: path.to_string(),
+        }],
+        at,
+    }
 }
 
 /// The level-up ding: any streamed unit's `UNIT_FIELD_LEVEL` change (`0x6045b0`) spawns
@@ -1404,6 +1718,7 @@ pub(super) fn arm_level_up_fx(
                 effect,
                 path: path.to_string(),
             }],
+            at: Some(e.at),
         });
     }
 }
@@ -1444,6 +1759,7 @@ pub(super) fn arm_mount_poof_fx(
                 effect,
                 path: path.to_string(),
             }],
+            at: Some(e.at),
         });
     }
 }
@@ -1500,6 +1816,55 @@ pub(super) fn arm_morph_latch(
     latch.0.retain(|e, _| units.contains(*e));
 }
 
+/// The sound half of the rebuild's replay (`0x60abe0`): the aura slots' state kits (`0x5ff130` at
+/// `0x60ada6`), then the channel's kit (`0x612a30` at `0x60adad`), played again as kind 2, ring
+/// afresh at the rebuild's place over the sounds its loop faded. Their models re-arm in
+/// `crate::entities::spell_fx`.
+pub(crate) fn replay_rebuilt_kit_sounds(
+    mut swaps: MessageReader<crate::entities::DisplaySwapped>,
+    units: Query<&ObjectStore>,
+    visuals: Option<Res<SpellVisuals>>,
+    spells: Option<Res<crate::ui_action::Spells>>,
+    mut sounds: MessageWriter<SpellKitSound>,
+) {
+    for swap in swaps.read() {
+        let Ok(store) = units.get(swap.entity) else {
+            continue; // a unit gone
+        };
+        let at = swap.at;
+        let (Some(visuals), Some(spells)) = (visuals.as_deref(), spells.as_deref()) else {
+            continue; // no client data
+        };
+        let mut auras: Vec<u32> = Vec::new();
+        for spell_id in store.0.unit_aura_ids().filter(|&s| s != 0) {
+            if !auras.contains(&spell_id) {
+                auras.push(spell_id);
+            }
+        }
+        let state = auras.into_iter().map(|spell_id| {
+            let kit = resolve_kit(spells, &visuals.0, spell_id, |s| s.state, || None);
+            (spell_id, kit, false)
+        });
+        let channel = Some(store.0.unit_channel_spell())
+            .filter(|&c| c != 0)
+            .map(|spell_id| {
+                let kit = resolve_kit(spells, &visuals.0, spell_id, |s| s.channel, || None);
+                (spell_id, kit, true)
+            });
+        for (spell_id, kit, cast_hold) in state.chain(channel) {
+            if let Some(kit_sound) = kit.and_then(|k| k.sound) {
+                sounds.write(SpellKitSound::Replay {
+                    entity: swap.entity,
+                    spell_id,
+                    kit_sound,
+                    cast_hold,
+                    at,
+                });
+            }
+        }
+    }
+}
+
 /// The rebuild's impact-kit replay (the tail of `0x60abe0`): a display swap with the latch armed
 /// plays the latched impact kit and clears it, a frame later on the rebuilt body. The same-record,
 /// same-tag replace (`0x6208e0`) is not built, so a cold-cache shift-in briefly shows two clouds.
@@ -1539,6 +1904,8 @@ pub(super) fn replay_morph_kit(
             shakes: &mut shakes,
             trails: &mut trails,
             recomputes: &mut recomputes,
+            // The replay rides the rebuild that was the frame before: after every packet.
+            at: None,
         };
         play_kit(
             swap.entity,

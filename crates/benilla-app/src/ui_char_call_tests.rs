@@ -1,7 +1,7 @@
 //! `AbandonSkill` through the whole client's host: it sends `CMSG_UNLEARN_SKILL` inside its call
 //! (`0x4d3b40`), so a chunk's packets leave in call order with every other verb's.
 
-use benilla_ui::script::UiScript;
+use benilla_ui::script::{SkillsState, UiScript};
 use crossbeam_channel::Receiver;
 
 use super::*;
@@ -10,7 +10,7 @@ use crate::script_calls::with_hosted_vm;
 /// The whole client, headless, its VM seated with two categories: rows 1 Weapon Skills,
 /// 2 Swords, 3 Professions, 4 First Aid.
 fn client() -> (App, Receiver<ClientCommand>) {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     let entry = |skill_id: u32, name: &str, category_id: u32, category: &str| SkillEntry {

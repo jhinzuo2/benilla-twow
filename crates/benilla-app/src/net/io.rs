@@ -10,7 +10,8 @@
 //! Deviation: the reference loads the world first and logs in after: the entry's first frame
 //! starts the load at the record's map and position (`0x401570`, called at `0x46c236`), and a
 //! later one, once its file reader is idle (`0x46c247`), sends the login (`0x46c272`). Here the two
-//! overlap, so entry is a round trip faster, and a refusal ends the cycle as a logout does.
+//! overlap because that way entry is a round trip faster; a refusal ends the cycle as a logout
+//! does.
 //!
 //! A logout or a later `SMSG_CHARACTER_LOGIN_FAILED` ends the world session, announced as a
 //! [`SessionEvent::Disconnected`] with [`SessionEnd::LoggedOut`], and parks at character select
@@ -30,8 +31,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use benilla_assets::LockRecover;
 use benilla_protocol::{
-    messages::SurveyAnswer, AuthReject, CharAction, LoginStage, Poll, RosterCause, SessionEnd,
-    SessionEvent, WorldReader, WorldSession, WorldWriter,
+    messages::SurveyAnswer, AuthReject, CharAction, LoginStage, Poll, RealmListEmptied,
+    RosterCause, SessionEnd, SessionEvent, WorldReader, WorldSession, WorldWriter,
 };
 use crossbeam_channel::{Receiver, Sender};
 
@@ -171,8 +172,10 @@ impl PingClock {
 /// Cap on send warnings per connection, so a movement stream during an outage cannot flood the log.
 const SEND_WARN_CAP: u32 = 8;
 
-/// How often the character park looks at the world socket for a server that dropped it.
-const PARK_LINK_CHECK: Duration = Duration::from_millis(500);
+/// How often the character park looks at the world socket, for a server that dropped it and for
+/// what it sent unasked: a guild's answer, which a tabard on the select screen waits on, is read
+/// here.
+const PARK_LINK_CHECK: Duration = Duration::from_millis(50);
 
 /// What one wake-up at the character park asked for, so every jump out is made outside `select!`.
 enum Parked {
@@ -384,49 +387,105 @@ enum WorldEnd {
 }
 
 /// Publish a realm list: a fresh one, or with `failed` the last one held, after a query that got
-/// no answer (`REALM_LIST_FAILED`). False once the app is gone.
+/// no answer (`REALM_LIST_FAILED`), and with `emptied` too none, after a query that empties the
+/// holder. False once the app is gone.
 fn publish(
     events_tx: &Sender<SessionEvent>,
     realms: &[benilla_protocol::RealmInfo],
     failed: bool,
+    emptied: Option<RealmListEmptied>,
 ) -> bool {
     events_tx
         .send(SessionEvent::RealmList {
             realms: realms.to_vec(),
             failed,
+            emptied,
         })
         .is_ok()
 }
 
 /// A realm list query on the realmd link, `RequestRealmList`'s (`0x5ab840`) and the connect's
-/// own (`0x5aab6d`), then the answer published. A request that fails for any reason (the link
-/// realmd closed, the 5 s timeout, a reply that does not parse) dials realmd again and asks once
-/// more; vmangos closes every link after `MaxSessionDuration`, 300 s by default, while a list may
-/// stand longer. False once the app is gone.
+/// own (`0x5aab6d`), then the answer published. A request that fails the link (the link realmd
+/// closed, the 5 s timeout, a reply the link's walk calls malformed) dials realmd again and asks
+/// once more; vmangos closes every link after `MaxSessionDuration`, 300 s by default, while a list
+/// may stand longer. A failed re-dial empties the list, as a failed reconnect empties the holder
+/// ([`redial_failure`]). A reply only the record fill refuses fails the query with the link up
+/// (`0x5b23ff`). False once the app is gone.
 ///
 /// Deviation: the reference re-dials only from `RequestRealmList`, and only when the link is down
 /// (`[CLoginMgr+5]` clear, `0x5ab857` → `0x5b2200`), with the reconnect challenge (`0x5b2134`,
 /// `[Logon+0xc]`); the connect's query sends only on a link in state 6 (`0x5bc14c`) and otherwise
 /// nothing, leaving the screen on its connecting dialog for good. Here both queries re-dial on
-/// any failure, with a full logon from the cycle's credentials, because benilla's logon has no
-/// reconnect exchange and a connect that can never complete is a dead end, not a behaviour; the
-/// new session key serves the next world dial as the reconnect's would.
+/// any failure of the link, with a full logon from the cycle's credentials, because benilla's
+/// logon has no reconnect exchange and a connect that can never complete is a dead end, not a
+/// behaviour; the new session key serves the next world dial as the reconnect's would. A PIN
+/// account's re-dial presses the PIN the logon proved on its new challenge's grid, as the
+/// reconnect asks for none. A PIN a re-dial's proof has refused (a TOTP code moves on, vmangos
+/// `AuthSocket.cpp:720`) is forgotten and the logon dials no more, so every query fails from then
+/// on: each refusal is a wrong password to the server (`:856`), and the list asks every 5 s.
 fn query(
     logon: &mut benilla_protocol::Logon,
     req: &LoginRequest,
     events_tx: &Sender<SessionEvent>,
 ) -> bool {
     let mut ok = logon.refresh_realms(REALM_REFRESH_TIMEOUT);
-    if !ok {
-        match benilla_protocol::logon(&req.host, &req.user, &req.pass, req.locale) {
+    let mut emptied = None;
+    if !ok && !logon.realmd_live() && logon.can_redial() {
+        let kept = logon.pin().map(<[u8]>::to_vec);
+        let mut press = |grid: &[u8; 10]| {
+            redial_digits(kept.as_deref(), crate::run_mode::EnvPin::process())
+                .and_then(|digits| benilla_protocol::auth::pin::positions(grid, &digits))
+                .ok_or_else(|| anyhow!("the re-dial has no PIN to press"))
+        };
+        // A hidden re-dial for the realm list: no logon on the screen to tell the states to.
+        match benilla_protocol::logon_with_pin(
+            &req.host,
+            &req.user,
+            &req.pass,
+            req.locale,
+            &mut press,
+            &mut |_| {},
+        ) {
             Ok(fresh) => {
                 *logon = fresh;
-                ok = true;
+                ok = !logon.realms_refused;
             }
-            Err(e) => bevy::log::warn!("net: realm list re-dial failed: {e:#}"),
+            Err(e) => {
+                bevy::log::warn!("net: realm list re-dial failed: {e:#}");
+                if logon.pin().is_some() && e.downcast_ref::<AuthReject>().is_some() {
+                    logon.forget_pin();
+                }
+                logon.realms.clear();
+                emptied = Some(redial_failure(&e));
+            }
         }
     }
-    publish(events_tx, &logon.realms, !ok)
+    let refused = logon.realms_refused.then_some(RealmListEmptied::ListFailed);
+    publish(events_tx, &logon.realms, !ok, emptied.or(refused))
+}
+
+/// What a failed re-dial ends a query with, read as the reconnect it stands in for: a proof's
+/// result of 9 or 10 is `0x5b2860`'s arm for 2 or 3 (`0x5b28be`, `0x5b2893`, by the table at
+/// `0x5b2910`); any other is its arm for 1 (`0x5b28dd`), as a refused challenge (`0x5bae37`), a
+/// failed dial and a dropped link are through `0x5b2c9e`.
+fn redial_failure(e: &anyhow::Error) -> RealmListEmptied {
+    match e.downcast_ref::<AuthReject>() {
+        Some(AuthReject {
+            code: 9 | 10,
+            reply: benilla_protocol::LogonReply::Proof,
+        }) => RealmListEmptied::ListFailed,
+        _ => RealmListEmptied::SessionExpired,
+    }
+}
+
+/// The PIN digits a re-dial's prompt is answered with: the environment's, derived from the clock
+/// as the prompt arrives (a TOTP code moves on every 30 s, so one kept from the first logon is
+/// stale after a long park), else the digits the logon proved.
+fn redial_digits(kept: Option<&[u8]>, env: &crate::run_mode::EnvPin) -> Option<Vec<u8>> {
+    match env.digits_now() {
+        Ok(Some(digits)) => Some(digits),
+        _ => kept.map(<[u8]>::to_vec),
+    }
 }
 
 /// The pre-logon park: waits for credentials. With no realmd link, a realm list query fails at
@@ -444,7 +503,7 @@ fn login_park(parks: &Parks, events_tx: &Sender<SessionEvent>) -> Option<LoginRe
             recv(park_rx) -> msg => match msg {
                 Err(_) => Some(None),
                 Ok(ParkRequest::Realm(RealmRequest::Refresh)) => {
-                    (!publish(events_tx, &[], true)).then_some(None)
+                    (!publish(events_tx, &[], true, None)).then_some(None)
                 }
                 Ok(_) => None,
             },
@@ -482,10 +541,62 @@ fn logon_park(
                     Some(LogonAnswer::Enter(realm, generation))
                 }
                 Ok(ParkRequest::Realm(RealmRequest::Close)) => Some(LogonAnswer::Close),
-                // No world session here to leave, and no character screen to ask.
-                Ok(ParkRequest::Realm(RealmRequest::Leave) | ParkRequest::Char(_)) => None,
+                // No world session here to leave, no character screen to ask and no keypad.
+                Ok(ParkRequest::Realm(RealmRequest::Leave | RealmRequest::Pin { .. })
+                    | ParkRequest::Char(_)) => None,
             },
             recv(login_rx) -> msg => Some(msg.map_or(LogonAnswer::Exit, LogonAnswer::Login)),
+        };
+        if let Some(answer) = answer {
+            return answer;
+        }
+    }
+}
+
+/// PIN prompts made this process, each numbered from 1, so keys are only ever proved on the grid
+/// they were pressed on.
+static PIN_PROMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// The keypad's answer of no keys: no screen stood to show it ([`RealmRequest::Pin`]).
+#[derive(Debug)]
+struct NoPinEntry;
+
+impl std::fmt::Display for NoPinEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the account asks for a PIN and no screen can enter it")
+    }
+}
+
+impl std::error::Error for NoPinEntry {}
+
+/// The logon at the keypad (logon state 7, `0x5b1cd7`): waits for the keys `PINEntered` hands on
+/// for this `prompt` (`0x5ab5a0` → `0x5b3120`); keys for another prompt are dropped. No keys
+/// ([`NoPinEntry`]), a Cancel (`0x5b3320`, its close behind a moved generation: one an older
+/// attempt left is stale), the app's exit and a new login each end the wait with an error, the new
+/// login handed back to supersede the attempt; anything else asked meanwhile is dropped, as no
+/// screen asks it there.
+fn keypad(
+    parks: &Parks,
+    prompt: u64,
+    canceled: &dyn Fn() -> bool,
+) -> (Result<Vec<u8>>, Option<LoginRequest>) {
+    let Parks {
+        login_rx, park_rx, ..
+    } = parks;
+    loop {
+        // No `break` or `continue` inside the `select!` arms (`login_park`).
+        let answer = crossbeam_channel::select! {
+            recv(park_rx) -> msg => match msg {
+                Err(_) => Some((Err(anyhow!("the app is gone")), None)),
+                Ok(ParkRequest::Realm(RealmRequest::Pin { prompt: p, keys })) if p == prompt => {
+                    Some((keys.map(|k| k.positions).ok_or_else(|| NoPinEntry.into()), None))
+                }
+                Ok(ParkRequest::Realm(RealmRequest::Close)) if canceled() => {
+                    Some((Err(anyhow!("the PIN entry was cancelled")), None))
+                }
+                Ok(_) => None,
+            },
+            recv(login_rx) -> msg => Some((Err(anyhow!("a new login superseded the PIN entry")), msg.ok())),
         };
         if let Some(answer) = answer {
             return answer;
@@ -517,9 +628,32 @@ fn run(
             let _ = events_tx.send(SessionEvent::LoginStage { stage: s });
         };
 
-        // Logon: the dial and the SRP6 exchange against realmd.
+        // Logon: the dial and the SRP6 exchange against realmd, waiting at the keypad when the
+        // challenge asks for a PIN.
         stage(LoginStage::Connecting);
-        let mut logon = match benilla_protocol::logon(&req.host, &req.user, &req.pass, req.locale) {
+        let mut superseded = None;
+        let logon = benilla_protocol::logon_with_pin(
+            &req.host,
+            &req.user,
+            &req.pass,
+            req.locale,
+            &mut |grid| {
+                let prompt = PIN_PROMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                stage(LoginStage::Pin {
+                    grid: *grid,
+                    prompt,
+                });
+                let (answer, next) = keypad(parks, prompt, &canceled);
+                superseded = next;
+                answer
+            },
+            &mut |s| stage(s),
+        );
+        if let Some(next) = superseded {
+            req = next;
+            continue 'logon;
+        }
+        let mut logon = match logon {
             Ok(l) => l,
             Err(e) => {
                 if canceled() {
@@ -527,16 +661,22 @@ fn run(
                 }
                 // A dial that never opened a socket, the one failure the screen can advise on.
                 let dial = e.downcast_ref::<benilla_protocol::DialFailure>().cloned();
-                // A server refusal carries its auth result byte for the `AUTH_*` string; a
-                // transport failure carries none.
-                let refusal = e.downcast_ref::<AuthReject>().map(|r| match r.reply {
-                    benilla_protocol::LogonReply::Challenge => {
-                        benilla_protocol::LoginRefusal::Logon(r.code)
-                    }
-                    benilla_protocol::LogonReply::Proof => {
-                        benilla_protocol::LoginRefusal::LogonProof(r.code)
-                    }
-                });
+                // A server refusal carries its auth result byte for the `AUTH_*` string, and a PIN
+                // no screen could enter is the client's own; a transport failure carries none.
+                let refusal = e
+                    .downcast_ref::<AuthReject>()
+                    .map(|r| match r.reply {
+                        benilla_protocol::LogonReply::Challenge => {
+                            benilla_protocol::LoginRefusal::Logon(r.code)
+                        }
+                        benilla_protocol::LogonReply::Proof => {
+                            benilla_protocol::LoginRefusal::LogonProof(r.code)
+                        }
+                    })
+                    .or_else(|| {
+                        e.downcast_ref::<NoPinEntry>()
+                            .map(|_| benilla_protocol::LoginRefusal::NoPinEntry)
+                    });
                 let _ = events_tx.send(SessionEvent::LoginFailed {
                     refusal: if dial.is_some() { None } else { refusal },
                     reason: format!("{e:#}"),
@@ -556,7 +696,9 @@ fn run(
         //
         // An answer queued during a dead cycle must not answer this list.
         while parks.park_rx.try_recv().is_ok() {}
-        if !publish(events_tx, &logon.realms, false) {
+        let refused = logon.realms_refused;
+        let emptied = refused.then_some(RealmListEmptied::ListFailed);
+        if !publish(events_tx, &logon.realms, refused, emptied) {
             return Ok(Cycle::Exit);
         }
         let mut pick = match logon_park(&mut logon, &req, parks, events_tx) {
@@ -769,6 +911,8 @@ fn world(
                         }
                         // `ConnectToRealm` with the world up drops it first (`0x46b22b`).
                         Ok(ParkRequest::Realm(RealmRequest::Leave)) => Parked::Leave,
+                        // No logon waits at a keypad here.
+                        Ok(ParkRequest::Realm(RealmRequest::Pin { .. })) => Parked::StayPut,
                         Ok(ParkRequest::Char(CharRequest::Enter(guid))) => Parked::Play(guid),
                         // Select's Back: drop the parked session, return to the login park.
                         Ok(ParkRequest::Char(CharRequest::Abandon)) => Parked::Repark,
@@ -790,13 +934,36 @@ fn world(
                                 characters = c;
                                 Parked::Listed
                             }
+                            // The reply failed the list: it is emptied (`0x5b4539`-`0x5b455d`) and
+                            // the screen's query fails (`0x5ab300`), on a link that stays up.
+                            Err(e) if e.is::<benilla_protocol::CharListFailed>() => {
+                                characters.clear();
+                                let sent = events_tx.send(SessionEvent::RosterFailed {
+                                    epoch,
+                                    emptied: true,
+                                });
+                                if sent.is_ok() {
+                                    Parked::StayPut
+                                } else {
+                                    Parked::Exit
+                                }
+                            }
                             // The stream failed under the ask: the screen's query fails
                             // (`0x5ab300`), and the session ends as a dropped socket does.
                             Err(e) => {
-                                let _ = events_tx.send(SessionEvent::RosterFailed { epoch });
+                                let _ = events_tx.send(SessionEvent::RosterFailed {
+                                    epoch,
+                                    emptied: false,
+                                });
                                 return Err(e);
                             }
                         },
+                        // The select build's guild lookup missed (`0x560e30`): the query goes out,
+                        // and nothing here waits for its answer.
+                        Ok(ParkRequest::Char(CharRequest::GuildQuery(guild_id))) => {
+                            session.guild_query(guild_id)?;
+                            Parked::StayPut
+                        }
                     },
                     recv(login_rx) -> msg => msg.map_or(Parked::Exit, Parked::Login),
                     recv(link_check) -> _ => match session.poll_link() {
@@ -807,6 +974,15 @@ fn world(
                     },
                 };
                 note_warden(&session, &mut warden_noted);
+                // A guild's answer, whichever read took it, goes up as in the world stream.
+                for record in session.take_guild_answers() {
+                    if events_tx
+                        .send(SessionEvent::GuildQueryResponse(record))
+                        .is_err()
+                    {
+                        return Ok(WorldEnd::Cycle(Cycle::Exit));
+                    }
+                }
                 let (action, code) = match answer {
                     Parked::Exit => return Ok(WorldEnd::Cycle(Cycle::Exit)),
                     Parked::Repark => return Ok(WorldEnd::Cycle(Cycle::Repark)),
@@ -875,7 +1051,7 @@ fn world(
             // again ([`query`]).
             logon.close();
             // No `CMSG_SET_ACTIVE_MOVER` here: it waits for our own player's create, as the
-            // reference's does (`super::enter_world_on_self_create`); a server may drop it before then.
+            // reference's does (the arrival, `0x5deb5b`); a server may drop it before then.
             session.player_login(refuse_once(guid))?;
 
             let billing = session.billing();
@@ -953,6 +1129,18 @@ enum StreamEnd {
     Back(&'static str),
 }
 
+/// A packet's events in the order the app hears them. A saved store's answer sends its bytes
+/// ([`SessionEvent::SavedAnswer`]) ahead of its decoded record, so a store never holds a record
+/// whose bytes are still on the way.
+pub(crate) fn inbound(opcode: u16, events: Vec<SessionEvent>, body: Vec<u8>) -> Vec<SessionEvent> {
+    if !crate::wdb::is_saved_answer(opcode) {
+        return events;
+    }
+    std::iter::once(SessionEvent::SavedAnswer { opcode, body })
+        .chain(events)
+        .collect()
+}
+
 /// The world stream: every packet off the socket into [`SessionEvent`]s until a logout or a refused
 /// character login ends the world session, the socket fails or the app exits.
 fn stream(
@@ -992,7 +1180,7 @@ fn stream(
                         &wire_trace::in_line(opcode, events.len(), &body),
                     );
                 }
-                for ev in events {
+                for ev in inbound(opcode, events, body) {
                     // The pong bypass: the reference's `OnData` (`0x537b10`) hands `SMSG_PONG` to
                     // `HandlePong` (`0x537d60`) inline, not onto the game thread's queue, so it is
                     // timed and consumed here.
@@ -1330,6 +1518,9 @@ pub(super) fn writer_loop(
                         w.pet_name_query(pet_number, guid)
                     }
                     ClientCommand::ItemQuery { entry, guid } => w.item_query(entry, guid),
+                    ClientCommand::ItemNameQuery { entry, guid } => {
+                        w.item_name_query(entry, guid)
+                    }
                     ClientCommand::UseItem {
                         bag_index,
                         slot,
@@ -1337,6 +1528,7 @@ pub(super) fn writer_loop(
                         target,
                     } => w.use_item(bag_index, slot, spell_index, target),
                     ClientCommand::OpenItem { bag_index, slot } => w.open_item(bag_index, slot),
+                    ClientCommand::ReadItem { bag, slot } => w.read_item(bag, slot),
                     ClientCommand::WrapItem {
                         gift_bag,
                         gift_slot,
@@ -1415,6 +1607,7 @@ pub(super) fn writer_loop(
                         enabled,
                     } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
                     ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
+                    ClientCommand::RequestPetInfo => w.request_pet_info(),
                     ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
                     ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
                     ClientCommand::AttackStop => w.attack_stop(),
@@ -1504,6 +1697,12 @@ pub(super) fn writer_loop(
                     ClientCommand::MeetingStoneJoin { go_guid } => w.meeting_stone_join(go_guid),
                     ClientCommand::MeetingStoneLeave => w.meeting_stone_leave(),
                     ClientCommand::MeetingStoneStatusQuery => w.meeting_stone_status_query(),
+                    ClientCommand::RequestAccountData { section } => {
+                        w.request_account_data(section)
+                    }
+                    ClientCommand::UpdateAccountData { section, contents } => {
+                        w.update_account_data(section, &contents)
+                    }
                     ClientCommand::TutorialFlag { id } => w.tutorial_flag(id),
                     ClientCommand::TutorialClear => w.tutorial_clear(),
                     ClientCommand::TutorialReset => w.tutorial_reset(),
@@ -1579,6 +1778,9 @@ pub(super) fn writer_loop(
                     ClientCommand::CastSpellTradeItem { spell_id, slot } => {
                         w.cast_spell_trade_item(spell_id, slot)
                     }
+                    ClientCommand::CastSpellTargets { spell_id, target } => {
+                        w.cast_spell_targets(spell_id, target)
+                    }
                     ClientCommand::LootMasterGive { guid, slot, target } => {
                         w.loot_master_give(guid, slot, target)
                     }
@@ -1652,8 +1854,8 @@ pub(super) fn writer_loop(
                         mail_id,
                         template_id,
                     } => w.mail_create_text_item(mailbox, mail_id, template_id),
-                    ClientCommand::ItemTextQuery { text_id, mail_id } => {
-                        w.item_text_query(text_id, mail_id)
+                    ClientCommand::ItemTextQuery { text_id, key } => {
+                        w.item_text_query(text_id, key)
                     }
                     ClientCommand::QueryNextMailTime => w.query_next_mail_time(),
                     // The auction house: the auctioneer guid rides on every verb.

@@ -3,7 +3,7 @@
 use crate::messages::{CastOutcome, Object, ObjectFields, ObjectType, ServerPacket};
 use crate::wire::Vector3d;
 
-use super::{EntityKind, MoveSpeeds, NotifyBlock, SessionEvent};
+use super::{EntityKind, MoveSpeeds, NotifyBlock, SessionEvent, TransportClock};
 
 fn v3(v: Vector3d) -> [f32; 3] {
     [v.x, v.y, v.z]
@@ -31,7 +31,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         } => decode_objects(first_pass, objects),
         // In order, each move as if alone: the app rebuilds a mover's arc from packet order.
         ServerPacket::CompressedMoves { packets } => packets.into_iter().flat_map(decode).collect(),
-        ServerPacket::CharEnum { characters } => vec![SessionEvent::CharacterList {
+        ServerPacket::CharEnum { characters, .. } => vec![SessionEvent::CharacterList {
             characters,
             realm: None,
             cause: super::RosterCause::Unasked,
@@ -46,6 +46,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::LogoutResponse { reason, instant }]
         }
         ServerPacket::LogoutCancelAck => vec![SessionEvent::LogoutCancelled],
+        ServerPacket::ClearFarSightImmediate => vec![SessionEvent::FarSightCleared],
         ServerPacket::PlaySound { sound_id } => vec![SessionEvent::PlaySound { sound_id }],
         ServerPacket::PlayMusic { music_id } => vec![SessionEvent::PlayMusic { music_id }],
         ServerPacket::PlayObjectSound { sound_id, guid } => {
@@ -130,6 +131,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 model_id,
                 position: [position.x, position.y, position.z],
             }]
+        }
+        ServerPacket::ItemNameQueryResponse { entry, name } => {
+            vec![SessionEvent::ItemName { entry, name }]
         }
         ServerPacket::ItemQueryResponse { entry, info } => {
             vec![SessionEvent::ItemTemplate { entry, info }]
@@ -229,6 +233,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 misses: s.misses,
                 target: s.targets.unit_target,
                 go_target: s.targets.go_target,
+                target_mask: s.targets.mask,
+                source: s.targets.source.map(|d| [d.x, d.y, d.z]),
                 dest: s.targets.dest.map(|d| [d.x, d.y, d.z]),
                 ammo_display_id: s.ammo_display_id,
                 // Against the resolved caster: a GameObject's own guid in slot 1 is not an item.
@@ -532,6 +538,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             launch,
         }],
         ServerPacket::GroupInvite { inviter } => vec![SessionEvent::GroupInvite { inviter }],
+        ServerPacket::GroupCancel => vec![SessionEvent::GroupCancel],
         ServerPacket::GroupDecline { name } => vec![SessionEvent::GroupDecline { name }],
         ServerPacket::GroupUninvited => vec![SessionEvent::GroupUninvited],
         ServerPacket::GroupLeaderChanged { name } => {
@@ -625,6 +632,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::IgnoreList { guids } => vec![SessionEvent::IgnoreList { guids }],
         ServerPacket::FriendStatus(status) => vec![SessionEvent::FriendStatus(status)],
         ServerPacket::WhoResults(results) => vec![SessionEvent::WhoResults(results)],
+        ServerPacket::LookingForGroup(results) => vec![SessionEvent::LfgResults(results)],
         ServerPacket::GuildQueryResponse(response) => {
             vec![SessionEvent::GuildQueryResponse(response)]
         }
@@ -739,7 +747,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }],
         ServerPacket::TransferPending { map, transport } => vec![SessionEvent::TransferPending {
             map_id: map,
-            transport_entry: transport.map(|(entry, _old_map)| entry),
+            transport_entry: transport.map(|(entry, _)| entry),
+            from_map: transport.map(|(_, from_map)| from_map),
         }],
         ServerPacket::TransferAborted { reason } => {
             vec![SessionEvent::TransferAborted { reason }]
@@ -752,7 +761,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::ServerUnixTime { unix_time }]
         }
         ServerPacket::BindPoint { area, .. } => vec![SessionEvent::BindPoint { area }],
-        ServerPacket::GmTicketAnswer { ticket } => vec![SessionEvent::GmTicket { ticket }],
+        ServerPacket::GmTicketAnswer { status, ticket } => {
+            vec![SessionEvent::GmTicket { status, ticket }]
+        }
         ServerPacket::GmTicketCreated { response } => {
             vec![SessionEvent::GmTicketCreated { response }]
         }
@@ -806,6 +817,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::MeetingStoneSetQueue { area, status }]
         }
         ServerPacket::MeetingStoneNotice(notice) => vec![SessionEvent::MeetingStoneNotice(notice)],
+        ServerPacket::AccountDataMd5(md5) => vec![SessionEvent::AccountDataMd5(md5.digests)],
+        ServerPacket::UpdateAccountData(data) => vec![SessionEvent::UpdateAccountData(data)],
         ServerPacket::TutorialFlags(flags) => vec![SessionEvent::TutorialFlags(flags.bytes)],
         ServerPacket::PlayerBound { binder, area } => {
             vec![SessionEvent::PlayerBound { binder, area }]
@@ -919,6 +932,22 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::GameObjectDespawnAnim { guid } => {
             vec![SessionEvent::GameObjectDespawnAnim { guid }]
         }
+        ServerPacket::GameObjectResetState { guid } => {
+            vec![SessionEvent::GameObjectResetState { guid }]
+        }
+        ServerPacket::GameObjectPageText { guid } => {
+            vec![SessionEvent::GameObjectPageText { guid }]
+        }
+        ServerPacket::ReadItemOk { guid } => vec![SessionEvent::ReadItemOk { guid }],
+        ServerPacket::ReadItemFailed {
+            guid,
+            reason,
+            milliseconds,
+        } => vec![SessionEvent::ReadItemFailed {
+            guid,
+            reason,
+            milliseconds,
+        }],
         ServerPacket::OpenContainer { item } => vec![SessionEvent::OpenContainer { item }],
         ServerPacket::StandStateUpdate { state } => {
             vec![SessionEvent::StandStateUpdate { state }]
@@ -964,8 +993,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 flags,
                 pitch,
                 time,
-                // The opcode's meaning is the speed, carried by its own event: the pose is plain.
-                verb: crate::messages::RelayVerb::Pose,
+                // The opcode's meaning is the speed, carried by its own event: the pose is plain,
+                // and its packet goes on to the speed.
+                verb: crate::messages::RelayVerb::Speed,
                 fall_time,
                 jump,
                 transport,
@@ -1124,7 +1154,8 @@ fn decode_objects(first_pass: bool, objects: Vec<Object>) -> Vec<SessionEvent> {
             // Deviation: an out-of-range list past the first block reads no body in the write
             // passes (`0x466076`), which misread every block behind it, while the notify pass
             // reads past it (`0x465fd0`) and stays in step; benilla reads the list and drops it,
-            // keeping the blocks behind it whole.
+            // keeping the blocks behind it whole, because the faults the reference's passes have on
+            // malformed packets are recorded, not copied.
             Object::OutOfRange { guids } => {
                 if at == 0 {
                     first.push(SessionEvent::ObjectsRemoved(guids));
@@ -1141,7 +1172,7 @@ fn decode_objects(first_pass: bool, objects: Vec<Object>) -> Vec<SessionEvent> {
             // Deviation: the flagged pass reads a movement block's guid as 8 raw bytes
             // (`0x467140`, `0x46714d`) where the wire packs it, so unless the packed guid happens
             // to be 8 bytes the reference misreads the rest of that pass; benilla reads the block
-            // once, packed, as pass 0 does (`0x467080`).
+            // once, packed, as pass 0 does (`0x467080`), because of the misreading just described.
             Object::Movement { guid, movement } => {
                 if let Some((position, orientation)) = movement.position {
                     second.push(SessionEvent::ObjectMove {
@@ -1225,7 +1256,12 @@ fn create_event(
         scale: object_scale(object_type, &mask),
         speeds: movement.speeds.map(MoveSpeeds::from_wire),
         mover: movement.mover,
-        transport_progress: movement.transport_progress,
+        transport_progress: movement
+            .transport_progress
+            .map(|progress_ms| TransportClock {
+                progress_ms,
+                arrived: None,
+            }),
         transport: movement.transport,
         spline: movement.spline,
         fields: mask,

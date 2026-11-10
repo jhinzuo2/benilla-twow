@@ -17,11 +17,14 @@ use benilla_assets::materials::WowModelMaterial;
 
 use super::booth::{redress_booth_batches, set_grip, BoothBatch, BoothRig};
 use super::framing::{attachment_point, diag_to_vert, stock_pane_view, PORTRAIT_ASPECT};
+use super::panes::StandChain;
 use super::{
     aim, body_frame, new_target_image, spawn_booth_effects, spawn_booth_model, Booth,
     BoothBillboardSpec, BoothCam, BoothEffects, BoothInstance, BoothLight, BoothMotion, BoothPart,
     BoothRider, BoothTwins, Booths, PortraitImages, PortraitSource, VariantLane, GLUE_LAYER,
 };
+
+pub(super) mod trace;
 
 /// The glue booth slot token (its key in [`super::PortraitImages`] / [`Booths`]).
 pub(crate) const GLUE_SLOT: &str = "glue";
@@ -54,6 +57,8 @@ pub(crate) struct SelectLook {
     pub(crate) hair_style: u8,
     pub(crate) hair_color: u8,
     pub(crate) facial_hair: u8,
+    /// The record's guild, which a guild tabard's crest comes from; 0 for none.
+    pub(crate) guild_id: u32,
     /// `CHARACTER_FLAG_*` bits; the builder honours hide-helm and hide-cloak.
     pub(crate) flags: u32,
     pub(crate) equipment: [benilla_protocol::CharEnumItem; 19],
@@ -83,6 +88,7 @@ impl From<&benilla_protocol::Character> for SelectLook {
             hair_style: c.hair_style,
             hair_color: c.hair_color,
             facial_hair: c.facial_hair,
+            guild_id: c.guild_id,
             flags: c.flags,
             equipment: c.equipment,
             pet_display_id: c.pet_display_id,
@@ -301,18 +307,12 @@ pub(crate) struct CreateScene {
     /// The character's stage spot, scene attachment 0 in Bevy model space (`ZERO` with no scene);
     /// the body seats on attachment 0 at select too (`0x473039`).
     char_spot: Vec3,
-    /// The stage's authored frame, attachment 0's bone rotation and uniform scale
-    /// ([`stage_frame`]); identity and 1.0 with no scene.
-    char_facing: Quat,
-    char_scale: f32,
     /// The pet's spot, scene attachment 1 (`0x47306b` seats the secondary model there). Every
     /// `UI_*` scene authors exactly attachments 0 and 1, both on parentless root bones.
     pet_root: Entity,
     pet_spot: Vec3,
-    /// Attachment 1's bone frame, read like [`Self::char_facing`]. UI_Human's holds the same
-    /// −16.5° yaw and 0.97 scale as attachment 0; UI_Tauren's holds 0.7324 on the pet's bone alone.
-    pet_facing: Quat,
-    pet_stage_scale: f32,
+    /// The family ramp scale of the pet standing at the seat.
+    pet_scale: f32,
     /// The revision of the pet bake standing at [`Self::pet_spot`], so a re-bake happens once.
     pet_baked: Option<u64>,
     /// The fog the spawn wrote; the scene rebuilds when it changes.
@@ -358,11 +358,7 @@ struct ParkedScene {
     file: GlueSceneFile,
     handle: Handle<M2Model>,
     char_spot: Vec3,
-    char_facing: Quat,
-    char_scale: f32,
     pet_spot: Vec3,
-    pet_facing: Quat,
-    pet_stage_scale: f32,
     stage: u64,
     clock_ms: u64,
 }
@@ -376,12 +372,9 @@ impl CreateScene {
             handle: None,
             spawned: false,
             char_spot: Vec3::ZERO,
-            char_facing: Quat::IDENTITY,
-            char_scale: 1.0,
             pet_root,
             pet_spot: Vec3::ZERO,
-            pet_facing: Quat::IDENTITY,
-            pet_stage_scale: 1.0,
+            pet_scale: 1.0,
             pet_baked: None,
             fog: None,
             stage: 0,
@@ -425,11 +418,7 @@ impl CreateScene {
                     file,
                     handle,
                     char_spot: self.char_spot,
-                    char_facing: self.char_facing,
-                    char_scale: self.char_scale,
                     pet_spot: self.pet_spot,
-                    pet_facing: self.pet_facing,
-                    pet_stage_scale: self.pet_stage_scale,
                     stage: self.stage,
                     clock_ms: self.clock_ms,
                 });
@@ -443,7 +432,7 @@ impl CreateScene {
         // A fresh root for the incoming spawn, whose materials are its own; a resumed scene
         // brings its root back.
         if returning.is_none() {
-            self.root = commands.spawn(stage_root(layer)).id();
+            self.root = commands.spawn(scene_root_bundle(layer)).id();
         }
         self.spawned = false;
         self.char_spot = Vec3::ZERO;
@@ -459,11 +448,7 @@ impl CreateScene {
         self.file = Some(p.file);
         self.handle = Some(p.handle);
         self.char_spot = p.char_spot;
-        self.char_facing = p.char_facing;
-        self.char_scale = p.char_scale;
         self.pet_spot = p.pet_spot;
-        self.pet_facing = p.pet_facing;
-        self.pet_stage_scale = p.pet_stage_scale;
         self.stage = p.stage;
         self.clock_ms = p.clock_ms;
         self.spawned = true;
@@ -487,8 +472,6 @@ impl CreateScene {
         self.handle = None;
         self.spawned = false;
         self.char_spot = Vec3::ZERO;
-        self.char_facing = Quat::IDENTITY;
-        self.char_scale = 1.0;
         clear_pet(commands, self);
         true
     }
@@ -732,6 +715,8 @@ pub(crate) struct GluePreviewBake {
     pub(crate) grip: [bool; 2],
     /// The selection's ghost kit ([`GhostKit`]); its effect models are already in the lists above.
     pub(crate) ghost: Option<GhostKit>,
+    /// The crest a select record's tabard wears in these parts, once its guild's record is held.
+    pub(crate) emblem: Option<benilla_formats::GuildEmblem>,
     pub(crate) revision: u64,
 }
 
@@ -803,7 +788,7 @@ pub(super) fn spawn_glue_booth(
         Booth::new(layer.clone(), root, image),
     );
     // The background scene's own root; the character root yaws, this one never does.
-    let scene_root = commands.spawn(stage_root(&layer)).id();
+    let scene_root = commands.spawn(scene_root_bundle(&layer)).id();
     // The pet's root never yaws: the reference's facing call turns only the character (`0x4730e0`).
     let pet_root = commands.spawn(stage_root(&layer)).id();
     commands.insert_resource(CreateScene::empty(scene_root, pet_root));
@@ -818,6 +803,16 @@ fn stage_root(layer: &RenderLayers) -> impl Bundle {
         Visibility::Visible,
         layer.clone(),
         benilla_world::rig_anim::SceneClock(0.0),
+    )
+}
+
+/// The background scene's root: a model frame creates its model with flags 5 (`0x76ccf5`), which
+/// turns depth fill off (`0x707a48`), so its batches sort each by its own centre; the character
+/// beside it is created with flags 0 (`0x470bd5`) and keeps it.
+fn scene_root_bundle(layer: &RenderLayers) -> impl Bundle {
+    (
+        stage_root(layer),
+        benilla_world::model_render::order::NoDepthFill,
     )
 }
 
@@ -1064,14 +1059,7 @@ pub(super) fn sync_glue_scene(
             "glue scene: {name} resumed at {} ms on its own clock",
             scene.clock_ms
         );
-        apply_yaw(
-            &mut commands,
-            booth.root,
-            scene.char_spot,
-            scene.char_facing,
-            scene.char_scale,
-            preview.yaw,
-        );
+        apply_yaw(&mut commands, booth.root, scene.char_spot, preview.yaw);
     }
     if !scene.spawned {
         let Some(model) = scene.handle.as_ref().and_then(|h| m2s.get(h)) else {
@@ -1082,12 +1070,6 @@ pub(super) fn sync_glue_scene(
         }
         // The scene's light, in its own buffer so the portraits' studio light is untouched.
         let stage = attachment_point(&model.skeleton, &model.attachments, 0).unwrap_or(Vec3::ZERO);
-        // The stage's frame, not just its point ([`stage_frame`]).
-        let (stage_facing, stage_scale) = model
-            .attachments
-            .iter()
-            .find(|a| a.id == 0)
-            .map_or((Quat::IDENTITY, 1.0), |a| stage_frame(model, a.bone));
         let rig = if ghost {
             ghost_rig()
         } else {
@@ -1132,8 +1114,8 @@ pub(super) fn sync_glue_scene(
             .iter()
             .enumerate()
             .map(|(pi, s)| {
-                // The authored batch order (index + 1) is all that separates batches sharing the
-                // scene root's sort distance.
+                // The authored batch order (index + 1) keys the batch's own material; the
+                // transparent order sorts it (`benilla_world::model_render::order`).
                 let order = u16::try_from(pi + 1).unwrap_or(u16::MAX);
                 // The scene's own material, never another scene's of the same file: its UV and
                 // tint rows run on this scene's clock and go with it.
@@ -1219,6 +1201,8 @@ pub(super) fn sync_glue_scene(
             &booth.layer,
             Some(&light),
             &model.emitters,
+            // A scene loops its one authored clip forever, as a doodad does.
+            benilla_world::particles::EmitClock::Pinned,
         );
         if emitters > 0 {
             info!(
@@ -1229,39 +1213,20 @@ pub(super) fn sync_glue_scene(
         scene_rig.finish(&mut commands);
         scene.spawned = true;
         scene.char_spot = stage;
-        scene.char_facing = stage_facing;
-        scene.char_scale = stage_scale;
-        // The pet's seat: attachment 1, frame and all.
+        // The pet's seat: attachment 1 ([`seat_on_stage_bones`] follows its bone from here).
         scene.pet_spot =
             attachment_point(&model.skeleton, &model.attachments, 1).unwrap_or(Vec3::ZERO);
-        let (pet_facing, pet_stage_scale) = model
-            .attachments
-            .iter()
-            .find(|a| a.id == 1)
-            .map_or((Quat::IDENTITY, 1.0), |a| stage_frame(model, a.bone));
-        scene.pet_facing = pet_facing;
-        scene.pet_stage_scale = pet_stage_scale;
         // A rebuilt scene moved the seat, so the standing pet re-seats.
         scene.pet_baked = None;
         scene.rev += 1; // the character re-lights onto the scene rig (sync_glue_booth's key)
         info!(
-            "create scene: {name} up — {} submeshes, {} camera(s), stage {:?} facing {:.2}° \
-             scale {:.3}",
+            "create scene: {name} up — {} submeshes, {} camera(s), stage {:?}",
             model.submeshes.len(),
             model.cameras.len(),
             scene.char_spot,
-            scene.char_facing.to_euler(EulerRot::YXZ).0.to_degrees(),
-            scene.char_scale,
         );
         // Seat the character at the current facing (the yaw path below runs only on a change).
-        apply_yaw(
-            &mut commands,
-            booth.root,
-            scene.char_spot,
-            scene.char_facing,
-            scene.char_scale,
-            preview.yaw,
-        );
+        apply_yaw(&mut commands, booth.root, scene.char_spot, preview.yaw);
     }
     // The installed camera owns the booth camera while the scene shows, every frame: the pane's
     // camera of the file's table, or with none the orthographic leg (`0x76ceeb` installs no
@@ -1482,13 +1447,17 @@ type StageLanes<'w> = (
 pub(super) struct GlueStanding {
     /// The bake revision, yaw and scene revision last committed.
     last: Option<(u64, f32, u64)>,
-    /// The create character standing as one instance a re-dress keeps. `None` for a select
-    /// record, an empty stage or a boneless bake.
-    create: Option<StandingCreate>,
+    /// The body standing as one instance a re-dress keeps. `None` for an empty stage or a
+    /// boneless bake.
+    body: Option<StandingBody>,
 }
 
-/// The create body standing: one `CharacterModel` while its display and its stage last.
-struct StandingCreate {
+/// The body standing: one `CharacterModel` while its display and its stage last.
+struct StandingBody {
+    /// The look it stands for: another select record is another model (`record+0x110`).
+    look: GlueLook,
+    /// The crest its tabard wears.
+    emblem: Option<benilla_formats::GuildEmblem>,
     /// The race and sex body: a change is the builder's new model (`0x470b70`).
     display: u32,
     /// The stage it was built on ([`GluePreview::stage`]): every create `OnShow` builds anew, its
@@ -1557,7 +1526,8 @@ type StandingRig<'a> = (
 /// The create character is one model across its customizations and class re-dresses, which
 /// update it in place (`0x478790` and kin, `0x470800`); only the race and sex builder `0x470b70`
 /// makes a new one. So a create bake on the standing body display re-dresses the standing
-/// instance ([`redress_booth_batches`]) and its clock runs on; anything else spawns afresh.
+/// instance ([`redress_booth_batches`]) and its clock runs on. A select record's model stays too
+/// when its crest lands (`0x472420` → `0x47a610`); anything else spawns afresh.
 pub(super) fn sync_glue_booth(
     mut commands: Commands,
     preview: Res<GluePreview>,
@@ -1580,16 +1550,9 @@ pub(super) fn sync_glue_booth(
     let Some(booth) = booths.0.get_mut(GLUE_SLOT) else {
         return;
     };
-    let (spot, stage, stage_scale, scene_rev) =
-        scene
-            .as_deref()
-            .map_or((Vec3::ZERO, Quat::IDENTITY, 1.0, 0), |s| {
-                if s.spawned {
-                    (s.char_spot, s.char_facing, s.char_scale, s.rev)
-                } else {
-                    (Vec3::ZERO, Quat::IDENTITY, 1.0, s.rev)
-                }
-            });
+    let (spot, scene_rev) = scene.as_deref().map_or((Vec3::ZERO, 0), |s| {
+        (if s.spawned { s.char_spot } else { Vec3::ZERO }, s.rev)
+    });
     let (last_rev, last_yaw, last_scene) = state.last.unwrap_or((u64::MAX, f32::NAN, u64::MAX));
     // `sync_glue_scene` runs first and commits a stage only beside its character, so a standing
     // stage matching the request means this bake may show ([`PendingSwap`]).
@@ -1611,15 +1574,8 @@ pub(super) fn sync_glue_booth(
             booth.rigged = false;
             booth.parked = false;
             state.last = Some((bake.revision, preview.yaw, scene_rev));
-            state.create = None;
-            apply_yaw(
-                &mut commands,
-                booth.root,
-                spot,
-                stage,
-                stage_scale,
-                preview.yaw,
-            );
+            state.body = None;
+            apply_yaw(&mut commands, booth.root, spot, preview.yaw);
             return;
         }
         // The rig comes from the display cache the builder gated on; if not ready, retry.
@@ -1782,15 +1738,17 @@ pub(super) fn sync_glue_booth(
             &booth_effects,
             scene_buf.as_ref(),
         );
-        // The standing create body, kept when this bake wears the same display on the same stage
-        // ([`StandingCreate`]).
-        let create = matches!(bake.look, Some(GlueLook::Create(_)));
-        let keep = create
-            && !instance.feathering()
-            && state
-                .create
-                .as_ref()
-                .is_some_and(|c| c.display == bake.display_id && c.stage == preview.stage);
+        // The standing body, kept when this bake wears the same display on the same stage
+        // ([`StandingBody`]): a create look's every dressing, or a select record's new crest.
+        let keep = !instance.feathering()
+            && state.body.as_ref().is_some_and(|b| {
+                let same_model = match (b.look, bake.look) {
+                    (GlueLook::Create(_), Some(GlueLook::Create(_))) => true,
+                    (GlueLook::Select(_), Some(look)) => look == b.look && bake.emblem != b.emblem,
+                    _ => false,
+                };
+                same_model && b.display == bake.display_id && b.stage == preview.stage
+            });
         let standing = if keep {
             standing_rigs
                 .get(booth.root)
@@ -1829,7 +1787,7 @@ pub(super) fn sync_glue_booth(
                     slot,
                     instance,
                 );
-                if state.create.as_ref().is_none_or(|c| c.hung != hung) {
+                if state.body.as_ref().is_none_or(|b| b.hung != hung) {
                     // The outfit changed: the old items come off with their anchors, and the new
                     // ones hang on a fresh pose buffer the root's player re-poses before it draws.
                     for c in kids.iter().filter(|c| !worn.iter().any(|(w, _)| w == *c)) {
@@ -1889,6 +1847,13 @@ pub(super) fn sync_glue_booth(
                     &booth_effects,
                     instance,
                 );
+                // Every glue body chains its Stand: a select record's model (`0x472b87`) and the
+                // create body (`0x470bfa`), which a re-dress leaves running.
+                if let (Some(_), Some(anims)) = (bake.look, rig.animations) {
+                    commands
+                        .entity(booth.root)
+                        .insert(StandChain::armed(anims, anim_data.as_deref().map(|a| &a.0)));
+                }
                 // A fresh bake is animated by construction; the park state is the new rig's.
                 booth.rigged = booth_rig.rigged();
                 let slot = booth_rig.slot();
@@ -1906,11 +1871,16 @@ pub(super) fn sync_glue_booth(
                 None => benilla_world::instance_tint::IDENTITY,
             },
         );
-        state.create = (create && booth.rigged).then_some(StandingCreate {
-            display: bake.display_id,
-            stage: preview.stage,
-            hung,
-        });
+        state.body = match bake.look {
+            Some(look) if booth.rigged => Some(StandingBody {
+                look,
+                emblem: bake.emblem,
+                display: bake.display_id,
+                stage: preview.stage,
+                hung,
+            }),
+            _ => None,
+        };
         // The fallback framing with no scene up: the model's `<PlayerModel>` pane camera, at the
         // bake's aspect, as it shows only for the frames before the scene's camera takes over.
         let (t, _) = body_frame(&anchors, 1.0);
@@ -1933,14 +1903,7 @@ pub(super) fn sync_glue_booth(
             );
         }
     }
-    apply_yaw(
-        &mut commands,
-        booth.root,
-        spot,
-        stage,
-        stage_scale,
-        preview.yaw,
-    );
+    apply_yaw(&mut commands, booth.root, spot, preview.yaw);
     // A yaw-only pass must not record revisions it did not commit, or a held pair never retries.
     state.last = Some((
         if rebake { bake.revision } else { last_rev },
@@ -2151,12 +2114,19 @@ pub(super) fn sync_glue_pet(
             .as_ref()
             .map(|ibp| (rig.skeleton, ibp, rig.animations)),
         anim_data.as_deref().map(|a| &a.0),
-        BoothMotion::Loop, // Stand, looping, like the character
+        BoothMotion::Loop, // Stand, like the character
         [false, false],    // …and no hands to grip with
         &booth_billboards,
         BoothInstance::default(),
     );
-    // The pet's own emitters, on its own bones, scaled with `pet_root` (`sizeByInstanceScale`).
+    // The pet chains its Stand as the character does (`0x472e99`).
+    if let Some(anims) = rig.animations {
+        commands
+            .entity(scene.pet_root)
+            .insert(StandChain::armed(anims, anim_data.as_deref().map(|a| &a.0)));
+    }
+    // The pet's own emitters, on its own bones, scaled with `pet_root` (`sizeByInstanceScale`),
+    // their tracks on the variation it plays.
     let (emitters, fx_frames) = super::spawn_booth_own_emitters(
         &mut commands,
         &mut pet_rig,
@@ -2164,14 +2134,15 @@ pub(super) fn sync_glue_pet(
         &booth.layer,
         Some(&light),
         &pet.emitters,
+        benilla_world::particles::EmitClock::Host(scene.pet_root),
     );
     // `anchor` writes the pose buffer, `finish` commits it.
     pet_rig.finish(&mut commands);
-    // The seat: attachment 1's whole frame, times the family ramp scale.
+    // The seat at bind pose, times the family ramp scale; the bone's frame comes next
+    // ([`seat_on_stage_bones`]).
+    scene.pet_scale = pet.scale.max(0.01);
     commands.entity(scene.pet_root).insert(
-        Transform::from_translation(scene.pet_spot)
-            .with_rotation(scene.pet_facing)
-            .with_scale(Vec3::splat(pet.scale.max(0.01) * scene.pet_stage_scale)),
+        Transform::from_translation(scene.pet_spot).with_scale(Vec3::splat(scene.pet_scale)),
     );
     scene.pet_baked = Some(pet.revision);
     info!(
@@ -2197,55 +2168,61 @@ fn clear_pet(commands: &mut Commands, scene: &mut CreateScene) {
     scene.pet_baked = None;
 }
 
-/// Seat the model root on the stage `spot` in the stage's frame, facing `yaw` (the reference's
-/// `Model:SetRotation`, about the root's own origin).
-fn apply_yaw(
-    commands: &mut Commands,
-    root: Entity,
-    spot: Vec3,
-    stage: Quat,
-    stage_scale: f32,
-    yaw: f32,
-) {
-    commands.entity(root).insert(
-        Transform::from_translation(spot)
-            .with_rotation(stage * Quat::from_rotation_y(yaw))
-            .with_scale(Vec3::splat(stage_scale)),
-    );
+/// Seat the model root on the stage `spot` at bind pose, facing `yaw` (the reference's
+/// `Model:SetRotation`, about the root's own origin); [`seat_on_stage_bones`] then puts it in the
+/// bone's frame.
+fn apply_yaw(commands: &mut Commands, root: Entity, spot: Vec3, yaw: f32) {
+    commands
+        .entity(root)
+        .insert(Transform::from_translation(spot).with_rotation(Quat::from_rotation_y(yaw)));
 }
 
-/// The stage's authored frame: the constant rotation and uniform scale parked on attachment
-/// `bone`'s chain. The reference composes an attachment's whole frame, not only its point
-/// (`0x71439b` in `0x714260`). `UI_Human` keys its stage bones with a constant −16.5° yaw to face
-/// its off-axis camera; the other race scenes leave them unrotated. The scale is uniform on every
-/// shipped scene, so `x` stands for it.
-fn stage_frame(model: &M2Model, bone: u16) -> (Quat, f32) {
-    let Some(anims) = model.animations.as_ref() else {
-        return (Quat::IDENTITY, 1.0);
+/// A child's seat under a scene bone: the bone's whole animated matrix, moved to the attachment's
+/// position, the composed result of `0x7140d8`-`0x714149`. The child's own turn and scale go in
+/// its frame, under the bone's.
+fn stage_seat(bone: bevy::math::Affine3A, offset: Vec3, own: Transform) -> Transform {
+    let mut seat = bone;
+    seat.translation = bone.transform_point3(offset).into();
+    Transform::from_matrix(Mat4::from(seat) * own.to_matrix())
+}
+
+/// Seats the body and the pet on attachments 0 and 1 of the standing scene every frame, from the
+/// scene rig's pose: a seat's keys, a parent's and keys that move all reach them. A scene with no
+/// posed rig keeps the bind-pose seats its build wrote.
+pub(super) fn seat_on_stage_bones(
+    mut seats: Query<&mut Transform>,
+    scene: Option<Res<CreateScene>>,
+    booths: Res<Booths>,
+    preview: Res<GluePreview>,
+    m2s: Res<Assets<M2Model>>,
+    rigs: Query<&benilla_world::rig_anim::RigPose>,
+) {
+    let (Some(scene), Some(booth)) = (scene, booths.0.get(GLUE_SLOT)) else {
+        return;
     };
-    let mut rot = Quat::IDENTITY;
-    let mut scale = 1.0;
-    let mut idx = bone;
-    // Cycle-guarded by the joint count, as the pivot walk is.
-    for _ in 0..=model.skeleton.joints.len() {
-        if let Some(g) = anims.global_bones.iter().find(|g| g.bone == idx) {
-            // `t = 0`: these are parked keys, and no stage bone animates.
-            if let Some(c) = g.rotation.as_ref() {
-                rot = c.sample(0.0) * rot;
-            }
-            if let Some(c) = g.scale.as_ref() {
-                scale *= c.sample(0.0).x;
-            }
-        }
-        let Some(joint) = model.skeleton.joints.get(usize::from(idx)) else {
-            break;
+    if !scene.spawned {
+        return;
+    }
+    let Some(model) = scene.handle.as_ref().and_then(|h| m2s.get(h)) else {
+        return;
+    };
+    let Ok(pose) = rigs.get(scene.root) else {
+        return;
+    };
+    let body = Transform::from_rotation(Quat::from_rotation_y(preview.yaw));
+    let pet = Transform::from_scale(Vec3::splat(scene.pet_scale));
+    for (id, root, own) in [(0, booth.root, body), (1, scene.pet_root, pet)] {
+        let Some(a) = model.attachments.iter().find(|a| a.id == id) else {
+            continue;
         };
-        match u16::try_from(joint.parent) {
-            Ok(parent) => idx = parent,
-            Err(_) => break, // -1 = root reached
+        let Some(bone) = pose.model.get(usize::from(a.bone)) else {
+            continue;
+        };
+        if let Ok(mut t) = seats.get_mut(root) {
+            // A still seat leaves the booth's transform unchanged.
+            t.set_if_neq(stage_seat(*bone, a.offset, own));
         }
     }
-    (rot, scale)
 }
 
 /// The create preview instrument:
@@ -2641,6 +2618,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             },
+            guild_id: 0,
             flags: 0,
             equipment: [benilla_protocol::CharEnumItem::default(); 19],
             pet_display_id: 517,
@@ -2938,6 +2916,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_seat_takes_the_bones_whole_matrix_at_the_attachment() {
+        // UI_CharacterSelect's seat: a half turn and 0.673 keyed on the bone, which also moves.
+        let half_turn = Quat::from_rotation_y(std::f32::consts::PI);
+        let bone = bevy::math::Affine3A::from_scale_rotation_translation(
+            Vec3::splat(0.5),
+            half_turn,
+            Vec3::new(1.0, 2.0, 3.0),
+        );
+        let quarter = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let seat = stage_seat(bone, Vec3::X, Transform::from_rotation(quarter));
+        assert!(seat.translation.abs_diff_eq(Vec3::new(0.5, 2.0, 3.0), 1e-5));
+        assert!(seat.scale.abs_diff_eq(Vec3::splat(0.5), 1e-5));
+        assert!(seat.rotation.dot(half_turn * quarter).abs() > 0.9999);
+    }
+
     fn create(sex: u8, class: u8, skin: u8, hair_style: u8) -> GlueLook {
         GlueLook::Create(CreateLook {
             race: 1,
@@ -3207,6 +3201,82 @@ mod tests {
             [false, false],
         );
         assert_eq!(stand_at(&app, root), 0.0);
+    }
+
+    /// A crest landing on the record that stands (`0x472420` → `0x47a610`) dresses its model in
+    /// place: the same batches, on the crested body, with the Stand clock running on.
+    #[test]
+    fn a_landed_crest_keeps_the_select_model_and_its_clock() {
+        let (mut app, root) = booth_app();
+        let record = GlueLook::Select(SelectLook::from(
+            &crate::glue_session::roster::test_character(1, "Rec"),
+        ));
+        bake(
+            &mut app,
+            record,
+            HUMAN_MALE,
+            vec![part(1, 10)],
+            Vec::new(),
+            [false, false],
+        );
+        run_stand_to(&mut app, root, 1.25);
+        let before = worn(&mut app, root);
+
+        let mut baked = app.world_mut().resource_mut::<GluePreviewBake>();
+        let revision = baked.revision + 1;
+        *baked = GluePreviewBake {
+            look: Some(record),
+            display_id: HUMAN_MALE,
+            parts: vec![part(1, 20)],
+            emblem: Some(benilla_formats::GuildEmblem::default()),
+            revision,
+            ..default()
+        };
+        app.update();
+
+        assert_eq!(stand_at(&app, root), 1.25, "the crest keeps the clock");
+        let after = worn(&mut app, root);
+        assert_eq!(after[0].1, before[0].1, "the same batch entity stands");
+        assert_eq!(after[0].2, handle::<WowModelMaterial>(20).id());
+    }
+
+    /// Each glue body registers the Stand chain, a select record's model (`0x472b87` → `0x473090`)
+    /// and the create body (`0x470bfa` → `0x470c90`, the same body), and a re-dress of the create
+    /// body leaves it on.
+    #[test]
+    fn a_create_body_and_a_select_model_each_carry_the_stand_chain() {
+        let (mut app, root) = booth_app();
+        let chained = |app: &App| app.world().get::<StandChain>(root).is_some();
+        bake(
+            &mut app,
+            create(0, 1, 0, 0),
+            HUMAN_MALE,
+            vec![part(1, 10)],
+            Vec::new(),
+            [false, false],
+        );
+        assert!(chained(&app), "the create body's");
+        bake(
+            &mut app,
+            create(0, 1, 3, 0),
+            HUMAN_MALE,
+            vec![part(1, 20)],
+            Vec::new(),
+            [false, false],
+        );
+        assert!(chained(&app), "a skin change keeps it");
+        let record = GlueLook::Select(SelectLook::from(
+            &crate::glue_session::roster::test_character(1, "Rec"),
+        ));
+        bake(
+            &mut app,
+            record,
+            HUMAN_MALE,
+            vec![part(1, 30)],
+            Vec::new(),
+            [false, false],
+        );
+        assert!(chained(&app), "a select record's");
     }
 
     // ── The stage's clock ────────────────────────────────────────────────
@@ -3601,11 +3671,7 @@ mod tests {
             file: GlueSceneFile::new("UI_MainMenu.mdx"),
             handle: Handle::default(),
             char_spot: Vec3::ZERO,
-            char_facing: Quat::IDENTITY,
-            char_scale: 1.0,
             pet_spot: Vec3::ZERO,
-            pet_facing: Quat::IDENTITY,
-            pet_stage_scale: 1.0,
             stage: 1,
             clock_ms: 0,
         });

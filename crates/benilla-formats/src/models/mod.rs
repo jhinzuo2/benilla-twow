@@ -15,6 +15,7 @@ mod key_anim;
 mod m2_batches;
 mod mat_anim;
 mod records;
+mod sort_order;
 mod tex_anim;
 mod types;
 mod wmo;
@@ -27,6 +28,7 @@ pub use key_anim::{KeyAnim, SeqLoops};
 pub use m2_batches::*;
 pub use mat_anim::{AlphaAnim, AlphaSeq, RgbAnim, ScalarAnim};
 pub use records::*;
+pub use sort_order::*;
 pub use tex_anim::{rotation_2x2, uv_transform, UvAnim, UvRotAnim};
 pub use types::*;
 pub use wmo::*;
@@ -63,6 +65,7 @@ fn remap_submesh(
             positions,
             normals,
             uvs,
+            uvs2: Vec::new(),
             indices,
             texture,
             // The per-batch fields start at their defaults; the M2 and WMO paths set their own.
@@ -100,6 +103,7 @@ fn remap_submesh(
             stage1: None,
             combine: 1,
             section: None,
+            order: None,
         },
         globals,
     )

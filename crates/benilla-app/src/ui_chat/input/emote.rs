@@ -7,6 +7,7 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
+use benilla_protocol::EntityKind;
 use benilla_ui::script::EmoteRequest;
 
 use super::{emote_gate, emote_target, EmoteGate};
@@ -26,8 +27,10 @@ pub(crate) struct EmoteDoer<'w, 's> {
     /// Our stand state and move flags for the gates, and the entity the stow and play are for.
     player: Query<'w, 's, (Entity, &'static MovementState), With<SelfPlayer>>,
     store: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
-    /// Our own auto-attack target, a gate of the local play.
-    engaged: Query<'w, 's, (), (With<SelfPlayer>, With<crate::creature_anim::Engaged>)>,
+    /// The units in view, which `IsSelfControlled` follows a possessed unit's charmer through.
+    units: Query<'w, 's, (&'static ObjectStore, &'static crate::net::NetEntity)>,
+    /// Our own auto-attack target as the queued unit edits leave it, a gate of the local play.
+    edits: Option<Res<'w, crate::creature_anim::UnitEdits>>,
     loot_kneel: Option<Res<'w, crate::ui_loot::LootKneel>>,
     /// Where the moving refusal shows inside the call (`0x496720`).
     sink: crate::ui_action::MessageSink<'w>,
@@ -118,9 +121,17 @@ impl EmoteDoer<'_, '_> {
         // The `0x4000` arm's red line (`0x5ef5d0`), only while self-controlled, so a feared or
         // confused player emotes normally.
         let controlled = || {
-            self.store
-                .single()
-                .is_ok_and(|s| crate::player::self_controlled(s.0.unit_flags()))
+            self.store.single().is_ok_and(|s| {
+                crate::player::self_controlled((&s.0, true), |guid| {
+                    let (store, entity) = self.units.get(*self.guids.0.get(&guid)?).ok()?;
+                    // The lookup's mask 0x8 takes units and players (`0x5fa5a5`).
+                    match entity.kind {
+                        EntityKind::Player => Some((&store.0, true)),
+                        EntityKind::Unit => Some((&store.0, false)),
+                        _ => None,
+                    }
+                })
+            })
         };
         if gate == EmoteGate::Moving && controlled() {
             debug!("chat: emote {text_id} refused — moving (ERR_NOEMOTEWHILERUNNING)");
@@ -171,7 +182,11 @@ impl EmoteDoer<'_, '_> {
                 flying: m.flying,
                 loot_kneel: self.loot_kneel.as_deref().is_some_and(|k| k.0),
                 channeling: fields.unit_channel_spell() != 0,
-                engaged: !self.engaged.is_empty(),
+                engaged: self.player.single().is_ok_and(|(me, _)| {
+                    self.edits
+                        .as_deref()
+                        .is_some_and(|edits| edits.attacking(me))
+                }),
             };
             if crate::creature_anim::local_play_eligible(&gate) {
                 if let (Some(out), Some(seq)) = (self.out.anim.as_mut(), self.out.play_seq.as_mut())

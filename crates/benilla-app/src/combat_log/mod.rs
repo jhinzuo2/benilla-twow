@@ -60,6 +60,8 @@ pub(crate) struct Ctx<'w> {
     ranges: Res<'w, CombatLogRanges>,
     /// `CombatLogPeriodicSpells`.
     periodic: Res<'w, LogPeriodicSpells>,
+    /// The wire an item line's lookup asks on.
+    net: Option<Res<'w, crate::net::NetCommands>>,
 }
 
 impl Ctx<'_> {
@@ -76,17 +78,20 @@ impl Ctx<'_> {
             enchants: self.enchants.as_deref().map(|e| &e.0),
             items: None,
             gameobjects: None,
+            net: self.net.as_deref(),
             ranges: &self.ranges,
             periodic: self.periodic.0,
         }
     }
 }
 
-/// The caches `LogOpenLock` reads (`0xc0e2a0`, `0xc0e318`). They stay out of [`Ctx`] because
+/// The caches `LogOpenLock` reads (`0xc0e2a0`, `0xc0e318`), the item cache also the item lines'
+/// lookups (`0x628f83`, `0x629650`, `0x6297a0`, `0x6298e1`) and their callback's formatters
+/// (`0x629513`). They stay out of [`Ctx`] because
 /// `on_missile_miss` runs in `Update` with it, and the sound systems that write the item cache run
 /// there too: a claim on a cache no line of that leg reads would only add undeclared orders.
 #[derive(SystemParam)]
-struct LockCaches<'w> {
+pub(crate) struct LockCaches<'w> {
     items: Option<Res<'w, crate::items::Items>>,
     gameobjects: Option<Res<'w, crate::go_templates::GameObjectTemplates>>,
 }
@@ -129,10 +134,11 @@ impl Plugin for CombatLogPlugin {
             .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log)
             .net_handler(K::XpGain, on_xp_gain)
             .net_handler(K::ExplorationXp, on_exploration_xp)
-            .net_handler(K::LevelUp, on_level_up)
             .net_handler(K::PvpCredit, on_pvp_credit)
             // Written by the missile flight; declared here too, as registering is idempotent.
             .add_message::<MissileMiss>()
+            // Where the lines' plate flashes fire; declared here too, as registering is idempotent.
+            .init_resource::<crate::field_watch::NoticeLane>()
             // After the flight that writes the arrivals (`entities::move_missiles`), so the
             // flash and the line queue together, in `0x61dd50`'s order, the frame the missile
             // lands. The flight runs after the frame's feeds (the sheath request it follows is
@@ -156,10 +162,19 @@ fn on_attacker_state(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     }
 }
 
-fn on_spell_damage_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_damage_log(
+    In(ev): In<SessionEvent>,
+    c: Ctx,
+    mut l: Sinks,
+    mut notices: ResMut<crate::field_watch::NoticeLane>,
+) {
     if let SessionEvent::SpellDamageLog(s) = ev {
         let ctx = c.ctx();
-        chat::spell_damage_log(s, &ctx, &l.stores, &l.poses, &l.log);
+        // The direct hit's flash runs ahead of its line (`0x62ce43`): its place is taken first.
+        let at = crate::lanes::stamp();
+        if let Some(victim) = chat::spell_damage_log(s, &ctx, &l.stores, &l.poses, &l.log) {
+            notices.write_at(at, plate_flash(victim));
+        }
         text::spell_damage_log(
             s,
             &c.index,
@@ -385,11 +400,30 @@ fn on_dispel_failed(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     }
 }
 
-fn on_enchantment_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
+fn on_enchantment_log(In(ev): In<SessionEvent>, c: Ctx, caches: LockCaches, l: Sinks) {
     if let SessionEvent::EnchantmentLog(e) = ev {
-        let ctx = c.ctx();
+        let ctx = chat::ChatCtx {
+            items: caches.items.as_deref(),
+            ..c.ctx()
+        };
         chat::enchantment_log(e, &ctx, &l.stores, &l.poses, &l.log);
     }
+}
+
+/// The combat log's item callback (`0x6294b0`), run in its answer's list for a record or a
+/// refusal ([`chat::item_answered`]).
+pub(crate) fn item_answered(
+    In((kind, item, answered)): In<(crate::ui_chat::combat::ItemLog, u32, bool)>,
+    c: Ctx,
+    caches: LockCaches,
+    l: Sinks,
+) {
+    let ctx = chat::ChatCtx {
+        items: caches.items.as_deref(),
+        gameobjects: caches.gameobjects.as_deref(),
+        ..c.ctx()
+    };
+    chat::item_answered(kind, item, answered, &ctx, &l.stores, &l.poses, &l.log);
 }
 
 fn on_spell_log_execute(In(ev): In<SessionEvent>, c: Ctx, caches: LockCaches, l: Sinks) {
@@ -403,10 +437,27 @@ fn on_spell_log_execute(In(ev): In<SessionEvent>, c: Ctx, caches: LockCaches, l:
     }
 }
 
-fn on_environmental_damage_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
+fn on_environmental_damage_log(
+    In(ev): In<SessionEvent>,
+    c: Ctx,
+    l: Sinks,
+    mut notices: ResMut<crate::field_watch::NoticeLane>,
+) {
     if let SessionEvent::EnvironmentalDamageLog(e) = ev {
         let ctx = c.ctx();
-        chat::environmental_damage_log(e, &ctx, &l.stores, &l.poses, &l.log);
+        // The flash runs ahead of the line (`0x62abac`): its place is taken first.
+        let at = crate::lanes::stamp();
+        if let Some(victim) = chat::environmental_damage_log(e, &ctx, &l.stores, &l.poses, &l.log) {
+            notices.write_at(at, plate_flash(victim));
+        }
+    }
+}
+
+/// `FlashNamePlate` (`0x6122e0`) on a line's victim, inside its packet.
+fn plate_flash(guid: u64) -> crate::field_watch::FieldNotice {
+    crate::field_watch::FieldNotice::Plate {
+        guid,
+        call: crate::vplates::PlateCall::Flash,
     }
 }
 
@@ -443,12 +494,6 @@ fn on_exploration_xp(
             &mut server_sounds,
             &l.log,
         );
-    }
-}
-
-fn on_level_up(In(ev): In<SessionEvent>, l: Sinks) {
-    if let SessionEvent::LevelUp(lv) = ev {
-        text::level_up(lv, &l.log);
     }
 }
 
@@ -663,6 +708,8 @@ mod tests {
             }],
             target: Some(ME),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: None,
@@ -704,6 +751,8 @@ mod tests {
             }],
             target: Some(ME),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: (item || (second != 0 && first != second)).then_some(first),
@@ -923,10 +972,12 @@ mod tests {
     /// line first, then the animation layer's, which runs ahead of it.
     fn swing_world(held: &[u64]) -> App {
         let mut app = world(held);
+        // The landed swing's far-victim stop sends on the wire (`0x5ea8a8`).
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.insert_resource(crate::net::NetCommands(tx));
         app.add_message::<crate::creature_anim::SwingMessage>()
             .add_message::<crate::creature_anim::SwingImpact>()
             .add_message::<crate::creature_anim::SheathRequest>()
-            .add_message::<crate::swing_refusal::SwingRefusalEdge>()
             .init_resource::<crate::creature_anim::PendingImpacts>()
             .init_resource::<crate::creature_anim::PlaySeq>()
             .init_resource::<crate::creature_anim::AttackStopInFlight>()
@@ -985,6 +1036,42 @@ mod tests {
             kinds(&app),
             ["combat", "unit combat", "combat", "unit combat"]
         );
+    }
+
+    /// The swing's log step triggers Spells and Abilities for a swing of the active player's
+    /// whose victim state is 1, a hit (`0x629b1a`-`0x629b37`), on the state the record read
+    /// left; a dodge, or a hit on us, triggers nothing.
+    #[test]
+    fn our_own_landed_swing_triggers_spells_and_abilities() {
+        let swing = |attacker: u64, victim: u64, victim_state: u32| {
+            SessionEvent::AttackerState(benilla_protocol::messages::AttackerState {
+                attacker,
+                victim,
+                hit_info: 0x2,
+                damage: 30,
+                victim_state,
+                absorb: 0,
+                resist: 0,
+                blocked: 0,
+                melee_spell_id: 0,
+                school: 0,
+            })
+        };
+        let mut app = swing_world(&[ME, MOB]);
+        app.init_resource::<crate::tutorial::Tutorials>();
+        app.world()
+            .resource::<crate::tutorial::Tutorials>()
+            .lock()
+            .apply_flags(&[0u8; 32]);
+        let fired = |app: &mut App, ev: SessionEvent| {
+            crate::net::handlers::dispatch(app.world_mut(), vec![ev]);
+            app.world()
+                .resource::<crate::tutorial::Tutorials>()
+                .take_fired()
+        };
+        assert!(fired(&mut app, swing(ME, MOB, 2)).is_empty(), "a dodge");
+        assert!(fired(&mut app, swing(MOB, ME, 1)).is_empty(), "a hit on us");
+        assert_eq!(fired(&mut app, swing(ME, MOB, 1)), [0x06], "our hit");
     }
 
     /// `HandleUnitCombatMessage` signals `PLAYER_ENTER_COMBAT` inside our `SMSG_ATTACKSTART`

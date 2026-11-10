@@ -26,7 +26,7 @@ pub(in crate::script) fn update(lua: &Lua, h: FrameHandle, dt: f32) {
 /// before the key or click acts.
 ///
 /// Deviation: the promotion's IME legs (`0x77d417`–`0x77d431`) and the IME writer's `or 6`
-/// (`0x77acde`, in `0x77ac60`) are not modelled: benilla has no IME composition.
+/// (`0x77acde`, in `0x77ac60`) are not modelled because benilla has no IME composition.
 pub(super) fn flush(lua: &Lua, h: FrameHandle) {
     let Some((entry, owed, left)) = with_eb(lua, h, |eb| {
         (eb.dirty, eb.relayout_owed, !eb.caret_in_window())
@@ -89,11 +89,18 @@ fn cursor_changed(lua: &Lua, h: FrameHandle) -> bool {
         return false;
     }
     // Already in the box's own units, as the measure answers.
-    let Some(line_h) =
-        super::ensure_text_region(lua, h).and_then(|rh| relayout::line_height(lua, h, rh))
-    else {
+    let Some(rh) = super::ensure_text_region(lua, h) else {
         return false;
     };
+    let Some(line_h) = relayout::line_height(lua, h, rh) else {
+        return false;
+    };
+    let justify_h = super::super::region::justify_word(
+        &lua.app_data_ref::<crate::script::Model>()
+            .expect("model app_data"),
+        rh,
+    )
+    .0 & crate::justify::H_MASK;
     let args = with_eb(lua, h, |eb| {
         let display = eb.display();
         if eb.advances.len() != display.len() + 1 {
@@ -122,7 +129,7 @@ fn cursor_changed(lua: &Lua, h: FrameHandle) -> bool {
         } else {
             a[cursor_d] - a[line_start]
         };
-        let x = match eb.justify & crate::justify::H_MASK {
+        let x = match justify_h {
             0x01 => along,
             0x02 => along - (a[line_end] - a[line_start]) * 0.5,
             0x04 if cursor_d == line_end => 0.0,

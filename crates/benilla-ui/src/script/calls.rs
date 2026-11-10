@@ -124,12 +124,21 @@ pub enum ScriptCall {
     RandomRoll { min: u32, max: u32 },
     /// `RequestTimePlayed()` (`0x48a900`): the empty `CMSG_PLAYED_TIME`, sent at `0x48a936`.
     RequestTimePlayed,
+    /// `OpeningCinematic()` (`0x48c8c0`): the empty `CMSG_OPENING_CINEMATIC`, sent at `0x48c8f6`.
+    OpeningCinematic,
     /// `DoEmote(token, target)` (`0x49fd30`) past its empty-token check: the host finds the
     /// `EmotesText` row by name (`0x49fd72`-`0x49fda6`), resolves the target (`0x49fdb1`-`0x49fdee`)
     /// and runs `0x5ef560` (`0x49fe16`), its gates, posture, play and `CMSG_TEXT_EMOTE`.
     DoEmote(super::EmoteRequest),
     /// `UninviteByName(name)` (`0x48a610`): `CMSG_GROUP_UNINVITE` (`0x75`), sent at `0x48a669`.
     Uninvite(String),
+    /// `LoggingChat(flag)` and `LoggingCombat(flag)` (`0x49fe50`) called with an argument, the VM's
+    /// flag already set: with it on and no log open the host opens the log (`0x49fea2`) and a
+    /// failed open clears the flag (`0x49feab`); with it off the host closes the file.
+    Logging {
+        /// `LoggingCombat`, else `LoggingChat`.
+        combat: bool,
+    },
     /// `SendAddonMessage(prefix, message, type)` (`0x49f920`) past its checks: the send at
     /// `0x49faff`.
     AddonMessage(super::AddonSend),
@@ -202,6 +211,284 @@ pub enum ScriptCall {
     /// A stable request past its binding's checks ([`super::StableCall`]): its packet inside the
     /// call.
     Stable(super::StableCall),
+    /// A session verb ([`super::SessionRequest`]): the logout's request, its cancel, the quit,
+    /// the reload's flag and the cinematic's stop, inside the call (`0x489390` → `0x5ab000`).
+    Session(super::SessionRequest),
+    /// A tutorial verb ([`super::TutorialCall`]): the bank's write and its packet inside the call
+    /// (`0x4b59dc` → `0x4b54c0`).
+    Tutorial(super::TutorialCall),
+    /// A bank verb ([`super::BankCall`]): `PurchaseSlot`'s refusal or packet, `CloseBankFrame`'s
+    /// close core, inside the call.
+    Bank(super::BankCall),
+    /// A profession window verb ([`super::TradeSkillCall`]): `DoTradeSkill`'s cast, the close's
+    /// marker, inside the call.
+    TradeSkill(super::TradeSkillCall),
+    /// The craft window's close ([`super::CraftCall`]): its marker, inside the call.
+    Craft(super::CraftCall),
+    /// A battleground verb ([`super::BattlefieldCall`]): its refusal, its packet and its throttle
+    /// inside the call.
+    Battlefield(super::BattlefieldCall),
+    /// A death verb ([`super::DeathAction`]): its gates and its packet, or the soulstone's item
+    /// use, inside the call.
+    Death(super::DeathAction),
+    /// A duel verb ([`super::DuelRequest`]): its packet or the duel spell's cast inside the call.
+    Duel(super::DuelRequest),
+    /// A group loot vote ([`super::LootRollCall`]): its packet inside the call, ahead of
+    /// `CANCEL_LOOT_ROLL`, and the engine's close after it.
+    LootRoll(super::LootRollCall),
+    /// The innkeeper's Accept ([`super::BinderCall`]): its packet inside the call.
+    Binder(super::BinderCall),
+    /// The summon's Accept ([`super::SummonCall`]): its packet inside the call.
+    Summon(super::SummonCall),
+    /// The meeting stone's leave ([`super::MeetingStoneCall`]): its refusal or packet inside the
+    /// call.
+    MeetingStone(super::MeetingStoneCall),
+    /// The lockouts' reset ([`super::InstanceCall`]): its packet inside the call.
+    Instance(super::InstanceCall),
+    /// The PvP flag's toggle ([`super::PvpCall`]): its packet inside the call.
+    Pvp(super::PvpCall),
+    /// `ShowHelm` or `ShowCloak` ([`super::WornDisplaySet`]): the model's piece and the toggle
+    /// the live bit owes, inside the call (`0x5ee660`-`0x5ee8d0`).
+    WornDisplay(super::WornDisplaySet),
+    /// An action bar verb's step ([`super::ActionBarCall`]): the toggles' send, a slot write
+    /// stored and sent ahead of its signal (`0x4e58e0`), or the usable cache's refresh.
+    ActionBar(super::ActionBarCall),
+    /// A GM ticket verb's packet, or `Stuck`'s cast ([`super::GmTicketCall`]), inside the call.
+    GmTicket(super::GmTicketCall),
+    /// A send of a system no 1.12 server runs ([`super::UnservedSend`]), inside its verb.
+    Unserved(super::UnservedSend),
+    /// An inspect verb ([`super::InspectCall`]): its packet and the target it sets inside the
+    /// call.
+    Inspect(super::InspectCall),
+    /// An item text verb ([`super::ItemTextCall`]): the page move and its ask, or the close core,
+    /// inside the call.
+    ItemText(super::ItemTextCall),
+    /// An aura cancel ([`super::AuraCall`]): `0x6e7040` whole inside the call.
+    Aura(super::AuraCall),
+    /// A minimap verb ([`super::MinimapCall`]): the ping or the ground cast inside the call.
+    Minimap(super::MinimapCall),
+    /// A posture verb ([`super::PostureCall`]): the stand-state setter inside the call.
+    Posture(super::PostureCall),
+    /// A getter's lookup with a callback on a record its mirror misses ([`RecordAsk`]): the host
+    /// asks the cache inside the call, which sends the query on the miss (`0x556aa0`).
+    RecordAsk(RecordAsk),
+    /// A `ConsoleExec` line that is no CVar write: `ConsoleCommandExecute` (`0x63ce00`) inside the
+    /// call (`0x515f43`), a registered command, a CVar's print or `Unknown command`.
+    Console(String),
+    /// A CVar write a verb made in the VM's mirror (`SetCVar`, `ConsoleExec`'s `set` and resets):
+    /// `CVar::Set` (`0x63df50`) runs the row's change callback inside the write (`0x63df7d`), so
+    /// the host takes the queued writes into its registry and runs their callbacks before the verb
+    /// goes on ([`super::cvars::written`]).
+    CvarWritten,
+    /// A camera-view verb ([`super::CameraViewRequest`]): `SetView`, `SaveView`, `ResetView`,
+    /// `NextView`, `PrevView` or `FlipCameraYaw`, seated on the camera inside the call, its CVar
+    /// writes with it (`0x512f17`, `0x50fa09`).
+    CameraView(super::CameraViewRequest),
+    /// `gxRestart`'s handler (`0x639f60`), run inside `RestartGx`, `SetScreenResolution` and
+    /// `SetMultisampleFormat` (through `0x63ce00`, which calls it synchronously) and
+    /// `RestoreVideoDefaults` (directly, `0x639a51`): the host commits the latched display rows
+    /// (`0x639ec0`) and runs their callbacks before the verb goes on.
+    RestartGx,
+    /// A dressing-room verb ([`super::DressUpIntent`]): `Dress`, `Undress`, `TryOn`, or `SetUnit`
+    /// and `RefreshUnit` on a `DressUpModel`, applied to the room inside the call; a cached
+    /// record's try-on goes on, or refuses with `ERR_NOT_EQUIPPABLE`, there (`0x504540`).
+    DressUp(super::DressUpIntent),
+    /// `FollowUnit` or `FollowByName` ([`super::FollowRequest`]): the start gate, its refusal's
+    /// line or the follow armed and `AUTOFOLLOW_BEGIN` signalled, inside the call (`0x60fed0`).
+    Follow(super::FollowRequest),
+    /// A plate verb (`ShowNameplates` `0x489450` and its three siblings): its bit of
+    /// `[0xc4da34]` written inside the call ([`super::PlateBitWrite`]).
+    Nameplates(super::PlateBitWrite),
+    /// `ConfirmPetUnlearn()` (`0x48dca0` → `0x5dfba0(0, 0)`): `CMSG_PET_UNLEARN` to the
+    /// remembered trainer, or the money refusal's line, inside the call.
+    ConfirmPetUnlearn,
+    /// A step of the world click a mouse command takes ([`super::ClickCall`]): the arm's pick at
+    /// the press (`ArmClick 0x514810` → `0x481f00`), or the last primary's release and its
+    /// dispatch (`ReleaseCommands 0x514b70` → `DispatchWorldClick 0x481f60`), inside the call.
+    WorldClick(super::ClickCall),
+    /// A nameplate's click ([`super::PlateClick`]): `ClickObjectByAction` (`0x7cb92a` →
+    /// `0x4949f0`) on the plate's unit, its select, or its select and the unit's interact, inside
+    /// the click and ahead of the plate's `OnClick`.
+    PlateClick(super::PlateClick),
+    /// A movement or camera binding function's call ([`super::BindingInput`]) on the engine's
+    /// input state, inside the call: a command bit pressed or released through `SetCommands`
+    /// (`0x515090`) with the cast cancel a new direction makes (`0x5150ce`-`0x515193`), a
+    /// one-shot, or a camera axis.
+    Input(super::BindingInput),
+    /// A look-session call ([`super::LookCall`]) on the camera's mouse state, inside the call:
+    /// `MouselookStart`/`Stop`'s TurnOrAction bit through `SetCommands` (`0x514231`, `0x51425b`),
+    /// `ToggleMouseMove` (`0x50f910`) or a mouse bit's release argument.
+    Look(super::LookCall),
+    /// `DropItemOnUnit(unit)` (`0x48d960`) on the token: the trade leg, then the pet leg's feed
+    /// on the unit it names, inside the call.
+    DropItemOnUnit(String),
+}
+
+/// A getter's lookup with a callback, which the host makes inside the getter's call: the cache
+/// sends the query on a miss, once while it is in flight, and keeps the callback for the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordAsk {
+    /// `UnitName` on a unit with no object: the player-name cache by guid (`0x5171eb`).
+    PlayerName(u64),
+    /// `GetBattlefieldPosition` on a nameless teammate: the player-name cache by guid, with the
+    /// callback `0x4ac190` and no dedupe (`0x4ac104`-`0x4ac118`), which signals
+    /// `WORLD_MAP_NAME_UPDATE` when the name answers, a refusal too.
+    BattlefieldName(u64),
+    /// A trade getter's filled slot whose template the mirror lacks: the item cache, with the
+    /// callback `0x4c0340` that signals `TRADE_UPDATE` (`0x4c017f`, `0x4c0582`). The owner id is
+    /// the partner (`[0xb71728]`, `0x4c016c`) for theirs, the active player (`0x4c0573`) for ours.
+    TradeItem { entry: u32, owner: u64 },
+    /// `GetGuildInfo` on a player whose guild the mirror lacks: the guild cache, with a waiter
+    /// of the call's own for the unit (`0x4c93b6`-`0x4c93d2`).
+    Guild { guild_id: u32, guid: u64 },
+    /// The ammo slot's texture or quality getter on ammunition whose record the mirror lacks: the
+    /// item cache, with the callback `0x4c84f0` that signals `UNIT_INVENTORY_CHANGED` for a ready
+    /// record (`0x4c83bc`, `0x4c89cf`). The owner id is the unit's, the active player's
+    /// (`0x4c83ad`-`0x4c83c4`).
+    AmmoItem { entry: u32, owner: u64 },
+    /// The item cooldown query `0x6e2ed0` on an item whose record the mirror lacks, from
+    /// `GetContainerItemCooldown` or the bag and inventory tooltips: the item cache, with the
+    /// callback `0x6e2f70`, deduped (`0x6e2ef4`-`0x6e2f0d`). The owner id is the active player
+    /// (`0x6e2eef`).
+    CooldownItem { entry: u32, owner: u64 },
+    /// A getter's item-record lookup on a record its mirror lacks: the item cache, with the
+    /// getter's callback, kept by its owner ([`ItemCallback`]), and the lookup's owner id, the
+    /// query's guid ([`spell_owner`] for the profession and trainer getters, 0 for the quest
+    /// log's; the questgiver's is the panel's source, which the host holds).
+    Item {
+        entry: u32,
+        owner: u64,
+        callback: ItemCallback,
+    },
+    /// The quest log's leaderboard on a creature objective whose name the cache lacks: the
+    /// creature cache, with the callback `0x4e07d0`, which signals `QUEST_LOG_UPDATE` when the
+    /// record lands (`0x4e044c`, `0x4e07ea`); the host keeps the wait.
+    QuestCreature(u32),
+    /// The quest log's rebuild on a slot whose quest record the mirror lacks: the quest cache,
+    /// with the callback `0x4de8b0` (`0x4de65f`-`0x4de679`), whose wait the VM keeps.
+    QuestRecord(u32),
+    /// The expiry latch's quest-giver refresh (`0x4df531` → `0x5eb070`): every giver's status
+    /// asked again.
+    QuestGiverStatuses,
+    /// The quest log's leaderboard on a GameObject objective with no text whose template the
+    /// cache lacks: the object cache by the id less its top bit, with the callback `0x4e0800`,
+    /// which signals `QUEST_LOG_UPDATE` when the record lands (`0x4e0387`-`0x4e039c`, `0x4e081a`).
+    QuestObject(u32),
+    /// `GetStablePetInfo` or `GetStablePetFoodTypes` (`0x4cb2ce`, `0x4cbb05`), or with `paperdoll`
+    /// `SetPetStablePaperdoll` (`0x4cba13`), on a stable record whose creature the cache lacks: the
+    /// creature cache by the record's entry, owned by the active player (`0x468550`), with the
+    /// callback `0x4cb3b0` or `0x4cba50`, kept once per call (flag 0), which signals
+    /// `PET_STABLE_UPDATE` or `PET_STABLE_UPDATE_PAPERDOLL` when the record lands (`0x4cb3bf`,
+    /// `0x4cba5f`).
+    StableCreature { entry: u32, paperdoll: bool },
+    /// `GetSummonConfirmSummoner` with no name: the player-name cache by the latched summoner
+    /// (`0xb4e358`), with the callback `0x48b710`, which does nothing (`0x48b6bf`-`0x48b6e1`).
+    Summoner,
+    /// The item build's creator (`0x52e1f4`) or giver (`0x52e28d`) the name cache misses, by guid,
+    /// asked with the tooltip as the answer's cookie (`0x52e530`) at every build, which the VM keeps
+    /// ([`super::tooltip_item`]'s waits).
+    ItemBuildName(u64),
+    /// A set block's member the item-name cache misses (`0x52df4b`), by entry, asked with the
+    /// tooltip as the answer's cookie at every build.
+    ItemName(u32),
+    /// The item build's charter, by its item object's guid, whose petition record (`0x52b93b`) or
+    /// owner's name (`0x52b9d2`) a cache misses, asked with the tooltip as the cookie at every
+    /// build: the record by the petition id in the object's enchantment slot 0 (`0x5ef337`).
+    Petition(u64),
+    /// `GetAuctionItemInfo` on a row whose bidder (`0x4cf167`) or seller (`0x4cf1c8`) the name
+    /// cache misses: the player-name cache by guid, with the list's callback (`0x4cf290`,
+    /// `0x4cf2b0`, `0x4cf2d0`), kept once per name and list (`0x55f080`'s dedupe flag 1).
+    AuctionName { guid: u64, list: usize },
+    /// `GetMasterLootCandidate` on a candidate the name cache misses: the player-name cache by
+    /// guid with the callback `0x4c2fb0`, kept once per call (dedupe flag 0, `0x4c2f61`), which
+    /// signals `UPDATE_MASTER_LOOT_LIST` when the name lands found (`0x4c2fb6`-`0x4c2fbf`).
+    MasterLootName(u64),
+    /// `ItemTextGetCreator` on a creator the name cache misses: the player-name cache by guid with
+    /// the callback `0x4e32b0` (`0x4e39b9`), kept once per call (dedupe flag 0), which opens the
+    /// reader again when the name lands found (`0x4e32b6`-`0x4e32d5`).
+    ItemTextCreator(u64),
+    /// `GetSendMailItem` on an attachment whose record the mirror lacks, by its object's guid:
+    /// for an object the engine holds (`0x468460`, `0x4ae5e1`), the item cache by the object's
+    /// entry (`[[obj+0x8]+0xc]`, `0x4ae5e7`-`0x4ae5f2`) with guid 0 (`0x4ae5ec`-`0x4ae5ef`) and the
+    /// callback `0x4ae710` (`0x4ae604`), kept once per call, which signals
+    /// `MAIL_SEND_INFO_UPDATE` for a found record (`0x4ae716`-`0x4ae71f`). A gone object asks
+    /// nothing.
+    SendMailItem(u64),
+    /// `CalculateAuctionDeposit` and `GetAuctionSellItemInfo` on a sell slot item whose record the
+    /// mirror lacks, by its object's guid: for an object the engine holds (`0x468460`, `0x4ce24e`,
+    /// `0x4ce5cf`), the item cache by the object's entry (`[[obj+0x8]+0xc]`) with the object's own
+    /// guid (`0x4ce263`, `0x4ce5e8`) and the callback `0x4ce2f0` (`0x4ce25e`, `0x4ce5e3`), kept once
+    /// per call, which signals `NEW_AUCTION_UPDATE` for a found record (`0x4ce2fa`-`0x4ce2ff`). A
+    /// gone object asks nothing.
+    AuctionSellItem(u64),
+    /// A mail getter's lookups on the row of `mail_id` that the mirror lacks a record for, each
+    /// with the callback that signals `MAIL_INBOX_UPDATE` for a found record, kept once per call
+    /// (dedupe flag 0): the session holds the keys ([`super::MailLookup`]).
+    Mail {
+        mail_id: u32,
+        lookup: super::MailLookup,
+    },
+}
+
+/// The owner id a profession or trainer getter's item lookup passes: `0xb0000000` over a spell id
+/// (`cdq; or edx,0xb0000000`), the row's at a profession (`0x4f75cf`, `0x4fdb8a`-`0x4fdb99`), the
+/// taught spell's at a trainer (`0x4d9074`-`0x4d9087`).
+pub fn spell_owner(spell_id: u32) -> u64 {
+    0xb000_0000_0000_0000 | u64::from(spell_id)
+}
+
+/// Who keeps the callback of a getter's item-record lookup ([`RecordAsk::Item`]); each is
+/// registered once per call, with no dedupe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemCallback {
+    /// `GetTrainerServiceIcon` and `GetTrainerServiceDescription` (`0x4d9140`, `0x4d9db0`), whose
+    /// landing runs the window's pass `0x4d7d40` (`0x4d914a`, `0x4d9dba`).
+    Trainer,
+    /// `GetQuestItemInfo` (`0x5018c0`), whose landing fires `QUEST_ITEM_UPDATE` for a ready record
+    /// (`0x5018fe`-`0x501903`), kept by the questgiver window.
+    Quest,
+    /// `GetCraftReagentInfo` and `GetCraftSpellFocus` (`0x4f7710`), whose landing rebuilds the
+    /// craft list (`0x4f771a`), kept beside the craft window.
+    Craft,
+    /// The trade-skill getters (`0x4fdc30`), whose landing rebuilds the list (`0x4fdc3c`), kept
+    /// beside the trade-skill window.
+    TradeSkill,
+    /// The quest log's leaderboard and reward getters (`0x4e0830`), whose callback the VM keeps
+    /// and signals `QUEST_LOG_UPDATE` with at its flush (`0x4e083a`): the cache only asks.
+    QuestLog,
+    /// `GetMerchantItemInfo` (`0x4faed0`), whose callback `0x4fada0` counts the window's waits down
+    /// and signals `MERCHANT_UPDATE` at the last with a vendor open (`0x4fb0f0`). Its query names
+    /// the vendor's cell at the call (`0x4faef6`-`0x4faf17`), which the host holds; the ask's
+    /// owner is unread.
+    Merchant,
+    /// `GetBuybackItemInfo` (`0x4fb40c`), whose callback `0x4fb570` signals `MERCHANT_UPDATE`; its
+    /// query's guid is 0 (`0x4fb3f0`-`0x4fb3f7`).
+    Buyback,
+    /// A tooltip build's miss, with the tooltip as the cookie: the item tooltip's `0x52e530`
+    /// (`0x52b722`, `0x52bf60`, `0x52dc27`, `0x535f53`, `0x5361ee`) or the spell tooltip's
+    /// reagent `0x52f820` (`0x52eda4`, `0x52f3f4`), whose answer rebuilds the tooltips the VM
+    /// keeps waiting on it.
+    Tooltip,
+}
+
+/// Make `ask` inside the getter's call. A getter never raises for its lookup: with no host lent,
+/// and no harness keeping calls, nothing asks, and at the nesting bound ([`MAX_NESTING`]) the ask
+/// is dropped where a verb would raise [`TOO_DEEP`].
+pub(crate) fn ask(lua: &Lua, ask: RecordAsk) -> mlua::Result<()> {
+    let open = super::host::open(lua);
+    let Some(model) = lua.app_data_ref::<Model>() else {
+        return Ok(());
+    };
+    let skip = if open {
+        model.call_depth >= MAX_NESTING
+    } else {
+        model.kept_calls.is_none()
+    };
+    drop(model);
+    if skip {
+        return Ok(());
+    }
+    submit(lua, ScriptCall::RecordAsk(ask))
 }
 
 /// The mode the four `TargetNearest*` shims hand the TAB cycler `0x493f60`, the only byte that
@@ -231,6 +518,7 @@ impl ScriptCall {
             ScriptCall::PickItem(pick) => pick.may_cast,
             ScriptCall::EnchantConfirm(answer) => answer.may_cast,
             ScriptCall::Item(super::ItemCall::BindOnUse { may_cast }) => *may_cast,
+            ScriptCall::Death(super::DeathAction::UseSoulstone { may_cast }) => *may_cast,
             ScriptCall::CastSpell { may_cast, .. } => *may_cast,
             ScriptCall::CastShapeshiftForm { may_cast, .. } => *may_cast,
             ScriptCall::Select { may_cast, .. }
@@ -238,6 +526,7 @@ impl ScriptCall {
             | ScriptCall::TargetNearest { may_cast, .. }
             | ScriptCall::TargetLastTarget { may_cast }
             | ScriptCall::AttackTarget { may_cast, .. } => *may_cast,
+            ScriptCall::PlateClick(click) => click.may_cast,
             _ => true,
         }
     }
@@ -268,8 +557,7 @@ pub(crate) struct CallRaises {
 }
 
 /// What waits for the host, in the order made: a call, or a handler an engine step fired while
-/// the host was out ([`Held`]), each with the input events running when it was made, and the lock
-/// and cursor writes made among them ([`Waiting::Lock`], [`Waiting::Cursor`]).
+/// the host was out ([`Held`]), each with the input events running when it was made.
 #[derive(Clone, Debug)]
 pub(crate) enum Waiting {
     Call(QueuedCall),
@@ -279,24 +567,6 @@ pub(crate) enum Waiting {
         /// The `PlaySound` suppression depth it was fired under (`0x458f50`): a load's or a
         /// sweep's handlers stay silent though they run once the scope has closed.
         muted: u32,
-    },
-    /// A write of item `guid`'s lock bit made while something waited ([`Model::set_item_lock`]):
-    /// `locked` after it, `was` before it. The take puts the bit back ([`take_waiting`]) and the
-    /// write is made again in its place, so what waited ahead of it reads the lock as it stood
-    /// then, as `UnlockItem` (`0x495420`) signals before the step's next write.
-    Lock {
-        guid: u64,
-        locked: bool,
-        was: bool,
-    },
-    /// A cursor write made while something waited ([`super::cursor::write`]): the take puts the
-    /// cursor back as it found it, so what waited ahead of it reads the cursor as it stood then,
-    /// and its operation runs again in its place against the cursor as it is then, as
-    /// `ClearCursor` (`0x495190`) acts on what the cursor holds when it runs. `shown`: Lua the
-    /// turn ran in place made it and its events fired then, so it is made again without them.
-    Cursor {
-        write: Box<super::cursor::CursorWrite>,
-        shown: bool,
     },
 }
 
@@ -331,6 +601,21 @@ impl super::Model {
     pub(crate) fn push_waiting(&mut self, item: Waiting) {
         self.script_calls.push(item);
     }
+
+    /// Hold `raised`, a write's records made outside a segment while something waits for the
+    /// host, behind it as a segment of its own ([`Held::Segment`]), with the input events running
+    /// now.
+    pub(crate) fn hold_behind(&mut self, raised: Vec<super::tick::Raised>) {
+        let input = self.protected.events();
+        let muted = self.sound_suppression;
+        self.push_waiting(Waiting::Lua {
+            held: Held::Segment(raised),
+            input,
+            muted,
+        });
+        #[cfg(debug_assertions)]
+        super::census::held();
+    }
 }
 
 /// Hold `held` for the host, with the input events running now: an engine step fired it while it
@@ -340,7 +625,7 @@ pub(crate) fn hold(lua: &Lua, held: Held) {
     let input = model.protected.events();
     let muted = model.sound_suppression;
     model.push_waiting(Waiting::Lua { held, input, muted });
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(debug_assertions)]
     super::census::held();
 }
 
@@ -353,48 +638,27 @@ pub(crate) fn signal_waiting(lua: &Lua) -> bool {
         .any(|item| matches!(item, Waiting::Lua { .. }))
 }
 
-/// Take what waits, with the lock bits and the cursor its writes changed put back, last first:
-/// each item then runs against the locks and the cursor as they stood when it was made, and each
-/// write is made again in its place ([`Waiting::Lock`], [`Waiting::Cursor`], a held segment's
-/// own).
+/// Take what waits, with the lock bits and the cursor its held segments' writes changed put back,
+/// last first: each item then runs against the locks and the cursor as they stood when it was
+/// made, and each segment's write is made again in its place.
 fn take_waiting(lua: &Lua) -> VecDeque<Waiting> {
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
     let model = &mut *model;
     let batch = std::mem::take(&mut model.script_calls);
-    for item in batch.iter().rev() {
-        match item {
-            Waiting::Lock { guid, was, .. } => {
-                super::tick::set_lock_bit(model, *guid, *was);
-            }
-            Waiting::Cursor { write, .. } => write.rewind(model),
-            Waiting::Lua {
-                held: Held::Segment(raised),
-                ..
-            } => super::tick::rewind(model, raised),
-            Waiting::Lua { .. } | Waiting::Call(_) => {}
-        }
-    }
+    rewind_waiting(model, &batch);
     batch.into()
 }
 
-/// Make a lock write that waited, in its place.
-fn relock(lua: &Lua, guid: u64, locked: bool) {
-    lua.app_data_mut::<Model>()
-        .expect("model app_data")
-        .set_item_lock(guid, locked);
-}
-
-/// Make a cursor write that waited again, in its place, against the cursor as it is now: as the
-/// engine half made it, outside any segment, or with `shown` silently, its events having fired
-/// as it was first made.
-fn rewrite(lua: &Lua, write: Box<super::cursor::CursorWrite>, shown: bool) {
-    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-    if shown {
-        let outer = model.verb_events.replace(Vec::new());
-        super::cursor::write(&mut model, write.op);
-        model.verb_events = outer;
-    } else {
-        super::cursor::write(&mut model, write.op);
+/// Put back, last first, the lock bits and the cursor `batch`'s held segments' writes changed.
+fn rewind_waiting(model: &mut Model, batch: &[Waiting]) {
+    for item in batch.iter().rev() {
+        if let Waiting::Lua {
+            held: Held::Segment(raised),
+            ..
+        } = item
+        {
+            super::tick::rewind(model, raised);
+        }
     }
 }
 
@@ -435,7 +699,7 @@ fn run_held(lua: &Lua, held: Held) {
 /// such a chain always ends inside its frame.
 ///
 /// Deviation: the reference's only bound is `luaD_call`'s count of 200 nested calls (`0x6f65ae`),
-/// past which it raises `C stack overflow` (`0x6f65bf`); eight here, as each level keeps an
+/// past which it raises `C stack overflow` (`0x6f65bf`); eight here, because each level keeps an
 /// apply's frame on the Rust stack.
 pub(crate) const MAX_NESTING: u8 = 8;
 
@@ -452,6 +716,12 @@ pub(crate) const TOO_DEEP: &str = "script calls nested too deep";
 pub(crate) fn submit(lua: &Lua, call: ScriptCall) -> mlua::Result<()> {
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
     if !super::host::open(lua) {
+        // A VM with no host open queues a refusal's line for the app instead
+        // ([`super::Model::push_ui_error`]).
+        if let ScriptCall::DisplayError(key) = call {
+            model.push_ui_error(key);
+            return Ok(());
+        }
         return match model.kept_calls.as_mut() {
             Some(kept) => {
                 kept.push(call);
@@ -486,6 +756,13 @@ pub(crate) fn submit(lua: &Lua, call: ScriptCall) -> mlua::Result<()> {
     }
 }
 
+/// `DisplayError` (`0x496720`) on the catalog row `key`, from inside a verb or an engine step that
+/// refuses: the host shows the line and signals `UI_ERROR_MESSAGE` before the verb returns, as
+/// `0x496720` signals before it returns ([`submit`]). The caller holds no borrow of the model.
+pub(crate) fn display_error(lua: &Lua, key: &'static str) -> mlua::Result<()> {
+    submit(lua, ScriptCall::DisplayError(key))
+}
+
 /// File what the call `seq` raised: for its verb, while that waits inside [`submit`]; else, its
 /// verb having returned while the call waited for the host, as its script's error, which the
 /// error handler hears as it would the verb's raise.
@@ -497,8 +774,12 @@ fn file_raise(lua: &Lua, seq: u64, message: String) {
         // The reference never defers a call: its verb raises in its own body, so the lines after
         // it never run and a `pcall` around it catches the error. A call that waited for the host
         // had its verb return without an error, the script's later lines ran, and a `pcall` saw
-        // nothing; the error reaches the handler only now, after them.
-        model.record_lua_error(&mlua::Error::runtime(message));
+        // nothing; the error reaches the handler only now, after them, outside any script.
+        drop(model);
+        super::stdlib::call_error_function(lua, message.as_bytes());
+        lua.app_data_mut::<Model>()
+            .expect("model app_data")
+            .record_lua_error(&mlua::Error::runtime(message));
     }
 }
 
@@ -514,6 +795,10 @@ fn swap_raising(lua: &Lua, raise: Option<String>) -> Option<String> {
 /// next, as the host comes back and before its tail, ahead of the rest; the calls its tail makes
 /// apply inside the tail.
 pub(crate) fn drain(lua: &Lua) {
+    super::origin::within(super::origin::Origin::Script, || drain_within(lua));
+}
+
+fn drain_within(lua: &Lua) {
     if !super::host::free(lua) {
         return;
     }
@@ -553,7 +838,7 @@ pub(crate) fn drain(lua: &Lua) {
                 // key, click or Enter that made it, and only inside that: a queued call gets
                 // exactly its events.
                 let tail = script.with_input_events(input, |script| {
-                    #[cfg(any(test, feature = "test-support"))]
+                    #[cfg(debug_assertions)]
                     let _census = super::census::Applying::new(&call);
                     super::host::with_host(lua, |host| host.apply(script, call)).flatten()
                 });
@@ -566,8 +851,6 @@ pub(crate) fn drain(lua: &Lua) {
                 }
             }
             Waiting::Lua { held, input, muted } => replay(lua, &mut script, held, input, muted),
-            Waiting::Lock { guid, locked, .. } => relock(lua, guid, locked),
-            Waiting::Cursor { write, shown } => rewrite(lua, write, shown),
         }
         drain(lua);
     }
@@ -578,6 +861,10 @@ pub(crate) fn drain(lua: &Lua) {
 /// level, so a call one makes is the call's own nested call, and a call made meanwhile one level
 /// in. The reference runs both inside the call.
 pub(super) fn settle(lua: &Lua, script: &mut UiScript) {
+    super::origin::within(super::origin::Origin::Script, || settle_within(lua, script));
+}
+
+fn settle_within(lua: &Lua, script: &mut UiScript) {
     let mut left = take_waiting(lua);
     while let Some(item) = left.pop_front() {
         if !super::host::free(lua) {
@@ -587,13 +874,25 @@ pub(super) fn settle(lua: &Lua, script: &mut UiScript) {
         }
         match item {
             Waiting::Lua { held, input, muted } => replay(lua, script, held, input, muted),
-            Waiting::Lock { guid, locked, .. } => relock(lua, guid, locked),
-            Waiting::Cursor { write, shown } => rewrite(lua, write, shown),
             call @ Waiting::Call(_) => {
                 requeue(lua, [call]);
                 drain(lua);
             }
         }
+    }
+}
+
+/// Hold `raised` for the host as one segment ([`Held::Segment`]) when it holds anything a
+/// listener or a later read sees: an event, a lock or cursor write, or a call.
+pub(crate) fn hold_segment(lua: &Lua, raised: Vec<super::tick::Raised>) {
+    use super::tick::Raised;
+    if raised.iter().any(|r| {
+        matches!(
+            r,
+            Raised::Event(..) | Raised::Lock { .. } | Raised::CursorWrite(_) | Raised::Call(_)
+        )
+    }) {
+        hold(lua, Held::Segment(raised));
     }
 }
 
@@ -616,6 +915,10 @@ impl super::Model {
 /// to lend, or a lend's once the outermost lend has ended): the held handlers run, with the calls
 /// they make waiting, and every call is dropped. The count of calls dropped.
 pub(crate) fn refuse_waiting(lua: &Lua) -> usize {
+    super::origin::within(super::origin::Origin::Script, || refuse_waiting_within(lua))
+}
+
+fn refuse_waiting_within(lua: &Lua) -> usize {
     super::host::open_unheld(lua, || {
         let mut dropped = 0;
         loop {
@@ -630,8 +933,6 @@ pub(crate) fn refuse_waiting(lua: &Lua) -> usize {
                     Waiting::Lua { held, input, muted } => {
                         replay(lua, &mut script, held, input, muted)
                     }
-                    Waiting::Lock { guid, locked, .. } => relock(lua, guid, locked),
-                    Waiting::Cursor { write, shown } => rewrite(lua, write, shown),
                 }
             }
         }
@@ -663,6 +964,32 @@ impl UiScript {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Take the kept calls equal to `call`, leaving the rest kept: how many there were.
+    pub fn take_calls_like(&mut self, call: &ScriptCall) -> usize {
+        self.take_calls_where(|kept| (kept == call).then_some(()))
+            .len()
+    }
+
+    /// The entries of the item-record lookups with `callback` a harness's VM kept, in call order
+    /// ([`RecordAsk::Item`]).
+    pub fn take_item_asks(&mut self, callback: ItemCallback) -> Vec<u32> {
+        self.take_calls_where(|call| match call {
+            ScriptCall::RecordAsk(RecordAsk::Item {
+                entry, callback: c, ..
+            }) if *c == callback => Some(*entry),
+            _ => None,
+        })
+    }
+
+    /// The record lookups a harness's VM kept, each with its owner id, in call order
+    /// ([`RecordAsk`]).
+    pub fn take_record_asks(&mut self) -> Vec<RecordAsk> {
+        self.take_calls_where(|call| match call {
+            ScriptCall::RecordAsk(ask) => Some(*ask),
+            _ => None,
+        })
     }
 
     /// Take the kept calls `pick` answers for, in call order, leaving the rest kept.
@@ -804,6 +1131,65 @@ mod tests {
         assert_eq!(s.refuse_waiting(), 0, "nothing waits");
     }
 
+    /// A host whose every `TargetLastEnemy` leaves `UnitName` on an unheld unit and then
+    /// `TargetLastEnemy` again to run in its tail, so the getter's ask is made at every depth.
+    struct AskingAtDepth {
+        applied: Vec<ScriptCall>,
+        errors: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl CallHost for AskingAtDepth {
+        fn apply(&mut self, _: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
+            let again = call == LAST_ENEMY;
+            self.applied.push(call);
+            if !again {
+                return None;
+            }
+            let errors = self.errors.clone();
+            Some(Box::new(move |script: &mut UiScript| {
+                let chunk = r#"UnitName("target") reached = (reached or 0) + 1 TargetLastEnemy()"#;
+                if let Err(e) = script.run(chunk) {
+                    errors.borrow_mut().push(e.to_string());
+                }
+            }))
+        }
+    }
+
+    /// A getter never raises for its lookup: at the nesting bound its ask is dropped and the
+    /// getter returns, and only the verb after it raises [`TOO_DEEP`]. The reference's getter
+    /// simply asks (`0x5171eb`).
+    #[test]
+    fn a_getters_ask_at_the_nesting_bound_is_dropped_not_raised() {
+        let mut s = UiScript::new().unwrap();
+        s.set_unit(
+            "target",
+            Some(super::super::UnitState {
+                guid: 0x77,
+                ..Default::default()
+            }),
+        );
+        let mut host = AskingAtDepth {
+            applied: Vec::new(),
+            errors: Default::default(),
+        };
+        s.hosted(&mut host, |s| s.run("TargetLastEnemy()").unwrap());
+        let levels = usize::from(MAX_NESTING);
+        assert_eq!(
+            s.eval::<usize>("return reached").unwrap(),
+            levels,
+            "every tail, the one at the bound too, gets past its getter"
+        );
+        let asks = host
+            .applied
+            .iter()
+            .filter(|c| matches!(c, ScriptCall::RecordAsk(_)))
+            .count();
+        assert_eq!(asks, levels - 1, "the ask at the bound is dropped");
+        let errors = host.errors.borrow();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains(TOO_DEEP), "{errors:?}");
+    }
+
     /// With no host lent a call is refused with an error: an entry ran Lua without lending one.
     #[test]
     fn with_no_host_a_call_is_refused() {
@@ -879,7 +1265,6 @@ mod tests {
         s.hosted(&mut host, |s| s.run("TargetLastEnemy()"))
             .expect("the outer verb's own call raised nothing");
         assert_eq!(host.applied, vec![LAST_ENEMY, ScriptCall::ClearTarget]);
-        s.dispatch_script_errors_to_handler();
         let heard: Vec<String> = s.eval("return HEARD").expect("the handler's record");
         assert_eq!(heard.len(), 1, "{heard:?}");
         assert!(heard[0].contains("refused in the call"), "{heard:?}");
@@ -1220,9 +1605,11 @@ mod tests {
     /// `UnlockItem` (`0x495420`) clears the bit (`0x495449`) and signals `ITEM_LOCK_CHANGED`
     /// (`0x495455`) before it returns, so a step that unlocks two items in turn, as a refused move
     /// unlocks its two (`0x5e3ac0`, `0x5e3ad3`), shows the first signal's handlers the second item
-    /// still locked. Held for the host, they read the locks as each signal left them.
+    /// still locked. An engine step that makes the second write while the first's handlers are
+    /// held for the host writes ahead of their point, which the census refuses.
     #[test]
-    fn a_held_handler_reads_the_locks_its_signal_left() {
+    #[should_panic(expected = "wrote the lock while a handler it signalled was held")]
+    fn a_lock_write_ahead_of_a_held_handlers_point_is_refused() {
         let mut s = UiScript::new().unwrap();
         watch_locks(&s);
         s.seed_item_locks([1, 2]);
@@ -1230,10 +1617,6 @@ mod tests {
             s.unlock_item(1);
             s.unlock_item(2);
         });
-        let mut host = Stamping::default();
-        s.hosted(&mut host, |_| ());
-        assert_eq!(global::<String>(&s, "SEEN"), "01 00 ");
-        assert_eq!(s.item_locks(), Vec::<u64>::new());
     }
 
     /// A held verb segment carries its lock writes: the sell-slot clear (`0x4cd640`) unlocks its
@@ -1277,7 +1660,9 @@ mod tests {
             .unwrap()
         };
         let pick_up = f(&lua, |lua, guid| {
-            cursor::set_cursor(lua, true, |_| Some(CursorPayload::Item(held_item(guid))));
+            cursor::set_cursor(lua, true, cursor::Setter::Item, |_| {
+                Some(CursorPayload::Item(held_item(guid)))
+            });
             super::super::tick::verb(lua, |model| cursor::lock_item(model, guid));
         });
         let put_down = f(&lua, |lua, _| {

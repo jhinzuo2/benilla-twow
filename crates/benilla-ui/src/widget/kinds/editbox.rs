@@ -140,18 +140,9 @@ pub struct EditBoxState {
     /// `<HighlightColor>` through `SetSelectionColor` (`0x77e330`), which no Lua method reaches;
     /// the ctor's is `0xFF606060` (`0x779c7a`).
     pub highlight_color: crate::color::Rgba8,
-    /// The bits of `Set/GetJustifyH` and `Set/GetJustifyV` (`0x797990`-`0x797bd0`), kept on the
-    /// box and not drawn. For V that is the reference: `SetMultiLine` (`0x77a4a0`) makes the
-    /// text's V bits local, so a `SetJustifyV` is masked out (`0x77086e`) and only the getter sees
-    /// it. Whether the draw (`0x77da80`) reads H is untraced.
-    pub justify: u32,
 }
 
 impl EditBoxState {
-    /// The horizontal justify bits (0-2).
-    pub const JUSTIFY_H_MASK: u32 = crate::justify::H_MASK;
-    /// The vertical justify bits (3-5).
-    pub const JUSTIFY_V_MASK: u32 = crate::justify::V_MASK;
     /// Dirty bit 0, the text changed: every edit raises it, and the flush relayouts (`0x77d447`)
     /// and fires `OnTextChanged` (`0x77d498`).
     pub const DIRTY_TEXT: u8 = 1;
@@ -160,23 +151,6 @@ impl EditBoxState {
     /// leg (`0x77d475` → `0x77da80`), which fires `OnCursorChanged`. Bit 1, the
     /// highlight's (`0x77d950`), has no counterpart: the host paints the selection each frame.
     pub const DIRTY_CURSOR: u8 = 4;
-
-    /// A justify token's bit; `None` makes the caller raise the reference's
-    /// `Usage: %s:SetJustifyH("justify")`.
-    pub fn justify_bit(token: &str) -> Option<u32> {
-        crate::justify::parse_bits(token)
-    }
-
-    /// Replace one axis's bits with `parsed`'s. `SetJustifyH("TOP")` parses but clears the H bits,
-    /// so `GetJustifyH()` then answers `"UNKNOWN"`, with no error.
-    pub fn set_justify_axis(&mut self, mask: u32, parsed: u32) {
-        self.justify = crate::justify::set_axis(self.justify, mask, parsed);
-    }
-
-    /// The token for one axis.
-    pub fn justify_token(&self, mask: u32) -> &'static str {
-        crate::justify::name_of(self.justify, mask)
-    }
 }
 
 impl Default for EditBoxState {
@@ -219,9 +193,6 @@ impl Default for EditBoxState {
             selection_regions: [None; 3],
             caret_region: None,
             highlight_color: crate::color::Rgba8::rgba(0x60, 0x60, 0x60, 0xff),
-            // The ctor's `0x211` less the unread bit 0x200: LEFT | MIDDLE, since the ctor
-            // overrides the font default's CENTER (`0x779be4`).
-            justify: 0x01 | 0x10,
         }
     }
 }
@@ -244,11 +215,11 @@ impl EditBoxState {
     /// One UP (`older`) or DOWN step, returning the text to show: the first UP stashes the draft,
     /// and DOWN past the newest entry restores it.
     ///
-    /// Deviation: the history browses as a shell's does, a small everyday gain: the first UP
-    /// stashes the line being typed and DOWN past the newest line brings it back, UP holds at the
-    /// oldest, DOWN does nothing when not browsing, typing or a focus gain ends the browse, and an
-    /// empty line is not kept. The reference's history is a ring of `historyLines` slots that
-    /// keeps any line (`0x77cf40`); UP scans back for the previous filled slot, wrapping
+    /// Deviation: the history browses as a shell's does because it is a small everyday gain: the
+    /// first UP stashes the line being typed and DOWN past the newest line brings it back, UP holds
+    /// at the oldest, DOWN does nothing when not browsing, typing or a focus gain ends the browse,
+    /// and an empty line is not kept. The reference's history is a ring of `historyLines` slots
+    /// that keeps any line (`0x77cf40`); UP scans back for the previous filled slot, wrapping
     /// (`0x77d030`), DOWN forward with `idiv` (`0x77cfd0`), each a `SetText` (`0x77be00`), with no
     /// draft and no stop at either end.
     pub fn history_step(&mut self, older: bool) -> Option<String> {
@@ -691,8 +662,10 @@ impl EditBoxState {
         true
     }
 
-    /// The selection for Ctrl+C (`0x77e1d0`); a password box yields the empty string, the image's
-    /// `""` at `0x882748` (`0x77e1ef`–`0x77e1fd`), never its text.
+    /// The selection for Ctrl+C (`0x77e1d0`) through `GxuStripControlCodes` with mask `0x500`
+    /// (`0x77e230`–`0x77e239`): no colour or link codes, `||` as `|`, a line break as `\n`. A
+    /// password box yields the empty string, the image's `""` at `0x882748`
+    /// (`0x77e1ef`–`0x77e1fd`), never its text.
     pub fn selected_text(&self) -> Option<String> {
         if self.sel_start == self.sel_end {
             return None;
@@ -704,7 +677,7 @@ impl EditBoxState {
         Some(if self.password {
             String::new()
         } else {
-            self.text[a..b].to_string()
+            crate::markup::strip_control_codes(&self.text[a..b], crate::markup::strip::CLIPBOARD)
         })
     }
 
@@ -814,8 +787,8 @@ impl EditBoxState {
             self.extend_to(target);
         } else if self.sel_start != self.sel_end {
             // Deviation: a plain Left or Right (or Ctrl+B or F) with a selection collapses it to
-            // that edge, as every OS's own text fields do; the reference clears the selection and
-            // steps once from the caret (`0x77c6b0` from `0x77c70b`).
+            // that edge, because every OS's own text fields do; the reference clears the selection
+            // and steps once from the caret (`0x77c6b0` from `0x77c70b`).
             self.cursor = if right { self.sel_end } else { self.sel_start };
             self.collapse();
         } else {
@@ -833,7 +806,7 @@ impl EditBoxState {
     /// (`0x77c8c0`) steps back over the spaces before the caret, then over the non-spaces.
     ///
     /// Deviation: Left reads the whole character before the caret, not the lone byte `caret - 1`
-    /// the client reads (`0x77c8da`), which takes a multi-byte space for a non-space.
+    /// the client reads (`0x77c8da`), because that takes a multi-byte space for a non-space.
     pub fn move_by_word(&mut self, right: bool, extend: bool) {
         // Right crosses non-spaces, then spaces; left spaces, then non-spaces.
         let first_is_space = !right;
@@ -996,12 +969,12 @@ impl EditBoxState {
     /// click (`0x77b800`) and the drag (`0x77a860`). Bit 2 rises only when the caret moved; a
     /// click raises it on its own.
     ///
-    /// Deviation: the drag selects from its anchor, as every OS's own text fields do, where the
-    /// reference's applies `0x77cd10` to each mouse move's whole delta (`0x77a8a1`). The two part
-    /// in two cases. One move that carries the caret across the anchor keeps the far end selected
-    /// too in the reference. And a drag that starts with the caret inside a selection, as after a
-    /// focus that selects all, gives `(0, t)` here dragging right to `t`, where the reference
-    /// gives `(t, len)`.
+    /// Deviation: the drag selects from its anchor, because every OS's own text fields do, where
+    /// the reference's applies `0x77cd10` to each mouse move's whole delta (`0x77a8a1`). The two
+    /// part in two cases. One move that carries the caret across the anchor keeps the far end
+    /// selected too in the reference. And a drag that starts with the caret inside a selection, as
+    /// after a focus that selects all, gives `(0, t)` here dragging right to `t`, where the
+    /// reference gives `(t, len)`.
     pub fn move_caret_to(&mut self, target: usize, extend: bool) {
         let from = self.cursor;
         let target = snap_down(&self.text, target.min(self.text.len()));
@@ -1126,7 +1099,7 @@ fn colour_carry(display: &str, from: usize) -> Option<&str> {
 /// spaces. From U+0100 it is the system's `GetStringTypeW` space type: the Unicode spaces, but not
 /// the zero-width ones.
 ///
-/// Deviation: a code point past U+FFFF is no space, where the client tests its low 16 bits, so
+/// Deviation: a code point past U+FFFF is no space, because the client tests its low 16 bits, so
 /// U+10020 counts as a space there.
 fn is_space(c: char) -> bool {
     matches!(

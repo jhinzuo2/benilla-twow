@@ -213,11 +213,12 @@ generated from the code.
 
 ## Status
 
-Complete and fully playable. What is left:
+Fully playable on a 1.12.1 server that doesn't enforce Warden or need client changes beyond its
+MPQ archives. What is left:
 
-- The long tail of small features that separates a working client from a finished one, tracked
-  as [issues](https://github.com/samwhosung/benilla/issues).
-- Addons, options and performance, ongoing.
+- The long tail of small differences from 1.12.1, tracked as
+  [issues](https://github.com/samwhosung/benilla/issues).
+- Addon compatibility, the remaining options and performance, ongoing.
 
 benilla is a faithful 1.12.1 client and the foundation people build on. There are no prebuilt
 downloads: a packaged build, a particular server's changes or anything 1.12.1 never had belongs
@@ -259,7 +260,9 @@ does the same (`ln -s /path/to/WoW WoW`, or on Windows a junction, which needs n
 `localhost:3724`, the stock auth port. Point `WOW_HOST` at another (`WOW_HOST=play.example.com`, or
 `play.example.com:5000` for a remapped port), or set it from the Realmlist button on the login
 screen, which remembers it. Credentials go in at the login screen, or set `WOW_USER` and `WOW_PASS`
-to skip it.
+to skip it. A PIN-protected account answers the keypad from `WOW_PIN` (the digits) or
+`WOW_PIN_TOTP` (the authenticator's base32 secret), as
+[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md), "Running it unattended", describes.
 
 Settings, screenshots and addons live in `benilla-config/` at the repo root: a 1.12 addon goes in
 `benilla-config/AddOns/`. [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) has the rest, from the
@@ -284,5 +287,6 @@ runtime. The few files under `crates/benilla-app/assets/ui/` are our own, not co
 adapters over stock files, and the settings windows and script error log benilla draws itself.
 
 World of Warcraft is a trademark of Blizzard Entertainment, Inc. Our own code is licensed under
-[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The kira audio engine under
-`third_party/` is vendored under the same two licenses, with its author's copyright notices beside it.
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The kira audio engine and the
+wgpu-hal graphics layer under `third_party/` are vendored under the same two licenses, with their
+authors' copyright notices beside them.
