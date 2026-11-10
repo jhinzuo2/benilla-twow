@@ -1115,6 +1115,13 @@ fn play_server_music(
     let Some((path, kit_vol)) = kits.pick_stream(kit_id) else {
         return false;
     };
+    // An internet-radio stream URL: dropped, as the zone cycle's kit open drops it.
+    if path.starts_with("http://") || path.starts_with("https://") {
+        if kits.note_stream_url(&path) {
+            warn!("server music: {path} — internet-radio stream URL, not streamed yet (dropped)");
+        }
+        return false;
+    }
     let flags = kits.catalog().get(kit_id).map_or(0, |k| k.flags);
     let live: Vec<(&str, kira::sound::PlaybackState)> = [
         (zone.server_music.as_ref(), zone.server_music_path.as_str()),
