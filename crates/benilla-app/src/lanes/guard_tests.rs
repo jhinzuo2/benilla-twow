@@ -539,6 +539,9 @@ pub(super) fn filled_through_a_read(n: &str) -> Option<Fill> {
 /// check here unseen. Each is named by its full path, the crate's own by its path in the crate,
 /// and matched whole ([`names_exactly`]).
 pub(super) const READ_ONLY_TO_HANDLERS: &[&str] = &[
+    // The fork's touch stick, which the press tick reads for the frame's walk (`press_tick`'s
+    // `touch`); the arbiter alone writes it, a handler never does.
+    "::touch::TouchMove",
     // `AreaPOI.dbc`, the landmark rows the gossip marker's re-select of the map reads
     // (`0x6dac93` → `0x4a67a0`, its walk at `0x4a6819`).
     "::area_poi::AreaPoiRes",

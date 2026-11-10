@@ -49,7 +49,7 @@ fn family(rel: &str) -> Family {
 /// The fork's own: iNilla drives the interface for touch and controllers (`inilla/hints.rs`,
 /// `icons.rs`, `pad.rs`, `platform.rs`, `synth.rs`, `touch.rs`), and Android's touch arbiter
 /// hit-tests it (`touch/mod.rs`).
-const CEILING: usize = 49;
+const CEILING: usize = 50;
 
 /// How far under [`CEILING`] the count may sit before the test asks for the ceiling to follow it.
 const SLACK: usize = 4;

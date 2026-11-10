@@ -982,7 +982,7 @@ pub(crate) mod schedule_tests {
     /// The fork's own: Android's touch arbiter (`touch::classify_touches`) and soft-keyboard driver
     /// (`android_keyboard::drive_soft_keyboard`), which read the input and client state the game
     /// writes and are ordered only against the UI pass.
-    const UPDATE_ACTIONABLE_CEILING: usize = 1_790;
+    const UPDATE_ACTIONABLE_CEILING: usize = 1_477;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {

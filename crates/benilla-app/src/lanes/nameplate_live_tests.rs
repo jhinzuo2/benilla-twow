@@ -451,8 +451,27 @@ fn a_units_bar_and_bridge_run_in_the_order_they_were_linked() {
 /// camera looking down on us, and the boar alone drawn, so the gate gives it the one plate. The
 /// spy's `Look` is the test's; the frame's gate has run once.
 fn framed_client(look: &str) -> App {
+    framed_client_with(look, true)
+}
+
+/// [`framed_client`], with the boar's name known to the frame's gate or not.
+fn framed_client_with(look: &str, named: bool) -> App {
     use bevy::camera::visibility::SetViewVisibility;
     let mut app = client();
+    // TWoW (pfUI): the frame's gate plates no unit until its name is known, so the boar's record
+    // is cached and its descriptor names it before the first gate.
+    if named {
+        record(&mut app, BOAR_ENTRY, "Boar");
+        let boar = app.world().resource::<crate::net::GuidIndex>().0[&BOAR];
+        app.world_mut()
+            .get_mut::<crate::net::ObjectStore>(boar)
+            .expect("a store")
+            .0
+            .merge(benilla_protocol::ObjectFields::from_pairs(&[(
+                OBJECT_ENTRY,
+                BOAR_ENTRY,
+            )]));
+    }
     let world = app.world_mut();
     world.insert_resource(crate::vplates::VPlateMode {
         enemies: true,
@@ -533,7 +552,11 @@ fn a_change_of_our_drunkenness_refreshes_the_kept_plates_level_at_the_frame() {
 /// the boar, which the frame before left in view.
 #[test]
 fn a_packets_gate_binds_a_plate_in_the_frame_the_plates_come_on() {
-    let mut app = framed_client("return Shown(Plate())");
+    // The boar's name lands in the packet that binds its plate: until then the gate plates no one.
+    let mut app = framed_client_with(
+        r#"local plate = Plate() if not plate then return "hidden" end return Shown(plate)"#,
+        false,
+    );
     record(&mut app, BOAR_ENTRY, "Boar");
     let set_mode = |app: &mut App, on: bool| {
         app.world_mut().insert_resource(crate::vplates::VPlateMode {

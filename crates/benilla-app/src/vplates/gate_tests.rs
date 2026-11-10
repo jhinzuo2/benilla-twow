@@ -83,6 +83,13 @@ fn plates_app() -> App {
     world.resource_mut::<GuidIndex>().0.insert(ME, me);
     world.resource_mut::<SelfGuid>().0 = Some(ME);
     part(&mut app, me, true);
+    // TWoW (pfUI): the driver gives no plate to a unit whose name is unknown, so the units these
+    // tests build carry one: our body, and the creature entry [`NAMED`] a unit with no `ENTRY`
+    // of its own takes.
+    app.world_mut()
+        .resource_mut::<NameCache>()
+        .insert_player(ME, "Me".into(), None);
+    record(&mut app, NAMED, "Unit", 1);
     app
 }
 
@@ -100,9 +107,15 @@ fn part(app: &mut App, unit: Entity, drawn: bool) -> Entity {
     part
 }
 
+/// The creature entry a unit with no `ENTRY` of its own takes, whose record [`plates_app`] caches.
+const NAMED: u32 = 1;
+
 /// A living creature `guid` at `at`, with `fields` over its health.
 fn unit(app: &mut App, guid: u64, at: Vec3, fields: &[(u16, u32)]) -> Entity {
     let mut pairs = vec![(2, 0x9), (HEALTH, 100), (MAX_HEALTH, 100)];
+    if !fields.iter().any(|(index, _)| *index == ENTRY) {
+        pairs.push((ENTRY, NAMED));
+    }
     pairs.extend_from_slice(fields);
     let world = app.world_mut();
     let e = world
@@ -236,10 +249,11 @@ fn a_friendly_totem_has_no_plate_and_an_enemy_totem_does() {
 }
 
 /// The bind sets the name text from `GetUnitName` (`0x609210`, called at `0x7cb70c`), whose miss
-/// is `UNKNOWNOBJECT` (`0x609324`): a creature whose record has not come back, and a player whose
-/// name has not, carry it, never an empty text.
+/// is `UNKNOWNOBJECT` (`0x609324`). TWoW (pfUI) plates no unit until its name is known, so a
+/// creature whose record has not come back, and a player whose name has not, have no plate to
+/// carry it; the named creature's reads its name.
 #[test]
-fn an_unnamed_units_plate_reads_unknownobject() {
+fn an_unnamed_units_has_no_plate_until_its_name_lands() {
     let mut app = plates_app();
     record(&mut app, 299, "Wolf", 1);
     unit(&mut app, mob(0x31), Vec3::X * 3.0, &[(ENTRY, 299)]);
@@ -269,8 +283,17 @@ fn an_unnamed_units_plate_reads_unknownobject() {
     part(&mut app, player, true);
     assert_eq!(
         plate_names(&mut app),
-        vec!["Unknown", "Unknown", "Wolf"],
-        "the unknown creature and the unknown player"
+        vec!["Wolf"],
+        "the unknown creature and the unknown player wait for their names"
+    );
+    record(&mut app, 300, "Boar", 1);
+    app.world_mut()
+        .resource_mut::<NameCache>()
+        .insert_player(0x40, "Tess".into(), None);
+    assert_eq!(
+        plate_names(&mut app),
+        vec!["Boar", "Tess", "Wolf"],
+        "each plate appears the frame its name lands"
     );
 }
 
