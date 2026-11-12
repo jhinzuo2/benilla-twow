@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
-use bevy::window::{PrimaryWindow, ScreenEdge};
+use bevy::window::{PrimaryWindow, ScreenEdge, WindowEvent};
 
 use inilla_core::touch::Screen;
 use inilla_platform::device::Side;
@@ -142,9 +142,34 @@ fn lock_landscape() {}
 
 /// The iOS keyboard's Return arrives as the text `"\n"` with no key code; benilla's text law keys
 /// submit on `Enter`. Rewrite it before Bevy's keyboard system sees it.
-fn return_key_is_enter(mut keys: ResMut<Messages<KeyboardInput>>) {
+fn return_key_is_enter(
+    mut keys: ResMut<Messages<KeyboardInput>>,
+    mut stream: ResMut<Messages<WindowEvent>>,
+) {
     if !cfg!(target_os = "ios") {
         return;
+    }
+    // The window-event stream carries the same key events, and is what the frame's input records
+    // are read from ([`crate::ui_script::collect_input_records`]): rewritten alike.
+    let newline = |k: &KeyboardInput| {
+        matches!(k.text.as_deref(), Some("\n") | Some("\r")) || is_newline_key(&k.logical_key)
+    };
+    let streamed = stream
+        .iter_current_update_messages()
+        .any(|e| matches!(e, WindowEvent::KeyboardInput(k) if newline(k)));
+    if streamed {
+        let current: Vec<WindowEvent> = stream.iter_current_update_messages().cloned().collect();
+        stream.drain().for_each(drop);
+        for mut e in current {
+            if let WindowEvent::KeyboardInput(k) = &mut e {
+                if newline(k) {
+                    k.key_code = KeyCode::Enter;
+                    k.logical_key = Key::Enter;
+                    k.text = None;
+                }
+            }
+            stream.write(e);
+        }
     }
     let needs = keys.iter_current_update_messages().any(|k| {
         matches!(k.text.as_deref(), Some("\n") | Some("\r")) || is_newline_key(&k.logical_key)
@@ -169,6 +194,8 @@ fn return_key_is_enter(mut keys: ResMut<Messages<KeyboardInput>>) {
 fn synthetic_keys(
     mut keys: ResMut<SyntheticKeys>,
     mut out: ResMut<Messages<KeyboardInput>>,
+    // The window-event stream the frame's input records are read from.
+    mut stream: ResMut<Messages<WindowEvent>>,
     windows: Query<Entity, With<PrimaryWindow>>,
 ) {
     if keys.queued.is_empty() && keys.down.is_empty() {
@@ -183,24 +210,28 @@ fn synthetic_keys(
         _ => Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
     };
     for key in std::mem::take(&mut keys.down) {
-        out.write(KeyboardInput {
+        let ev = KeyboardInput {
             key_code: key,
             logical_key: logical(key),
             state: bevy::input::ButtonState::Released,
             text: None,
             repeat: false,
             window,
-        });
+        };
+        out.write(ev.clone());
+        stream.write(WindowEvent::KeyboardInput(ev));
     }
     for key in std::mem::take(&mut keys.queued) {
-        out.write(KeyboardInput {
+        let ev = KeyboardInput {
             key_code: key,
             logical_key: logical(key),
             state: bevy::input::ButtonState::Pressed,
             text: None,
             repeat: false,
             window,
-        });
+        };
+        out.write(ev.clone());
+        stream.write(WindowEvent::KeyboardInput(ev));
         keys.down.push(key);
     }
 }

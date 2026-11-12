@@ -535,9 +535,10 @@ pub fn equip_region_candidates(layer: usize, name: &str, sex: u8) -> [String; 2]
 /// Source-over blit of an overlay's mip pyramid at `tile`, level by level, from the overlay's own
 /// origin (`0x4770f0`: src `(0,0)`, extent the tile); an opaque texel copies, the client's REPLACE.
 ///
-/// Deviation: an HD texture patch ships skins and overlays at a whole multiple of the 1.12 size.
-/// The tile scales by the atlas's multiple of 256 and the overlay is resampled (nearest) by its own
-/// multiple of the tile, so mixed stock and HD art still lands in place. At 1× both are identity.
+/// Deviation: an HD texture patch ships skins and overlays at a whole multiple of the 1.12 size,
+/// because Turtle's patch chain carries HD body art. The tile scales by the atlas's multiple of 256
+/// and the overlay is resampled (nearest) by its own multiple of the tile, so mixed stock and HD
+/// art still lands in place. At 1× both are identity.
 fn blit_over(dst: &mut BlpMipChain, src: &BlpMipChain, tile: Tile) {
     // Both chains must be decoded RGBA: DXT blocks would blend into garbage without failing.
     debug_assert!(

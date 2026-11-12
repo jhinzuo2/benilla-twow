@@ -119,6 +119,19 @@ impl std::fmt::Display for Unparsed {
 
 impl std::error::Error for Unparsed {}
 
+/// A character list the reply failed (`ServerPacket::CharEnum`'s `failed`). The link is unharmed:
+/// the reference reports it to the screen and reads on (`0x5b4574`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharListFailed;
+
+impl std::fmt::Display for CharListFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server's character list is over 10 or not read to its end")
+    }
+}
+
+impl std::error::Error for CharListFailed {}
+
 /// What [`observe_sends`] takes: called with a sent packet's opcode and its body, the bytes after
 /// the header and as plain as the caller built them (encryption covers the header alone).
 pub type SendObserver = fn(opcode: u16, body: &[u8]);
@@ -307,6 +320,22 @@ mod frame_tests {
         server.decrypter().decrypt(&mut second);
         assert_eq!(second, [0x00, 0x0c, 0xdc, 0x01, 0x00, 0x00]);
         assert_eq!(&wire[second_at + 6..], &[9; 8]);
+    }
+
+    /// An empty body is the size word 4, the opcode alone (`0x4bc738`): `CMSG_REQUEST_PET_INFO`.
+    #[test]
+    fn an_empty_body_is_its_header_alone() {
+        let traffic = LinkTraffic::new();
+        let mut wire = Vec::new();
+        send_packet(
+            &mut wire,
+            None,
+            &traffic,
+            crate::messages::opcode::CMSG_REQUEST_PET_INFO,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(wire, [0x00, 0x04, 0x79, 0x02, 0x00, 0x00]);
     }
 
     /// The three-byte form carries 23 bits; a bigger packet has no header, so it is refused.

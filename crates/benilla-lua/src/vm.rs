@@ -48,9 +48,18 @@ const CI_BYTES: usize = 24;
 /// (`0x6f6e0b`): the 0x68-byte `lua_State` (`0x6f6b8d`) and the 0xc0-byte `global_State`
 /// (`0x6f6d88`).
 const STATE_BYTES: usize = 0x128;
-/// 5.1.5's `MAXTAGLOOP`: the steps `luaV_gettable` and `luaV_settable` take along a chain of
-/// `__index` or `__newindex` tables before `loop in gettable`.
-const MAXTAGLOOP: u32 = 100;
+/// The tables `luaV_gettable` (`0x6f7cf0`) reads along an `__index` chain entered from the API
+/// (`lua_gettable`, `0x6f3ab3`): the loop count starts at 0 and the chain raises `loop in
+/// gettable` once it passes 100 (`0x6f7cf7`), so the 101 tables at counts 0 to 100.
+const GETTABLE_TABLES_API: u32 = 101;
+/// The same chain entered from an instruction: the VM reads the first table itself and hands the
+/// `__index` step a count of 0 (`0x6f8940`, `0x6f8a0a`, `0x6f8bf3`, `0x6f8c0d`), so the chain
+/// reaches one table more.
+const GETTABLE_TABLES_OP: u32 = 102;
+/// The tables `luaV_settable` (`0x6f7f40`) writes along an `__newindex` chain: its count starts at
+/// 0 and raises `loop in settable` once the table it just left makes it pass 100 (`0x6f7ffa`),
+/// so the 101 tables, whichever way it is entered.
+const SETTABLE_TABLES: u32 = 101;
 
 #[derive(Clone, Copy)]
 struct Frame {
@@ -132,6 +141,38 @@ pub struct Names {
     pub n: StrRef,
     pub next: StrRef,
     pub ipairs: StrRef,
+}
+
+impl Names {
+    /// Every name, for the collector's roots. The pattern names each field, so a name added
+    /// without a root does not compile.
+    fn all(&self) -> [StrRef; 19] {
+        let Names {
+            index,
+            newindex,
+            call,
+            add,
+            sub,
+            mul,
+            div,
+            pow,
+            unm,
+            concat,
+            eq,
+            lt,
+            le,
+            mode,
+            metatable,
+            tostring,
+            n,
+            next,
+            ipairs,
+        } = *self;
+        [
+            index, newindex, call, add, sub, mul, div, pow, unm, concat, eq, lt, le, mode,
+            metatable, tostring, n, next, ipairs,
+        ]
+    }
 }
 
 #[derive(Clone)]
@@ -661,12 +702,24 @@ impl Vm {
         args: &[Value],
         nres: i32,
     ) -> Result<Vec<Value>, Value> {
+        self.pcall_value_with(f, args, nres, None)
+    }
+
+    /// [`Vm::pcall_value`] under an error function, `lua_pcall`'s `errfunc`: `handler` runs at
+    /// the raise, before the stack unwinds ([`Vm::throw`]), and its answer is the error.
+    pub fn pcall_value_with(
+        &mut self,
+        f: Value,
+        args: &[Value],
+        nres: i32,
+        handler: Option<Value>,
+    ) -> Result<Vec<Value>, Value> {
         let func_idx = self.top;
         self.ensure(func_idx + args.len() + 1);
         self.stack[func_idx] = f;
         self.stack[func_idx + 1..func_idx + 1 + args.len()].copy_from_slice(args);
         self.top = func_idx + 1 + args.len();
-        match self.pcall_at(func_idx, args.len(), nres, None) {
+        match self.pcall_at(func_idx, args.len(), nres, handler) {
             Ok(()) => {
                 let out = self.stack[func_idx..self.top].to_vec();
                 self.top = func_idx;
@@ -681,13 +734,15 @@ impl Vm {
     /// `lua_getglobal` and `lua_setglobal` do; each one's earlier value is put back after the
     /// call, after an error too. The earlier values wait on the stack, where a collection inside
     /// the call keeps them. It is the 1.12 script handler's convention (`this`, `event`,
-    /// `arg1..`) in one step. Answers the call's error value, or the first one a read or write
-    /// of the globals raised. `f` and the values must be rooted by the caller, as a host's handles
-    /// root them; the names wait on the stack with the earlier values.
+    /// `arg1..`) in one step, `handler` the call's error function, which runs at the raise with
+    /// the globals still set. Answers the call's error value, or the first one a read or write
+    /// of the globals raised. `f`, `handler` and the values must be rooted by the caller, as a
+    /// host's handles root them; the names wait on the stack with the earlier values.
     pub fn call_with_globals(
         &mut self,
         f: Value,
         globals: &[(StrRef, Value)],
+        handler: Option<Value>,
     ) -> Result<(), Value> {
         let base = self.top;
         let n = globals.len();
@@ -715,7 +770,7 @@ impl Vm {
         let called = set.and_then(|()| {
             let func_idx = self.top;
             self.push(f);
-            match self.pcall_at(func_idx, 0, 0, None) {
+            match self.pcall_at(func_idx, 0, 0, handler) {
                 Ok(()) => Ok(()),
                 Err(e) => Err(e.value),
             }
@@ -1104,13 +1159,31 @@ impl Vm {
         None
     }
 
-    /// `luaV_gettable`. `reg` names the indexed value for an error.
+    /// `luaV_gettable` as the API enters it (`lua_gettable`), for the host and the natives. `reg`
+    /// names the indexed value for an error.
     #[cold]
     #[inline(never)]
     pub fn index(&mut self, t: Value, key: Value, reg: Option<usize>) -> Result<Value, LuaError> {
+        self.index_chain(t, key, reg, GETTABLE_TABLES_API)
+    }
+
+    /// `luaV_gettable` as an instruction enters it: `GETGLOBAL`, `GETTABLE` and `SELF`.
+    #[cold]
+    #[inline(never)]
+    fn index_op(&mut self, t: Value, key: Value, reg: Option<usize>) -> Result<Value, LuaError> {
+        self.index_chain(t, key, reg, GETTABLE_TABLES_OP)
+    }
+
+    fn index_chain(
+        &mut self,
+        t: Value,
+        key: Value,
+        reg: Option<usize>,
+        tables: u32,
+    ) -> Result<Value, LuaError> {
         let mut t = t;
         let mut reg = reg;
-        for _ in 0..MAXTAGLOOP {
+        for _ in 0..tables {
             let tm = match t.unpack() {
                 V::Table(tr) => {
                     let tab = self.heap.table(tr);
@@ -1156,7 +1229,7 @@ impl Vm {
     ) -> Result<(), LuaError> {
         let mut t = t;
         let mut reg = reg;
-        for _ in 0..MAXTAGLOOP {
+        for _ in 0..SETTABLE_TABLES {
             let tm = match t.unpack() {
                 V::Table(tr) => {
                     let slot = match self.heap.table_mut(tr).slot_for(key) {
@@ -2317,30 +2390,9 @@ impl Vm {
         // a new function took would step a table without calling that function.
         roots.push(self.builtin_next);
         let open: Vec<u32> = self.open.iter().map(|&(_, u)| u).collect();
-        // Names live forever.
-        let n = &self.names;
-        for s in [
-            n.index,
-            n.newindex,
-            n.call,
-            n.add,
-            n.sub,
-            n.mul,
-            n.div,
-            n.pow,
-            n.unm,
-            n.concat,
-            n.eq,
-            n.lt,
-            n.le,
-            n.mode,
-            n.metatable,
-            n.tostring,
-            n.n,
-            n.next,
-        ] {
-            roots.push(Value::Str(s));
-        }
+        // Names live forever: the VM reads them by id, so a freed one would come back under
+        // another.
+        roots.extend(self.names.all().map(Value::Str));
         // A frame running code a hot reload replaced reads that code's constants and upvalues;
         // with no frame left, nothing runs it.
         if self.frames.is_empty() {
@@ -2815,7 +2867,7 @@ impl Vm {
                         if !v.is_nil() || tab.meta.is_none() {
                             r!(a) = v;
                         } else {
-                            let v = slow!(self.index(Value::Table(env), key, None))?;
+                            let v = slow!(self.index_op(Value::Table(env), key, None))?;
                             r!(a) = v;
                         }
                     }
@@ -2843,7 +2895,7 @@ impl Vm {
                             }
                         }
                         let (t, key) = (r!(b), rk!(c));
-                        let v = slow!(self.index(t, key, Some(b as usize)))?;
+                        let v = slow!(self.index_op(t, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
                     Op::GetField(a, b, kx) => {
@@ -2861,7 +2913,7 @@ impl Vm {
                             }
                         }
                         let t = r!(b);
-                        let v = slow!(self.index(t, key, Some(b as usize)))?;
+                        let v = slow!(self.index_op(t, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
                     Op::SelfField(a, b, kx) => {
@@ -2880,7 +2932,7 @@ impl Vm {
                                 continue;
                             }
                         }
-                        let v = slow!(self.index(obj, key, Some(b as usize)))?;
+                        let v = slow!(self.index_op(obj, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
                     Op::SetField(a, kx, c) => {
@@ -2952,7 +3004,7 @@ impl Vm {
                             }
                         }
                         let key = rk!(c);
-                        let v = slow!(self.index(obj, key, Some(b as usize)))?;
+                        let v = slow!(self.index_op(obj, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
                     Op::Add(a, b, c) => arith!(a, b, c, +, Arith::Add),
@@ -2981,10 +3033,10 @@ impl Vm {
                         match self.tonumber(x) {
                             Some(n) => r!(a) = Value::Num(-n),
                             None => {
-                                // 5.1.5's `OP_UNM`: `Arith(L, ra, rb, rb, TM_UNM)`, the operand
-                                // passed twice.
+                                // The client's `OP_UNM` (`0x6f8ea1`): `call_binTM` with the operand
+                                // and a nil temporary (`0x6f8edc`), so `__unm` gets (operand, nil).
                                 let unm = self.names.unm;
-                                match slow!(self.bin_tm(x, x, unm))? {
+                                match slow!(self.bin_tm(x, Value::Nil, unm))? {
                                     Some(v) => r!(a) = v,
                                     None => {
                                         return Err(self.type_error(

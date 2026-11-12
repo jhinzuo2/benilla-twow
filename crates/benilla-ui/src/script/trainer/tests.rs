@@ -35,6 +35,7 @@ fn svc(
         skill_step: false,
         step_increase: None,
         line_name: Some(group_name.into()),
+        skill_line: None,
     }
 }
 
@@ -59,6 +60,7 @@ fn trainer() -> TrainerState {
         "Fury",
     );
     TrainerState {
+        list: 0,
         guid: 0x42,
         greeting: "What would you like to learn?".into(),
         trainer_type: 0,
@@ -265,6 +267,44 @@ fn service_getters_read_the_row_at_a_visible_index() {
     assert!(s
         .eval::<bool>("return GetTrainerServiceSkillReq(1) == nil")
         .unwrap());
+
+    // An empty name answers `nil, 0` and the flag (`0x4d9589`).
+    let mut t = trainer();
+    t.services[0].skill_req = Some(TrainerSkillReq {
+        name: String::new(),
+        rank: 100,
+        met: false,
+    });
+    s.set_trainer(Some(t));
+    assert!(s
+        .eval::<bool>(
+            "local n, r, m = GetTrainerServiceSkillReq(2) return n == nil and r == 0 and m == nil"
+        )
+        .unwrap());
+}
+
+/// `GetTrainerServiceSkillLine` answers the service's own skill line (`0x4d92bb`), never its
+/// group's name, and nil for a header, a service with none and a row past the list.
+#[test]
+fn the_skill_line_is_the_services_own_not_its_groups() {
+    let mut s = UiScript::new().unwrap();
+    let mut t = trainer();
+    t.services[0].skill_line = Some("Alchemy".into());
+    s.set_trainer(Some(t));
+    // Row 1 is Arms' header; rows 2 and 3 are its services.
+    assert_eq!(
+        s.eval::<String>("return GetTrainerServiceSkillLine(2)")
+            .unwrap(),
+        "Alchemy",
+        "not the group's \"Arms\""
+    );
+    for row in [1, 3, 99] {
+        assert!(
+            s.eval::<bool>(&format!("return GetTrainerServiceSkillLine({row}) == nil"))
+                .unwrap(),
+            "row {row}"
+        );
+    }
 }
 
 /// The reference's filter hide exempts no header (`0x4d8528`, `0x4d8535`).
@@ -414,6 +454,7 @@ fn buy_calls_with_an_available_services_spell_id_and_refuses_every_other_row() {
 #[test]
 fn selection_and_close_intents() {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_trainer(Some(trainer()));
     assert_eq!(
         s.eval::<i64>("return GetTrainerSelectionIndex()").unwrap(),
@@ -430,10 +471,8 @@ fn selection_and_close_intents() {
         0
     );
 
-    assert!(!s.take_trainer_close());
     s.run("CloseTrainer()").unwrap();
-    assert!(s.take_trainer_close());
-    assert!(!s.take_trainer_close(), "drained");
+    assert_eq!(s.take_trainer_calls(), [TrainerCall::Close]);
 }
 
 /// `IsTradeskillTrainer` tests type 2 (`0x4d8ea0`); `IsTalentTrainer` answers 1 with no trainer
@@ -460,6 +499,7 @@ fn tradeskill_and_talent_flags() {
     );
     recipe.is_trade_skill = true;
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: String::new(),
         trainer_type: 2,
@@ -474,6 +514,7 @@ fn tradeskill_and_talent_flags() {
         .unwrap());
 
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: String::new(),
         trainer_type: 1,
@@ -528,6 +569,7 @@ fn row_names_compare_byte_for_byte_and_headers_ignore_case() {
     ];
     let mut s = UiScript::new().unwrap();
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: String::new(),
         trainer_type: 0,
@@ -708,6 +750,7 @@ fn tradeskill_trainer_matches_the_emulated_reference_order() {
 
     let mut s = UiScript::new().unwrap();
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: "Care to learn how to turn the ore that you find into weapons?".into(),
         trainer_type: 2,
@@ -783,6 +826,7 @@ fn mount_trainer_folds_known_services_into_my_talents() {
     // The header reads its text by name (`0x4d8b11`), not off a service.
     s.run("KNOWN_TALENTS_HEADER = 'My Talents'").unwrap();
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: "Ready to ride?".into(),
         trainer_type: 1,
@@ -822,6 +866,7 @@ fn talent_order_sorts_on_state_within_a_group() {
     ];
     let mut s = UiScript::new().unwrap();
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: String::new(),
         trainer_type: 1,
@@ -833,6 +878,7 @@ fn talent_order_sorts_on_state_within_a_group() {
 
     // At a class trainer the same three sort by name: equal levels, no skill gates.
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: String::new(),
         trainer_type: 0,
@@ -859,6 +905,47 @@ fn the_filter_and_collapse_verbs_fire_trainer_update_in_place() {
     assert_eq!(seen, ["TRAINER_UPDATE 4", "TRAINER_UPDATE 3"]);
 }
 
+/// The fold verbs take `n - 1` signed (`0x4da6f4`, `0x4da774`): below 0 they fold every group, a
+/// row that is no header (`0x4d8be0` answers -1 for a service or a row past the total) raises
+/// "Bad skill line in ..." and fires no `TRAINER_UPDATE`.
+#[test]
+fn the_fold_verbs_take_a_negative_index_for_all_and_raise_on_a_bad_row() {
+    let mut s = UiScript::new().unwrap();
+    s.set_trainer(Some(trainer()));
+    s.run("CollapseTrainerSkillLine(-1)").unwrap();
+    assert_eq!(s.eval::<i64>("return GetNumTrainerServices()").unwrap(), 2);
+    s.run("ExpandTrainerSkillLine(-5)").unwrap();
+    assert_eq!(s.eval::<i64>("return GetNumTrainerServices()").unwrap(), 5);
+
+    crate::script::tick::heard::listen(&s, &["TRAINER_UPDATE"], None);
+    for (call, want) in [
+        (
+            "CollapseTrainerSkillLine(2)",
+            "Bad skill line in CollapseTrainerSkillLine",
+        ),
+        (
+            "CollapseTrainerSkillLine(6)",
+            "Bad skill line in CollapseTrainerSkillLine",
+        ),
+        (
+            "ExpandTrainerSkillLine(3)",
+            "Bad skill line in ExpandTrainerSkillLine",
+        ),
+        (
+            "ExpandTrainerSkillLine(99)",
+            "Bad skill line in ExpandTrainerSkillLine",
+        ),
+    ] {
+        let err = s.run(call).unwrap_err().to_string();
+        assert!(err.contains(want), "{call}: {err}");
+    }
+    assert!(
+        crate::script::tick::heard::take(&s).is_empty(),
+        "a raise fires no update"
+    );
+    assert_eq!(s.eval::<i64>("return GetNumTrainerServices()").unwrap(), 5);
+}
+
 /// `OpenTrainer` (`0x4d8cf0`) asks for the player's own list: it hands the host its call, which
 /// holds the player, and takes no argument.
 #[test]
@@ -867,10 +954,6 @@ fn open_trainer_calls_for_the_own_list() {
     s.keep_calls();
     s.run("OpenTrainer()").unwrap();
     assert_eq!(s.take_trainer_calls(), vec![TrainerCall::OpenOwn]);
-    assert!(
-        !s.take_trainer_close(),
-        "the close waits on the player, which the host sees"
-    );
 }
 
 /// `IsTrainerServiceSkillStep` (`0x4d9dd0`) and `GetTrainerServiceStepIncrease` (`0x4da030`).
@@ -1145,6 +1228,7 @@ fn every_finalize_sorts_the_whole_array_from_its_last_order() {
         let mut s = UiScript::new().unwrap();
         s.reset_trainer_list_state(trainer_type);
         s.set_trainer(Some(TrainerState {
+            list: 0,
             guid: 0,
             greeting: String::new(),
             trainer_type,
@@ -1344,6 +1428,7 @@ fn a_mount_trainer_always_builds_the_known_group_first() {
     let mut s = UiScript::new().unwrap();
     s.run("KNOWN_TALENTS_HEADER = 'My Talents'").unwrap();
     s.set_trainer(Some(TrainerState {
+        list: 0,
         guid: 0,
         greeting: String::new(),
         trainer_type: 1,
@@ -1465,6 +1550,7 @@ fn a_pass_keeps_the_lists_header_array() {
             "Ram Riding",
         );
         TrainerState {
+            list: 0,
             guid: 0x42,
             greeting: String::new(),
             trainer_type: 1,

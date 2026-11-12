@@ -14,7 +14,7 @@ const TRAINER: u64 = 0xF130_0000_0000_0042;
 /// The whole client, headless, with a class trainer open on [`TRAINER`] offering Heroic Strike
 /// (78), available, under one Arms header.
 fn client() -> (App, Receiver<ClientCommand>) {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     let world = app.world_mut();
@@ -43,7 +43,6 @@ fn client() -> (App, Receiver<ClientCommand>) {
         }],
         String::new(),
     );
-    world.resource_mut::<TrainerOpen>().fresh_list = false;
     let mut script = UiScript::new().expect("a VM");
     script.set_trainer(Some(TrainerState {
         guid: TRAINER,
@@ -58,6 +57,7 @@ fn client() -> (App, Receiver<ClientCommand>) {
         greeting: String::new(),
         trainer_type: 0,
         groups: Vec::new(),
+        list: 1,
     }));
     world.insert_non_send_resource(script);
     (app, rx)
@@ -94,5 +94,10 @@ fn the_trainer_verbs_send_inside_their_calls() {
             format!("TrainerList {{ trainer: {ME} }}"),
             "RandomRoll { min: 3, max: 4 }".to_string(),
         ]
+    );
+    assert_eq!(
+        app.world().resource::<TrainerOpen>().asked,
+        ME,
+        "`TalkToTrainer` stores the guid it asks (`0x5df69f`)"
     );
 }

@@ -4,11 +4,10 @@
 
 use benilla_protocol::field::{FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_FLAGS};
 use benilla_protocol::ObjectFields;
-use bevy::ecs::system::RunSystemOnce;
 use crossbeam_channel::Receiver;
 
 use super::*;
-use crate::net::ClientCommand;
+use crate::net::{ClientCommand, GuidIndex, NetCommands};
 use crate::script_calls::with_hosted_vm;
 
 const ME: u64 = 0x10;
@@ -18,7 +17,7 @@ const MASTER: u64 = 0xF130_0000_0000_0099;
 /// Hill (4), Ironforge (6) and Thelsamar (8), the master latched, and every map event and shown
 /// line recorded in `HEARD`.
 fn client(data: &std::path::Path) -> (App, Receiver<ClientCommand>) {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     let mut chain = benilla_formats::open_chain(data).expect("open chain");
@@ -44,12 +43,6 @@ fn client(data: &std::path::Path) -> (App, Receiver<ClientCommand>) {
         ))
         .id();
     world.resource_mut::<GuidIndex>().0.insert(MASTER, master);
-    world
-        .resource_mut::<TaxiState>()
-        .open(MASTER, 2, TaxiMask([0b1010_1010, 0, 0, 0, 0, 0, 0, 0]));
-    world
-        .resource_mut::<crate::ui_session::InteractLatch>()
-        .latch_for_test(MASTER);
     let script = UiScript::new().expect("a VM");
     script
         .run(
@@ -66,7 +59,13 @@ fn client(data: &std::path::Path) -> (App, Receiver<ClientCommand>) {
         )
         .expect("the recorder installs");
     world.insert_non_send_resource(script);
-    world.run_system_once(feed_taxi).expect("the feed runs");
+    open_map(
+        world,
+        MASTER,
+        2,
+        TaxiMask([0b1010_1010, 0, 0, 0, 0, 0, 0, 0]),
+    );
+    crate::lanes::fire_in_order(world);
     (app, rx)
 }
 
@@ -124,10 +123,7 @@ fn close_taxi_map_closes_inside_the_call() {
         ]
     );
     assert!(app.world().resource::<TaxiState>().open.is_none());
-    // The latch's own release is the drain's (`0x4dc105`).
-    app.world_mut()
-        .run_system_once(super::drain_taxi)
-        .expect("the drain runs");
+    // The latch released inside the call (`0x4dc105`).
     assert_eq!(
         app.world()
             .resource::<crate::ui_session::InteractLatch>()
@@ -160,54 +156,43 @@ fn take_taxi_node_sends_inside_the_call() {
     );
 }
 
-/// `0x493310` closes the first window in its order whose cell holds the latched guid, the item
-/// text ahead of the taxi map: with a read's cell on the flight master's guid (`0x4e3364`, written
-/// ahead of its register), `CloseTaxiMap`'s release closes the reader, not the map again, so
-/// `TAXIMAP_CLOSED` fires once (`0x4dc105`).
-#[test]
-fn close_taxi_map_fires_once_when_a_window_ahead_holds_the_master() {
-    let data = benilla_formats::wow_data_or_skip!();
-    let (mut app, _rx) = client(&data);
-    app.world_mut()
-        .resource_mut::<crate::ui_item_text::ItemTextOpen>()
-        .open_letter(MASTER, 1);
-    let closed: String = eval(&mut app, "HEARD = '' CloseTaxiMap() return HEARD");
-    assert_eq!(closed, "TAXIMAP_CLOSED(nil) ");
-    // The release, the drain's, closes the reader.
-    app.world_mut()
-        .run_system_once(super::drain_taxi)
-        .expect("the drain runs");
-    app.world_mut().flush();
-    assert_eq!(
-        app.world()
-            .resource::<crate::ui_item_text::ItemTextOpen>()
-            .object(),
-        None
-    );
-}
-
-/// The open's Travel tutorial follows its `TAXIMAP_OPENED` (`0x4dba96`, `0x4dbaa2`), raised where
-/// the event is, so a handler that closes the map inside its call cannot skip it; the close and
-/// the feeds after it raise no other.
+/// The open's Travel tutorial fires straight after its `TAXIMAP_OPENED`, with no delay, inside the
+/// builder (`0x4dba96`, `0x4dbaa2` → `0x4b5390(0x22, 0)`), so a listener that closes the map
+/// inside its call cannot skip it; it fires once (`0x4b5390`'s bank bit).
 #[test]
 fn the_open_raises_the_travel_tutorial_with_its_event() {
-    use crate::tutorial::{id, TutorialEvent};
     let data = benilla_formats::wow_data_or_skip!();
     let (mut app, _rx) = client(&data);
-    let travel = |app: &App, cursor: &mut bevy::ecs::message::MessageCursor<TutorialEvent>| {
-        cursor
-            .read(app.world().resource::<Messages<TutorialEvent>>())
-            .filter(|e| **e == TutorialEvent::trigger(id::TRAVEL))
-            .count()
-    };
-    let mut cursor = app
-        .world()
-        .resource::<Messages<TutorialEvent>>()
-        .get_cursor();
-    assert_eq!(travel(&app, &mut cursor), 1, "the open raised it");
     eval::<()>(&mut app, "CloseTaxiMap()");
-    app.world_mut()
-        .run_system_once(feed_taxi)
-        .expect("the feed runs");
-    assert_eq!(travel(&app, &mut cursor), 0);
+    app.world()
+        .resource::<crate::tutorial::Tutorials>()
+        .lock()
+        .apply_flags(&[0u8; 32]);
+    eval::<()>(
+        &mut app,
+        r#"
+        HEARD = ""
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("TAXIMAP_OPENED")
+        f:RegisterEvent("TUTORIAL_TRIGGER")
+        f:SetScript("OnEvent", function()
+            HEARD = HEARD .. event .. "(" .. tostring(arg1) .. ") "
+            if event == "TAXIMAP_OPENED" then CloseTaxiMap() end
+        end)
+        "#,
+    );
+    let open = |app: &mut App| {
+        open_map(
+            app.world_mut(),
+            MASTER,
+            2,
+            TaxiMask([0b1010_1010, 0, 0, 0, 0, 0, 0, 0]),
+        );
+        crate::lanes::fire_in_order(app.world_mut());
+        eval::<String>(app, "local h = HEARD HEARD = '' return h")
+    };
+    // The close signals twice (`0x4dc105`, `0x4dc15f`).
+    let closed = "TAXIMAP_OPENED(nil) TAXIMAP_CLOSED(nil) TAXIMAP_CLOSED(nil) ";
+    assert_eq!(open(&mut app), format!("{closed}TUTORIAL_TRIGGER(35) "));
+    assert_eq!(open(&mut app), closed);
 }

@@ -14,6 +14,7 @@ fn enabled(s: &UiScript, button: &str) -> bool {
 fn minimap_zoom_buttons_resync_when_switching_inside_and_outside() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // Host globals the cluster calls that a bare engine does not install.
     s.run("function GetMinimapZoneText() return '' end")
@@ -71,13 +72,15 @@ fn minimap_zoom_buttons_resync_when_switching_inside_and_outside() {
 }
 
 /// Stock `MiniMapTrackingFrame` (`Minimap.xml:109-174`) follows `GetTrackingTexture()` on
-/// `PLAYER_AURAS_CHANGED`, which the aura feed fires beside `UNIT_AURA`.
+/// `PLAYER_AURAS_CHANGED`, which the aura watcher fires beside `UNIT_AURA`.
 #[test]
 fn tracking_frame_follows_get_tracking_texture_across_player_auras_changed() {
     let _data = benilla_formats::wow_data_or_skip!();
     use benilla_ui::script::TrackingState;
 
     let mut s = UiScript::new().unwrap();
+
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -116,6 +119,7 @@ fn tracking_frame_follows_get_tracking_texture_across_player_auras_changed() {
 /// The cluster and the stock `GameTime.xml`, the clock at `hour:minute` as the app pushes it.
 fn game_time_session(hour: i32, minute: i32) -> UiScript {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -222,6 +226,7 @@ fn hovering_the_indicator_shows_and_live_updates_the_game_time_tooltip() {
 fn a_click_on_the_minimap_pings_the_world_point_under_it() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -280,6 +285,7 @@ fn a_click_on_the_minimap_pings_the_world_point_under_it() {
 fn get_ping_position_answers_two_numbers_always() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -350,6 +356,7 @@ fn get_ping_position_answers_two_numbers_always() {
 fn the_meeting_stone_icon_follows_the_queue_across_meetingstone_changed() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -421,6 +428,7 @@ fn a_shown_ping_pane_asks_for_a_tile_and_draws_its_cell() {
 
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -614,13 +622,15 @@ fn a_shown_ping_pane_asks_for_a_tile_and_draws_its_cell() {
 /// rim arrows disc-sized frames the arrow push shows and aims. Each is a child, a level above the
 /// minimap, so its pane paints after the minimap's own draw, the tiles and dots included: the
 /// draw pass submits levels in ascending order (`0x7657d0`), and the minimap's render is a
-/// callback on its own level's first layer (`0x4ebe70`).
+/// callback on its own level's first layer (`0x4ebe70`). A rim arrow is a copy of one model and
+/// keeps its depth fill; the player arrow's `SetModel` create turns it off.
 #[test]
 fn the_stock_minimaps_arrows_are_its_children_s_panes_above_its_own_draw() {
     use benilla_ui::script::{MinimapRimArrow, QuadContent};
     use benilla_ui::widget::{ModelFileFacts, SequenceFacts};
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.run("function GetMinimapZoneText() return '' end")
         .unwrap();
@@ -665,6 +675,7 @@ fn the_stock_minimaps_arrows_are_its_children_s_panes_above_its_own_draw() {
             cameras: 0,
         },
     );
+    s.centre_minimap_player_arrows();
     s.set_minimap_player_facing(0.5);
     s.set_minimap_arrows(
         &[MinimapRimArrow {
@@ -691,18 +702,19 @@ fn the_stock_minimaps_arrows_are_its_children_s_panes_above_its_own_draw() {
                 model: Some(m),
                 facing,
                 position,
+                depth_fill,
                 ..
-            } => Some((q, m.clone(), *facing, *position)),
+            } => Some((q, m.clone(), *facing, *position, *depth_fill)),
             _ => None,
         })
-        .filter(|(_, m, _, _)| m.contains("MinimapArrow"))
+        .filter(|(_, m, _, _, _)| m.contains("MinimapArrow"))
         .collect();
     assert_eq!(
         panes.len(),
         2,
         "the player arrow and one rim arrow: {panes:?}"
     );
-    for (q, m, facing, position) in &panes {
+    for (q, m, facing, position, depth_fill) in &panes {
         assert!(q.z > minimap.z, "{m} paints above the minimap's own draw");
         let r = q.rect.expect("a resolved rect");
         let c = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
@@ -712,6 +724,8 @@ fn the_stock_minimaps_arrows_are_its_children_s_panes_above_its_own_draw() {
                 "0.001 layout units up and right: {c:?} vs {centre:?}"
             );
             assert!((facing - 0.5).abs() < 1e-6);
+            // Its file is set through `SetModel`'s create, flags 5 (`0x4ee269` → `0x76ccf5`).
+            assert!(!depth_fill, "the player arrow has no depth fill");
             // Centred on its own box, half the extent each way (`0x4ee100`).
             assert!(
                 (position.0 - 0.0131).abs() < 1e-4 && (position.1 - 0.01315).abs() < 1e-4,
@@ -719,6 +733,8 @@ fn the_stock_minimaps_arrows_are_its_children_s_panes_above_its_own_draw() {
             );
         } else {
             assert!((r.right - r.left - 140.8).abs() < 0.01, "disc-sized: {r:?}");
+            // A copy of the one arrow model, flags 0 (`0x4ee206`).
+            assert!(depth_fill, "a rim arrow keeps its depth fill");
             assert!((c.0 - centre.0).abs() < 0.01 && (c.1 - centre.1).abs() < 0.01);
             // Due north: the top of the disc, 0.8 of the half disc out.
             assert!((position.0 - 0.055).abs() < 1e-6 && (position.1 - 0.099).abs() < 1e-6);

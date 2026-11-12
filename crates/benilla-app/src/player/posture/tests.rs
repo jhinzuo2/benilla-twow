@@ -165,6 +165,7 @@ fn the_stand_state_stop_sends_the_attack_stop_only_while_attacking() {
     world.init_resource::<crate::spell::SpellTargeting>();
     world.init_resource::<crate::ui_cast::CastReports>();
     world.init_resource::<crate::creature_anim::AttackStopInFlight>();
+    world.init_resource::<crate::creature_anim::UnitEdits>();
     let me = world.spawn(crate::net::SelfPlayer).id();
     let sent = |rx: &crossbeam_channel::Receiver<ClientCommand>| {
         rx.try_iter().map(|c| format!("{c:?}")).collect::<Vec<_>>()
@@ -200,26 +201,40 @@ fn a_sit_closes_the_loot_and_stops_the_attack_and_a_stand_does_neither() {
     world.init_resource::<crate::spell::SpellTargeting>();
     world.init_resource::<crate::ui_cast::CastReports>();
     world.init_resource::<crate::creature_anim::AttackStopInFlight>();
+    world.init_resource::<crate::creature_anim::UnitEdits>();
     world.init_resource::<crate::player::StandPending>();
-    world.init_resource::<crate::ui_loot::LootMoveStart>();
+    world.init_resource::<crate::net::GuidIndex>();
+    world.init_resource::<crate::ui_loot::LootState>();
+    world.init_resource::<crate::ui_loot::LootLatch>();
     world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
     world.spawn((
         crate::net::SelfPlayer,
         crate::creature_anim::Engaged(0xf130_0000_0000_0001),
     ));
+    const CORPSE: u64 = 0xf130_0000_0000_0042;
     let mut apply = |s: u8, stand_now: u8| {
+        let mut loot = world.resource_mut::<crate::ui_loot::LootState>();
+        loot.open(
+            CORPSE,
+            benilla_protocol::messages::loot_type::CORPSE,
+            0,
+            vec![],
+        );
+        // Open long ago: its `LOOT_OPENED` has fired.
+        loot.signals_fired();
+        world.resource_mut::<crate::ui_loot::LootLatch>().0 = Some(CORPSE);
         world
             .run_system_once(
                 move |mut player: ResMut<crate::player::StandPending>,
                       me: super::super::SelfPosture,
                       mut commands: Commands,
                       mut sheath: MessageWriter<crate::creature_anim::SheathRequest>,
-                      mut loot: ResMut<crate::ui_loot::LootMoveStart>| {
+                      mut loot: crate::ui_loot::MoveStartClose| {
                     super::apply_locally(
                         &mut player,
                         s,
                         stand_now,
-                        me.single().ok(),
+                        me.single(),
                         &mut commands,
                         &mut sheath,
                         &mut loot,
@@ -227,14 +242,27 @@ fn a_sit_closes_the_loot_and_stops_the_attack_and_a_stand_does_neither() {
                 },
             )
             .unwrap();
-        let closed = std::mem::take(&mut world.resource_mut::<crate::ui_loot::LootMoveStart>().0);
+        let closed = world
+            .resource::<crate::ui_loot::LootState>()
+            .source()
+            .is_none();
+        world
+            .resource_mut::<crate::ui_loot::LootState>()
+            .clear_session();
+        world.resource_mut::<crate::ui_loot::LootLatch>().0 = None;
         let sent: Vec<String> = rx.try_iter().map(|c| format!("{c:?}")).collect();
         (closed, sent)
     };
     assert_eq!(
         apply(1, 0),
-        (true, vec!["AttackStop".to_string()]),
-        "the sit closes the loot and ends the attack"
+        (
+            true,
+            vec![
+                format!("LootRelease {{ guid: {CORPSE} }}"),
+                "AttackStop".to_string()
+            ]
+        ),
+        "the sit closes the loot, released there, then ends the attack"
     );
     assert_eq!(apply(0, 1), (false, vec![]), "the stand does neither");
 }
@@ -318,11 +346,10 @@ fn under_possession_the_posture_verbs_act_on_the_active_player() {
     world.insert_resource(NetCommands(tx));
     world.init_resource::<super::Player>();
     world.init_resource::<crate::player::StandPending>();
-    world.init_resource::<crate::ui_loot::LootMoveStart>();
+    world.init_resource::<crate::net::GuidIndex>();
     world.init_resource::<crate::bindings::BindingsState>();
     world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
     world.init_resource::<Messages<super::StandStateRequest>>();
-    world.init_resource::<Messages<super::super::ServerStandState>>();
     // The priest channels Mind Control; the creature it drives stands, unchannelled.
     let priest = world
         .spawn((
@@ -334,7 +361,7 @@ fn under_possession_the_posture_verbs_act_on_the_active_player() {
 
     let frame = |world: &mut World, ask: Option<u8>, moving: bool| -> (u8, Vec<String>) {
         if let Some(state) = ask {
-            world.write_message(super::StandStateRequest { state });
+            world.write_message(super::StandStateRequest { state, sent: false });
         }
         let stand = world
             .run_system_once(
@@ -346,9 +373,8 @@ fn under_possession_the_posture_verbs_act_on_the_active_player() {
                       net: Res<NetCommands>,
                       mut commands: Commands,
                       mut sheath: MessageWriter<crate::creature_anim::SheathRequest>,
-                      mut loot: ResMut<crate::ui_loot::LootMoveStart>,
-                      mut asks: MessageReader<super::StandStateRequest>,
-                      mut server: MessageReader<super::super::ServerStandState>| {
+                      mut loot: crate::ui_loot::MoveStartClose,
+                      mut asks: MessageReader<super::StandStateRequest>| {
                     super::update(
                         &mut player,
                         &mut pending,
@@ -360,7 +386,6 @@ fn under_possession_the_posture_verbs_act_on_the_active_player() {
                         &mut sheath,
                         &mut loot,
                         &mut asks,
-                        &mut server,
                         super::PlayerReads::default(),
                         None,
                         moving,
@@ -392,4 +417,226 @@ fn under_possession_the_posture_verbs_act_on_the_active_player() {
         Vec::<String>::new(),
         "the creature's movement stands nobody"
     );
+}
+
+/// The attack's stand-up sends its packet in place (`0x5ecc9b` → `0x5ed501`), so its ask owes the
+/// local apply alone (`0x5ed53f` → `0x6127b0`): the prediction, and no second packet.
+#[test]
+fn a_stand_ask_sent_in_place_applies_locally_and_sends_nothing() {
+    use bevy::ecs::message::Messages;
+    use bevy::ecs::system::RunSystemOnce;
+
+    use crate::net::{Embodied, ObjectStore, SelfPlayer};
+
+    let mut world = World::new();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    world.insert_resource(NetCommands(tx));
+    world.init_resource::<super::Player>();
+    world.init_resource::<crate::player::StandPending>();
+    world.init_resource::<crate::net::GuidIndex>();
+    world.init_resource::<crate::bindings::BindingsState>();
+    world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
+    world.init_resource::<Messages<super::StandStateRequest>>();
+    world.spawn((
+        SelfPlayer,
+        Embodied,
+        Transform::default(),
+        ObjectStore(alive(&[(benilla_protocol::field::FIELD_UNIT_BYTES_1, 1)])),
+    ));
+    world.write_message(super::StandStateRequest {
+        state: 0,
+        sent: true,
+    });
+    world
+        .run_system_once(
+            |mut player: ResMut<super::Player>,
+             mut pending: ResMut<crate::player::StandPending>,
+             body: super::BodyQuery,
+             me: super::super::SelfPosture,
+             binds: Res<crate::bindings::BindingsState>,
+             net: Res<NetCommands>,
+             mut commands: Commands,
+             mut sheath: MessageWriter<crate::creature_anim::SheathRequest>,
+             mut loot: crate::ui_loot::MoveStartClose,
+             mut asks: MessageReader<super::StandStateRequest>| {
+                super::update(
+                    &mut player,
+                    &mut pending,
+                    &body,
+                    &me,
+                    &binds,
+                    &net,
+                    &mut commands,
+                    &mut sheath,
+                    &mut loot,
+                    &mut asks,
+                    super::PlayerReads::default(),
+                    None,
+                    false,
+                    false,
+                )
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        rx.try_iter().count(),
+        0,
+        "the packet went out at the attack"
+    );
+    assert_eq!(world.resource::<crate::player::StandPending>().0, Some(0));
+}
+
+/// The posture pass with the world's own state, as the controller runs it; its stand state.
+fn posture_frame(world: &mut World) -> u8 {
+    use bevy::ecs::system::RunSystemOnce;
+    world
+        .run_system_once(
+            |mut player: ResMut<super::Player>,
+             mut pending: ResMut<crate::player::StandPending>,
+             body: super::BodyQuery,
+             me: super::super::SelfPosture,
+             binds: Res<crate::bindings::BindingsState>,
+             net: Res<NetCommands>,
+             mut commands: Commands,
+             mut sheath: MessageWriter<crate::creature_anim::SheathRequest>,
+             mut loot: crate::ui_loot::MoveStartClose,
+             mut asks: MessageReader<super::StandStateRequest>| {
+                super::update(
+                    &mut player,
+                    &mut pending,
+                    &body,
+                    &me,
+                    &binds,
+                    &net,
+                    &mut commands,
+                    &mut sheath,
+                    &mut loot,
+                    &mut asks,
+                    super::PlayerReads::default(),
+                    None,
+                    false,
+                    false,
+                )
+            },
+        )
+        .unwrap()
+}
+
+/// A bare world with the posture pass's state, the write channel's reader beside it.
+fn posture_world() -> (World, crossbeam_channel::Receiver<ClientCommand>) {
+    use bevy::ecs::message::Messages;
+    let mut world = World::new();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    world.insert_resource(NetCommands(tx));
+    world.init_resource::<super::Player>();
+    world.init_resource::<crate::player::StandPending>();
+    world.init_resource::<crate::net::GuidIndex>();
+    world.init_resource::<crate::bindings::BindingsState>();
+    world.init_resource::<crate::creature_anim::UnitEdits>();
+    world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
+    world.init_resource::<Messages<super::StandStateRequest>>();
+    (world, rx)
+}
+
+/// `ToggleSheath`'s attack leg reads `[+0xc48]` as the frame leaves it (`0x5eb513`): a swing a
+/// link of the pass started, still queued, refuses the toggle, and an end it queued lets it go.
+#[test]
+fn the_sheath_toggle_reads_the_attack_target_the_queued_edits_leave() {
+    use bevy::ecs::message::Messages;
+
+    use crate::creature_anim::{SheathRequest, UnitEdit, UnitEdits};
+    use crate::net::{Embodied, ObjectStore, SelfPlayer};
+
+    let (mut world, _rx) = posture_world();
+    let me = world
+        .spawn((
+            SelfPlayer,
+            Embodied,
+            crate::creature_anim::AnimDriver::default(),
+            Wielded {
+                main: Some((2, 7)),
+                ..Default::default()
+            },
+            ObjectStore(alive(&[])),
+        ))
+        .id();
+    let toggled = |world: &mut World| {
+        world
+            .resource_mut::<crate::bindings::BindingsState>()
+            .fire_for_test(crate::bindings::Input::ToggleSheath);
+        posture_frame(world);
+        world
+            .resource_mut::<crate::bindings::BindingsState>()
+            .clear_for_test();
+        world
+            .resource_mut::<Messages<SheathRequest>>()
+            .drain()
+            .count()
+    };
+    assert_eq!(toggled(&mut world), 1, "nothing in the way");
+    world.resource::<UnitEdits>().push(UnitEdit::StartAttack {
+        entity: me,
+        target: 0xF130_0000_0000_0042,
+    });
+    assert_eq!(toggled(&mut world), 0, "a queued swing refuses it");
+    crate::creature_anim::apply_unit_edits(&mut world);
+    world.resource::<UnitEdits>().push(UnitEdit::EndAttack(me));
+    assert_eq!(toggled(&mut world), 1, "a queued end lets it go");
+}
+
+/// A stand ask sent in place applies locally in its order among the frame's asks (`0x5ed53f` →
+/// `0x6127b0`), so a later ask for the same state reads it standing (`GetStandState` `0x5ed570`
+/// answers the prediction) and sends no second `CMSG_STANDSTATECHANGE`.
+#[test]
+fn a_stand_sent_in_place_leaves_a_later_ask_for_it_nothing_to_send() {
+    use crate::net::{Embodied, ObjectStore, SelfPlayer};
+
+    let (mut world, rx) = posture_world();
+    world.spawn((
+        SelfPlayer,
+        Embodied,
+        Transform::default(),
+        ObjectStore(alive(&[(benilla_protocol::field::FIELD_UNIT_BYTES_1, 1)])),
+    ));
+    for sent in [true, false] {
+        world.write_message(super::StandStateRequest { state: 0, sent });
+    }
+    posture_frame(&mut world);
+    assert_eq!(
+        rx.try_iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
+        Vec::<String>::new(),
+        "the one packet went out at the attack"
+    );
+    assert_eq!(world.resource::<crate::player::StandPending>().0, Some(0));
+}
+
+/// Each queued ask is its own `SetStandState` in its order (`0x5ed430`): a sit asked ahead of the
+/// attack's stand sends its packet and applies, and the stand, sent at the attack, then applies
+/// over it.
+#[test]
+fn a_sit_asked_ahead_of_the_attacks_stand_still_sends() {
+    use crate::net::{Embodied, ObjectStore, SelfPlayer};
+
+    let (mut world, rx) = posture_world();
+    world.spawn((
+        SelfPlayer,
+        Embodied,
+        Transform::default(),
+        ObjectStore(alive(&[])),
+    ));
+    world.write_message(super::StandStateRequest {
+        state: 1,
+        sent: false,
+    });
+    world.write_message(super::StandStateRequest {
+        state: 0,
+        sent: true,
+    });
+    posture_frame(&mut world);
+    assert_eq!(
+        rx.try_iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
+        ["StandStateChange { state: 1 }"],
+        "the sit's packet; the stand's went out at the attack"
+    );
+    assert_eq!(world.resource::<crate::player::StandPending>().0, Some(0));
 }

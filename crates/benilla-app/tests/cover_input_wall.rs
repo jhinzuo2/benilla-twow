@@ -30,6 +30,8 @@ const VERDICTS: &[(&str, Verdict)] = &[
     ("MouseMotion", Swallowed),
     ("MouseWheel", Swallowed),
     ("CursorMoved", Swallowed),
+    // The stream the input records are read from, in the window's order.
+    ("WindowEvent", Swallowed),
     ("AccumulatedMouseMotion", Swallowed),
     ("AccumulatedMouseScroll", Swallowed),
     // The pointer position is a field, not a message; the cover blanks it.
@@ -91,6 +93,8 @@ const VERDICTS: &[(&str, Verdict)] = &[
     ("MouseButton", Plumbing),
     ("MouseScrollUnit", Plumbing),
     ("NativeKey", Plumbing),
+    ("NativeKeyCode", Plumbing),
+    ("ACCESS_KIT_ADAPTERS", Plumbing),
     ("ExitCondition", Plumbing),
     ("Monitor", Plumbing),
     ("MonitorSelection", Plumbing),
@@ -99,6 +103,7 @@ const VERDICTS: &[(&str, Verdict)] = &[
     ("RawHandleWrapper", Plumbing),
     ("VideoMode", Plumbing),
     ("Window", Plumbing),
+    ("WindowCreated", Plumbing),
     ("WindowLevel", Plumbing),
     ("WindowMode", Plumbing),
     ("WindowPlugin", Plumbing),
