@@ -1675,7 +1675,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// Run `f` on the VM with the host lent around all of it, as [`HostedVm::run`]; `P` waits
     /// outside, so what a call does to it is there for the next [`Self::own`].
     pub(crate) fn run<R>(&mut self, f: impl FnOnce(Option<&mut UiScript>) -> R) -> R {
-        let mut host = self.set.p1();
+        let mut host = self.set.p1_valid();
         match self.script.as_deref_mut() {
             Some(script) => lent(script, host.as_mut(), |script| f(Some(script))),
             None => f(None),
@@ -1695,7 +1695,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
             return f(None, self.set.p0());
         };
         #[cfg(debug_assertions)]
-        if let Some(host) = self.set.p1().as_ref() {
+        if let Some(host) = self.set.p1_valid().as_ref() {
             host.census_probe();
         }
         let r = script.host_out(|script| {
@@ -1704,7 +1704,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
             self.set.end_lend();
             r
         });
-        match self.set.p1().as_mut() {
+        match self.set.p1_valid().as_mut() {
             Some(host) => script.hosted(host, |_| ()),
             None => {
                 script.refuse_waiting();
@@ -1724,7 +1724,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
         pay: impl FnOnce(SystemParamItem<'_, '_, P>, crate::target::SelectDebt),
     ) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_select(script, select);
                 return;
             }
@@ -1736,7 +1736,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// ([`ScriptCallHost::engine_open_used`]); with no VM or no host, nothing opens it.
     pub(crate) fn engine_open_used(&mut self, mark: crate::lanes::Mark) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_open_used(script, mark);
             }
         }
@@ -1746,7 +1746,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// ([`ScriptCallHost::engine_usable_refresh`]); with no VM or no host, nobody listens.
     pub(crate) fn engine_usable_refresh(&mut self) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_usable_refresh(script);
             }
         }
@@ -1756,7 +1756,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// ([`ScriptCallHost::engine_enter_world_refresh`]): whether a pair changed; with no VM or no
     /// host, none did.
     pub(crate) fn engine_enter_world_refresh(&mut self) -> bool {
-        match (self.script.as_deref_mut(), self.set.p1().as_mut()) {
+        match (self.script.as_deref_mut(), self.set.p1_valid().as_mut()) {
             (Some(script), Some(host)) => host.engine_enter_world_refresh(script),
             _ => false,
         }
@@ -1766,7 +1766,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// ([`ScriptCallHost::engine_usable_cache_refresh`]); with no VM or no host, nobody listens.
     pub(crate) fn engine_usable_cache_refresh(&mut self) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_usable_cache_refresh(script);
             }
         }
@@ -1775,7 +1775,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// A follow stop's autorun clear on the host's bit, VM or not
     /// ([`crate::player::CommandSteps::clear_autorun`]); with no host, nothing holds the bit.
     pub(crate) fn engine_autorun_clear(&mut self) {
-        if let Some(host) = self.set.p1().as_mut() {
+        if let Some(host) = self.set.p1_valid().as_mut() {
             host.appliers.commands().clear_autorun();
         }
     }
@@ -1784,7 +1784,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// host, nothing stores the pair.
     pub(crate) fn engine_slot_written(&mut self, action: u32) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_slot_written(script, action);
             }
         }
@@ -1793,7 +1793,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// Our player's arrival's slot pass with the host ([`ScriptCallHost::engine_arrival_slots`]).
     pub(crate) fn engine_arrival_slots(&mut self) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_arrival_slots(script);
             }
         }
@@ -1803,7 +1803,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// with no VM or no host, where no slot is read.
     pub(crate) fn engine_item_count(&mut self, entry: u32) -> Option<u32> {
         self.script.as_ref()?;
-        self.set.p1().as_mut()?.engine_item_count(entry)
+        self.set.p1_valid().as_mut()?.engine_item_count(entry)
     }
 
     /// `0x4e5de0`'s notify of one slot with the host
@@ -1813,7 +1813,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
             return false;
         };
         self.set
-            .p1()
+            .p1_valid()
             .as_mut()
             .is_some_and(|host| host.engine_spell_slot_notified(script, action, spell))
     }
@@ -1824,7 +1824,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
             return false;
         };
         self.set
-            .p1()
+            .p1_valid()
             .as_mut()
             .is_some_and(|host| host.engine_recounted(script, action, entry, count))
     }
@@ -1834,7 +1834,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// selection stands.
     pub(crate) fn engine_clear_target(&mut self, mark: crate::lanes::Mark) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_clear_target(script, mark);
             }
         }
@@ -1849,7 +1849,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
         start: impl FnOnce(SystemParamItem<'_, '_, P>),
     ) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_attack(script, guid, mark);
                 return;
             }
@@ -1865,7 +1865,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
         send: impl FnOnce(SystemParamItem<'_, '_, P>),
     ) {
         if let Some(script) = self.script.as_deref_mut() {
-            if let Some(host) = self.set.p1().as_mut() {
+            if let Some(host) = self.set.p1_valid().as_mut() {
                 host.engine_cast(script, spell_id);
                 return;
             }
@@ -1894,10 +1894,37 @@ pub(crate) fn with_hosted_vm<R>(
     world: &mut World,
     f: impl FnOnce(Option<&mut UiScript>) -> R,
 ) -> R {
-    let mut state = bevy::ecs::system::SystemState::<HostedVm>::new(world);
-    let r = state.get_mut(world).run(f);
-    state.apply(world);
+    let r = with_cached_state::<HostedVm, _>(world, |state, world| {
+        let r = state.get_mut(world).run(f);
+        state.apply(world);
+        r
+    });
     crate::creature_anim::apply_unit_edits(world);
+    r
+}
+
+/// The [`SystemState`](bevy::ecs::system::SystemState) of `P` an exclusive entry builds its host
+/// from, kept in the world between calls. Building one matches each of its queries against every
+/// archetype the world holds, and the host's queries are many; a kept state matches only the
+/// archetypes made since its last use. Its `Local`s live on between calls, as a system's do.
+struct CachedState<P: SystemParam + 'static>(Option<bevy::ecs::system::SystemState<P>>);
+
+/// Run `f` on the kept [`CachedState`] of `P`, built on the first call. The state is out of the
+/// world while `f` runs, so an entry nested in it (a command in its apply that reaches the VM
+/// again) builds one of its own.
+fn with_cached_state<P: SystemParam + 'static, R>(
+    world: &mut World,
+    f: impl FnOnce(&mut bevy::ecs::system::SystemState<P>, &mut World) -> R,
+) -> R {
+    let kept = world
+        .get_non_send_resource_mut::<CachedState<P>>()
+        .and_then(|mut cached| cached.0.take());
+    let mut state = kept.unwrap_or_else(|| bevy::ecs::system::SystemState::<P>::new(world));
+    let r = f(&mut state, world);
+    match world.get_non_send_resource_mut::<CachedState<P>>() {
+        Some(mut cached) => cached.0 = Some(state),
+        None => world.insert_non_send_resource(CachedState(Some(state))),
+    }
     r
 }
 
@@ -1925,15 +1952,17 @@ pub(crate) fn lent_by_world<R>(
     script: &mut UiScript,
     f: impl FnOnce(&mut UiScript) -> R,
 ) -> R {
-    let mut state = bevy::ecs::system::SystemState::<Option<ScriptCallHost>>::new(world);
-    let r = {
-        let mut host = state.get_mut(world);
-        match host.as_mut() {
-            Some(host) => script.hosted(host, f),
-            None => script.refusing(f),
-        }
-    };
-    state.apply(world);
+    let r = with_cached_state::<Option<ScriptCallHost>, _>(world, |state, world| {
+        let r = {
+            let mut host = state.get_mut(world);
+            match host.as_mut() {
+                Some(host) => script.hosted(host, f),
+                None => script.refusing(f),
+            }
+        };
+        state.apply(world);
+        r
+    });
     crate::creature_anim::apply_unit_edits(world);
     r
 }
@@ -5363,5 +5392,61 @@ mod tests {
              so a call their Lua makes is refused:\n  {}",
             unhosted.join("\n  ")
         );
+    }
+}
+
+#[cfg(test)]
+mod cached_state_tests {
+    use super::*;
+
+    #[derive(Component)]
+    struct Mark;
+
+    #[derive(Component)]
+    struct Other;
+
+    fn count(world: &mut World) -> usize {
+        with_cached_state::<Query<&Mark>, _>(world, |state, world| state.get(world).iter().count())
+    }
+
+    #[test]
+    fn a_kept_state_sees_the_archetypes_made_after_it() {
+        let mut world = World::new();
+        world.spawn(Mark);
+        assert_eq!(count(&mut world), 1);
+        assert!(world
+            .get_non_send_resource::<CachedState<Query<&Mark>>>()
+            .is_some());
+        // A new archetype holding the component, made after the state was built and kept.
+        world.spawn((Mark, Other));
+        assert_eq!(count(&mut world), 2);
+    }
+
+    #[test]
+    fn an_entry_nested_in_the_apply_builds_its_own() {
+        let mut world = World::new();
+        world.spawn(Mark);
+        let (outer, inner) = with_cached_state::<Query<&Mark>, _>(&mut world, |state, world| {
+            let outer = state.get(world).iter().count();
+            world.spawn(Mark);
+            (outer, count(world))
+        });
+        assert_eq!((outer, inner), (1, 2));
+        // The outer state goes back last, and still answers for the world as it stands.
+        assert_eq!(count(&mut world), 2);
+    }
+
+    #[test]
+    fn the_hosted_vm_keeps_one_state_across_calls() {
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+        let world = app.world_mut();
+        with_hosted_vm(world, |_| ());
+        assert!(world
+            .get_non_send_resource::<CachedState<HostedVm>>()
+            .is_some_and(|c| c.0.is_some()));
+        with_hosted_vm(world, |_| ());
+        assert!(world
+            .get_non_send_resource::<CachedState<HostedVm>>()
+            .is_some_and(|c| c.0.is_some()));
     }
 }

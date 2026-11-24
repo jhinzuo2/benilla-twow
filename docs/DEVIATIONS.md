@@ -117,7 +117,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - A mounted draw is refused at the setter, because our rider track never replays the reference's per-play force-stow (`0x5fdf80`); the result is the same. ([`src/creature_anim/driver.rs:792`](../crates/benilla-app/src/creature_anim/driver.rs#L792))
 - The reference writes bone 0's rate blindly; we scope it to the swing's own node, because a moving attacker's gait would otherwise slow too. The id is re-checked, as `Mode::Swing` also holds non-swing one-shots. ([`src/creature_anim/driver.rs:1111`](../crates/benilla-app/src/creature_anim/driver.rs#L1111))
 - A time-based rate, because the reference's per-frame step changes with the frame rate. ([`src/creature_anim/select.rs:137`](../crates/benilla-app/src/creature_anim/select.rs#L137))
-- A spell's state kit and body procs are reaped only once no slot holds the spell because the reference's removal of one slot (`0x612320` → `0x5ff290`) stops every effect of that spell on the unit (`0x614150(spell, 1)` at `0x5ff2d2`, and its procs through `0x60d150` and `0x5ff320`), even while another slot holds the same spell, which drops a visual the server says still holds. ([`src/creature_anim/spell_visual.rs:1367`](../crates/benilla-app/src/creature_anim/spell_visual.rs#L1367))
+- A spell's state kit and body procs are reaped only once no slot holds the spell because the reference's removal of one slot (`0x612320` → `0x5ff290`) stops every effect of that spell on the unit (`0x614150(spell, 1)` at `0x5ff2d2`, and its procs through `0x60d150` and `0x5ff320`), even while another slot holds the same spell, which drops a visual the server says still holds. ([`src/creature_anim/spell_visual.rs:1376`](../crates/benilla-app/src/creature_anim/spell_visual.rs#L1376))
 
 #### cvars
 
@@ -189,8 +189,8 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - The reference places collision and culling by the raw facing, ours follow the display facing, because a capsule and a sphere barely change under rotation. ([`src/net/motion/facing.rs:10`](../crates/benilla-app/src/net/motion/facing.rs#L10))
 - The reference paces a self move through the same replay chain as a remote's; benilla hands it over at arrival because pacing it would only delay a correction to our own pose. ([`src/net/motion/remote.rs:110`](../crates/benilla-app/src/net/motion/remote.rs#L110))
 - Its rate-limited hover climb (`0x636fa1`, 7 yd/s) is not reproduced, because the cache gate needs a pure function; it converges to this answer. ([`src/net/motion/spline.rs:794`](../crates/benilla-app/src/net/motion/spline.rs#L794))
-- A first-pass values block the clear header byte left unwritten re-fires, for a live object, its last write's edges against the watch copy (`0x465570`, `0x466686`); benilla compares against this packet's copies, which hold none for it, because that way a stale edge never fires twice. ([`src/net/objects/update.rs:1123`](../crates/benilla-app/src/net/objects/update.rs#L1123))
-- The create notify uses its lookup's result untested (`0x465c97`, `0x465d79`). For a first-pass create the clear header byte left unwritten, an object not live crashes the reference, and a live one runs the all-fields watch (`0x465d8e`) against its stale watch copy, re-firing its last write's edges as the values block above does; benilla's `notify` fires nothing for either, because the faults the reference's passes have on malformed packets are recorded, not copied. ([`src/net/objects/update.rs:1135`](../crates/benilla-app/src/net/objects/update.rs#L1135))
+- A first-pass values block the clear header byte left unwritten re-fires, for a live object, its last write's edges against the watch copy (`0x465570`, `0x466686`); benilla compares against this packet's copies, which hold none for it, because that way a stale edge never fires twice. ([`src/net/objects/update.rs:1154`](../crates/benilla-app/src/net/objects/update.rs#L1154))
+- The create notify uses its lookup's result untested (`0x465c97`, `0x465d79`). For a first-pass create the clear header byte left unwritten, an object not live crashes the reference, and a live one runs the all-fields watch (`0x465d8e`) against its stale watch copy, re-firing its last write's edges as the values block above does; benilla's `notify` fires nothing for either, because the faults the reference's passes have on malformed packets are recorded, not copied. ([`src/net/objects/update.rs:1166`](../crates/benilla-app/src/net/objects/update.rs#L1166))
 - On benilla's unattended reconnect, which the reference lacks, the world's VM survives the loss; because of that the clear signals its `PLAYER_TARGET_CHANGED` and usable refresh as a release's teardown does (`0x493a69`, `0x493a73`), still sending nothing, and the surviving target frame lets the lost unit go. ([`src/net/session.rs:319`](../crates/benilla-app/src/net/session.rs#L319))
 
 #### no_install
@@ -322,7 +322,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - A missing global prints nothing, where the reference prints an empty line (`0x703c02`), because benilla's other `DisplayError` routes do the same. ([`src/ui_chat/broadcast.rs:167`](../crates/benilla-app/src/ui_chat/broadcast.rs#L167))
 - A dropped link re-enters the world in this session, where the reference logs in anew, because of benilla's same-character reconnect, which the reference lacks. ([`src/ui_chat/channels.rs:49`](../crates/benilla-app/src/ui_chat/channels.rs#L49))
 - In a capital with a blank city word the walk composes `"Trade - "` (it tests the row pointer, not the string, `0x49a2e4`-`0x49a2ed`); we decline, because a wrong channel name is joined silently and for good. ([`src/ui_chat/channels.rs:160`](../crates/benilla-app/src/ui_chat/channels.rs#L160))
-- The reference holds every line that waits on its `$`-macro subject's name in the name cache's callback list (`0x49daea` → `0x55f080`) until the name answers, with no bound; here at most `MAX_HELD_SUBJECT_LINES` wait, the oldest dropped past that, because a subject no player owns never answers. ([`src/ui_chat/feed.rs:396`](../crates/benilla-app/src/ui_chat/feed.rs#L396))
+- The reference holds every line that waits on its `$`-macro subject's name in the name cache's callback list (`0x49daea` → `0x55f080`) until the name answers, with no bound; here at most `MAX_HELD_SUBJECT_LINES` wait, the oldest dropped past that, because a subject no player owns never answers. ([`src/ui_chat/feed.rs:408`](../crates/benilla-app/src/ui_chat/feed.rs#L408))
 - A probe's bare `/assist` assists the live selection, `AssistByName("")` (`0x489c89`), where the stock handler (`ChatFrame.lua:740`) resolves a selected player's name through `AssistByName`, because a name resolve can land on a different player. ([`src/ui_chat/input/mod.rs:594`](../crates/benilla-app/src/ui_chat/input/mod.rs#L594))
 - A line of 256 bytes or more, which reaches here only through `chat_send`'s deviation for `0x49f604`, is slurred whole instead of cut to that buffer, because that way it reaches the server whole for the refusal that deviation leaves to it. ([`src/ui_chat/input/send.rs:305`](../crates/benilla-app/src/ui_chat/input/send.rs#L305))
 - The files live in `benilla-config/Logs/`, not the install's `Logs`, because the install is read-only. ([`src/ui_chat/logging.rs:14`](../crates/benilla-app/src/ui_chat/logging.rs#L14))
@@ -589,10 +589,10 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 #### models
 
 - The fraction is clamped to `[0, 1]` because the reference extrapolates, which for a window whose brackets miss the band can push a fix16 factor negative and cull the batch on a quirk. ([`src/models/key_anim.rs:130`](../crates/benilla-formats/src/models/key_anim.rs#L130))
-- Owners past the ceiling (Maraudon's waterfalls, the glue screens) keep the interleave with their emitters, because a bias past a 200-yard owner would jump every transparent surface in the zone. ([`src/models/m2_batches.rs:804`](../crates/benilla-formats/src/models/m2_batches.rs#L804))
+- Owners past the ceiling (Maraudon's waterfalls, the glue screens) keep the interleave with their emitters, because a bias past a 200-yard owner would jump every transparent surface in the zone. ([`src/models/m2_batches.rs:809`](../crates/benilla-formats/src/models/m2_batches.rs#L809))
 - The reference compares the texture objects' addresses (`0x41af70` on instance `+0xa4`, `0x70ac45`-`0x70ac69`); the model's own texture order stands in for them, because those addresses are a fact of the run's allocator and not of the file. Entries sharing a handle still tie. ([`src/models/sort_order.rs:47`](../crates/benilla-formats/src/models/sort_order.rs#L47))
-- The fx lane redraws them as projected decals (`ground_fx`) because that way they drape the terrain. ([`src/models/types.rs:398`](../crates/benilla-formats/src/models/types.rs#L398))
-- Consumers light such a card off the side it presents, because the reference's shading of it is inverted and follows the camera. ([`src/models/types.rs:472`](../crates/benilla-formats/src/models/types.rs#L472))
+- The fx lane redraws them as projected decals (`ground_fx`) because that way they drape the terrain. ([`src/models/types.rs:403`](../crates/benilla-formats/src/models/types.rs#L403))
+- Consumers light such a card off the side it presents, because the reference's shading of it is inverted and follows the camera. ([`src/models/types.rs:478`](../crates/benilla-formats/src/models/types.rs#L478))
 - The UV comes from the model-space position, not each surface's own `(i, j)`, because the two agree on cell-aligned surfaces and the position never seams where they are not. Magma and slime use this period too; the reference reads their UV from the vertex's authored `int16` pair × 1/256 (`0x6b6993`), which is not parsed. ([`src/models/wmo/group.rs:19`](../crates/benilla-formats/src/models/wmo/group.rs#L19))
 
 #### particles
@@ -665,7 +665,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### events
 
-- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:792`](../crates/benilla-protocol/src/events.rs#L792))
+- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:796`](../crates/benilla-protocol/src/events.rs#L796))
 - An out-of-range list past the first block reads no body in the write passes (`0x466076`), which misread every block behind it, while the notify pass reads past it (`0x465fd0`) and stays in step; benilla reads the list and drops it, keeping the blocks behind it whole, because the faults the reference's passes have on malformed packets are recorded, not copied. ([`src/events/decode.rs:1154`](../crates/benilla-protocol/src/events/decode.rs#L1154))
 - The flagged pass reads a movement block's guid as 8 raw bytes (`0x467140`, `0x46714d`) where the wire packs it, so unless the packed guid happens to be 8 bytes the reference misreads the rest of that pass; benilla reads the block once, packed, as pass 0 does (`0x467080`), because of the misreading just described. ([`src/events/decode.rs:1172`](../crates/benilla-protocol/src/events/decode.rs#L1172))
 
@@ -904,7 +904,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### interact
 
-- The broad bound is the mesh `Aabb` grown by 1 unit, not the reference's sequence-bounds sphere, because it can only err permissive. ([`src/interact/pick.rs:190`](../crates/benilla-world/src/interact/pick.rs#L190))
+- The broad bound is the mesh `Aabb` grown by 1 unit, not the reference's sequence-bounds sphere, because it can only err permissive. ([`src/interact/pick.rs:191`](../crates/benilla-world/src/interact/pick.rs#L191))
 
 #### lighting
 

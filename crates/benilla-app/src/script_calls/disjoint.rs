@@ -63,16 +63,17 @@ macro_rules! disjoint_set {
         // holds outside the set ([`crate::script_calls::disjoint::gather`]), and lends one member
         // at a time, through `&mut self`.
         unsafe impl bevy::ecs::system::SystemParam for $name<'_, '_> {
-            type State = $state;
+            // Boxed, as a system holds its params' state inline from the moment it is added.
+            type State = Box<$state>;
             type Item<'w, 's> = $name<'w, 's>;
 
             fn init_state(world: &mut bevy::ecs::world::World) -> Self::State {
-                $state {
+                Box::new($state {
                     $(
                         $(#[cfg($cfg)])?
                         $field: <$ty as bevy::ecs::system::SystemParam>::init_state(world),
                     )*
-                }
+                })
             }
 
             fn init_access(
@@ -142,7 +143,7 @@ macro_rules! disjoint_set {
                 change_tick: bevy::ecs::change_detection::Tick,
             ) -> Self::Item<'w, 's> {
                 $name {
-                    states: state,
+                    states: &mut **state,
                     meta: meta.clone(),
                     world,
                     change_tick,
@@ -210,6 +211,8 @@ pub(crate) struct Pair<'w, 's, A: SystemParam, B: SystemParam> {
     meta: SystemMeta,
     world: UnsafeWorldCell<'w>,
     change_tick: Tick,
+    /// Whether the second member validated, once [`Pair::p1_valid`] has asked this run.
+    valid: Option<bool>,
     /// The tick and name of the first member's lend running now, while the census watches writes.
     #[cfg(debug_assertions)]
     lend: Option<(Tick, &'static str)>,
@@ -270,6 +273,7 @@ unsafe impl<A: SystemParam, B: SystemParam> SystemParam for Pair<'_, '_, A, B> {
             meta: meta.clone(),
             world,
             change_tick,
+            valid: None,
             #[cfg(debug_assertions)]
             lend: None,
         }
@@ -297,6 +301,20 @@ impl<A: SystemParam, B: SystemParam> Pair<'_, '_, A, B> {
     pub(crate) fn p1(&mut self) -> SystemParamItem<'_, '_, B> {
         // SAFETY: the pair registered `B`'s access, and `&mut self` keeps `A` unlent.
         unsafe { B::get_param(&mut self.states.1, &self.meta, self.world, self.change_tick) }
+    }
+}
+
+impl<A: SystemParam, T: SystemParam> Pair<'_, '_, A, Option<T>> {
+    /// The second member as `p1` lends it, validated once a run: nothing adds or removes a resource
+    /// or an entity mid-run.
+    pub(crate) fn p1_valid(&mut self) -> Option<SystemParamItem<'_, '_, T>> {
+        let (states, meta, world) = (&mut self.states.1, &self.meta, self.world);
+        // SAFETY: the pair registered `T`'s access, and `&mut self` keeps `A` unlent.
+        let valid = *self
+            .valid
+            .get_or_insert_with(|| unsafe { T::validate_param(states, meta, world) }.is_ok());
+        // SAFETY: as above, and `T` validated in this run.
+        valid.then(|| unsafe { T::get_param(states, meta, world, self.change_tick) })
     }
 }
 
@@ -387,6 +405,15 @@ mod tests {
 
     use super::Pair;
 
+    /// A system holds the host's state inline from the moment it is added.
+    #[test]
+    fn the_hosts_state_is_a_few_words() {
+        use crate::script_calls::ScriptCallHost;
+        use bevy::ecs::system::SystemParam;
+        let size = size_of::<<ScriptCallHost<'static, 'static> as SystemParam>::State>();
+        assert!(size <= 64, "{size}");
+    }
+
     #[derive(Resource, Default)]
     struct Cell(u32);
 
@@ -415,5 +442,26 @@ mod tests {
             |_outside: ResMut<Cell>, _pair: Pair<Res<'static, Cell>, Res<'static, Cell>>| {},
         );
         app.update();
+    }
+
+    #[derive(Resource, Default)]
+    struct Seen(Vec<bool>);
+
+    /// `p1_valid` lends `None` while its resource is missing, every lend of the run, and the next
+    /// run validates again, so it lends the resource once it is there.
+    #[test]
+    fn p1_valid_validates_once_a_run() {
+        let mut app = App::new();
+        app.init_resource::<Seen>().add_systems(
+            Update,
+            |mut pair: Pair<ResMut<'static, Seen>, Option<Res<'static, Cell>>>| {
+                let lent = [pair.p1_valid().is_some(), pair.p1_valid().is_some()];
+                pair.p0().0.extend(lent);
+            },
+        );
+        app.update();
+        app.init_resource::<Cell>();
+        app.update();
+        assert_eq!(app.world().resource::<Seen>().0, [false, false, true, true]);
     }
 }
